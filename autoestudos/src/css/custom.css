@@ -1,0 +1,280 @@
+/**
+ * Any CSS included here will be global. The classic template
+ * bundles Infima by default. Infima is a CSS framework designed to
+ * work well for content-centric websites.
+ */
+
+/* You can override the default Infima variables here. */
+:root {
+  --ifm-color-primary: #3F01FF;
+  --ifm-color-primary-dark: #3901e6;
+  --ifm-color-primary-darker: #3501d9;
+  --ifm-color-primary-darkest: #2c01b3;
+  --ifm-color-primary-light: #521aff;
+  --ifm-color-primary-lighter: #5c26ff;
+  --ifm-color-primary-lightest: #7a4dff;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+/* For readability concerns, you should choose a lighter palette in dark mode. */
+[data-theme='dark'] {
+  --ifm-color-primary: #3F01FF;
+  --ifm-color-primary-dark: #3901e6;
+  --ifm-color-primary-darker: #3501d9;
+  --ifm-color-primary-darkest: #2c01b3;
+  --ifm-color-primary-light: #521aff;
+  --ifm-color-primary-lighter: #5c26ff;
+  --ifm-color-primary-lightest: #7a4dff;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  
+  /* Fundos mais pretos no modo escuro */
+  --ifm-background-color: #111116;
+  --ifm-background-surface-color: #17171d;
+}
+
+/* ================== PREMIUM DESIGN ================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap');
+
+:root {
+  /* Use a modern Google Font */
+  --ifm-font-family-base: 'Outfit', system-ui, sans-serif;
+  
+  /* Softer shadows and rounder edges */
+  --ifm-global-radius: 12px;
+  --ifm-menu-color: #4a5568;
+}
+
+[data-theme='dark'] {
+  --ifm-menu-color: #a0aec0;
+}
+
+/* Glassmorphism Navbar */
+.navbar {
+  background-color: rgba(255, 255, 255, 0.8) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.05);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+[data-theme='dark'] .navbar {
+  background-color: rgba(20, 20, 20, 0.8) !important;
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.3);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Cor do texto Autoestudos (e outros links da navbar) no modo escuro */
+[data-theme='dark'] .navbar__link {
+  color: #ffffff !important;
+}
+
+/* Aproximar "Autoestudos" da logo */
+.navbar__brand {
+  margin-right: 5px !important;
+}
+.navbar__logo {
+  height: 3rem !important;
+}
+.navbar__items:not(.navbar__items--right) .navbar__item:first-child {
+  padding-left: 0 !important;
+  font-size: 1.7rem !important;
+  font-weight: 700 !important;
+}
+
+.navbar__items--right .navbar__item {
+  font-size: 0.9rem !important;
+}
+
+/* Smooth Hover Animations for Sidebar */
+.menu__link {
+  transition: all 0.2s ease-in-out;
+}
+.menu__link:hover {
+  transform: translateX(4px);
+}
+
+/* Modern Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--ifm-color-primary-light);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ifm-color-primary);
+}
+
+/* ================== GRADIENT HEADINGS ================== */
+
+/* Títulos h1 com cor sólida roxa */
+.markdown h1 {
+  color: #3F01FF;
+  font-weight: 700;
+}
+
+/* Linha decorativa abaixo de h2 */
+.markdown h2 {
+  padding-bottom: 8px;
+  border-bottom: 2px solid rgba(63, 1, 255, 0.2);
+}
+
+[data-theme='dark'] .markdown h2 {
+  border-bottom: 2px solid rgba(122, 77, 255, 0.25);
+}
+
+/* ================== SIDEBAR UPGRADES ================== */
+
+/* Item ativo com glow sutil */
+.menu__link--active:not(.menu__link--sublist) {
+  background: rgba(63, 1, 255, 0.08) !important;
+  border-left: 3px solid #3F01FF;
+  border-radius: 0 8px 8px 0;
+  padding-left: 9px;
+}
+
+[data-theme='dark'] .menu__link--active:not(.menu__link--sublist) {
+  background: rgba(63, 1, 255, 0.15) !important;
+  box-shadow: inset 0 0 20px rgba(63, 1, 255, 0.05);
+}
+
+/* Categorias com ícone de seta suave */
+.menu__list-item-collapsible:hover {
+  background: rgba(63, 1, 255, 0.04);
+  border-radius: 8px;
+}
+
+[data-theme='dark'] .menu__list-item-collapsible:hover {
+  background: rgba(63, 1, 255, 0.08);
+}
+
+/* ================== CODE BLOCKS ================== */
+
+/* Borda gradiente nos blocos de código */
+.prism-code {
+  border: 1px solid rgba(63, 1, 255, 0.15) !important;
+}
+
+[data-theme='dark'] .prism-code {
+  border: 1px solid rgba(122, 77, 255, 0.2) !important;
+  background-color: #0d0d12 !important;
+}
+
+/* Inline code mais bonito */
+.markdown code {
+  background: rgba(63, 1, 255, 0.08);
+  border: 1px solid rgba(63, 1, 255, 0.12);
+  color: #3F01FF;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 0.9em;
+}
+
+[data-theme='dark'] .markdown code {
+  background: rgba(122, 77, 255, 0.12);
+  border: 1px solid rgba(122, 77, 255, 0.2);
+  color: #a380ff;
+}
+
+/* Não aplicar estilo inline em blocos de código */
+.prism-code code {
+  background: none !important;
+  border: none !important;
+  color: inherit !important;
+  padding: 0 !important;
+}
+
+/* ================== TABLE OF CONTENTS ================== */
+
+.table-of-contents__link {
+  transition: all 0.2s ease;
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+
+.table-of-contents__link:hover {
+  background: rgba(63, 1, 255, 0.06);
+}
+
+.table-of-contents__link--active {
+  color: #3F01FF !important;
+  font-weight: 600;
+}
+
+[data-theme='dark'] .table-of-contents__link--active {
+  color: #7a4dff !important;
+}
+
+/* ================== BREADCRUMBS ================== */
+
+.breadcrumbs__link {
+  transition: all 0.2s ease;
+  border-radius: 6px;
+  padding: 4px 10px;
+}
+
+.breadcrumbs__link:hover {
+  background: rgba(63, 1, 255, 0.08);
+}
+
+/* ================== ADMONITIONS (CALLOUTS) ================== */
+
+[data-theme='dark'] .alert {
+  border-left-width: 4px;
+  background-color: rgba(23, 23, 29, 0.8) !important;
+  backdrop-filter: blur(8px);
+}
+
+/* ================== PAGE TRANSITIONS ================== */
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.markdown {
+  animation: fadeInUp 0.4s ease-out;
+}
+
+/* ================== PAGINATION (PREV/NEXT) ================== */
+
+.pagination-nav__link {
+  border: 1px solid rgba(63, 1, 255, 0.15);
+  border-radius: 12px;
+  transition: all 0.25s ease;
+}
+
+.pagination-nav__link:hover {
+  border-color: #3F01FF;
+  box-shadow: 0 4px 20px rgba(63, 1, 255, 0.15);
+  transform: translateY(-2px);
+}
+
+[data-theme='dark'] .pagination-nav__link {
+  border: 1px solid rgba(122, 77, 255, 0.15);
+  background: rgba(23, 23, 29, 0.5);
+}
+
+[data-theme='dark'] .pagination-nav__link:hover {
+  border-color: #7a4dff;
+  box-shadow: 0 4px 20px rgba(63, 1, 255, 0.2);
+}
+
+/* ================== SELECTION COLOR ================== */
+
+::selection {
+  background: rgba(63, 1, 255, 0.25);
+  color: inherit;
+}
