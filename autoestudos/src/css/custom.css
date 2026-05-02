@@ -75,7 +75,7 @@
   margin-right: 5px !important;
 }
 .navbar__logo {
-  height: 3rem !important;
+  height: 2.1rem !important;
 }
 .navbar__items:not(.navbar__items--right) .navbar__item:first-child {
   padding-left: 0 !important;
@@ -225,10 +225,26 @@
 
 /* ================== ADMONITIONS (CALLOUTS) ================== */
 
+.alert {
+  border-left-width: 5px;
+  border-radius: 12px;
+  border-color: #3F01FF !important;
+  background-color: rgba(63, 1, 255, 0.05) !important;
+  box-shadow: 0 4px 12px rgba(63, 1, 255, 0.08);
+}
+
 [data-theme='dark'] .alert {
-  border-left-width: 4px;
-  background-color: rgba(23, 23, 29, 0.8) !important;
+  background-color: rgba(63, 1, 255, 0.12) !important;
+  border-color: #7a4dff !important;
   backdrop-filter: blur(8px);
+}
+
+.alert svg {
+  fill: #3F01FF;
+}
+
+[data-theme='dark'] .alert svg {
+  fill: #7a4dff;
 }
 
 /* ================== PAGE TRANSITIONS ================== */

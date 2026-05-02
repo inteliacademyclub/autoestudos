@@ -7,7 +7,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 const config: Config = {
   title: 'Autoestudos',
   tagline: 'Plataforma de Autoestudos',
-  favicon: 'img/logo.png',
+  favicon: 'img/logobranca.png',
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
   future: {
@@ -42,10 +42,6 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           routeBasePath: '/', // Serve the docs at the site's root
-          // Please change this to your repo.
-          // Remove this to remove the "edit this page" links.
-          editUrl:
-            'https://github.com/inteliacademyclub/autoestudos/tree/main/',
         },
         blog: {
           showReadingTime: true,
@@ -53,10 +49,6 @@ const config: Config = {
             type: ['rss', 'atom'],
             xslt: true,
           },
-          // Please change this to your repo.
-          // Remove this to remove the "edit this page" links.
-          editUrl:
-            'https://github.com/inteliacademyclub/autoestudos/tree/main/',
           // Useful options to enforce blogging best practices
           onInlineTags: 'warn',
           onInlineAuthors: 'warn',
@@ -89,6 +81,11 @@ const config: Config = {
           sidebarId: 'autoestudosSidebar',
           position: 'left',
           label: 'Autoestudos',
+        },
+        {
+          type: 'html',
+          position: 'right',
+          value: '<img src="/autoestudos/img/mascote.png" alt="Mascote Inteli Academy" style="height: 40px; margin-right: 0px; margin-top: 5px; border-radius: 50%;" />',
         },
         {
           href: 'https://github.com/inteliacademyclub/autoestudos',
