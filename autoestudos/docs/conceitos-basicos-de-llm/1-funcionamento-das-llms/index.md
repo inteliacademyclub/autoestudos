@@ -7,7 +7,7 @@ sidebar_label: 'Funcionamento das LLMs'
 
 Sabe quando você tá digitando uma mensagem no WhatsApp, escreve "Bom" e o teclado já sugere "dia"? E se você apertar "dia", ele sugere "tudo", e depois "bem"? 
 
-Acredite se quiser, mas é **exatamente** isso que o ChatGPT, o Claude, o Gemini e outras Inteligências Artificiais fazem. Eles são, na sua essência, teclados de celular bombados! 
+Acredite se quiser, mas é **exatamente** isso que o ChatGPT, o Claude, o Gemini e outras Inteligências Artificiais fazem. Eles são, na sua essência, teclados de celular aprimorados! 
 
 
 <div align="center">
@@ -107,4 +107,4 @@ Ela não "sabe" a resposta; ela sabe qual é o **formato** de uma resposta corre
 
 Uma LLM não é um cérebro humano dentro do computador. Não é um banco de dados mágico onde ela vai buscar a resposta pronta numa prateleira. 
 
-Ela é um "papagaio estatístico" hiperativo. Ela mapeou a estrutura da nossa linguagem tão perfeitamente que consegue gerar textos novos, criar conexões e resolver problemas apenas prevendo qual é a próxima pecinha desse enorme quebra-cabeça de palavras. Bizarro, né? Mas é genial!
+Ela é um "papagaio estatístico" hiperativo. Ela mapeou a estrutura da nossa linguagem tão perfeitamente que consegue gerar textos novos, criar conexões e resolver problemas apenas prevendo qual é a próxima pecinha desse enorme quebra-cabeça de palavras.

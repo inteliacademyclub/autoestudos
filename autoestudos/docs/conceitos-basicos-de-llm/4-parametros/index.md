@@ -45,28 +45,28 @@ Na IA, um Parâmetro é exatamente a **"força" dessa estrada**! Mas ao invés d
 
 </div>
 
-Cada **ponto brilhante** é um neurônio artificial — uma unidade matemática que recebe um sinal, faz um cálculo e passa o resultado adiante. As **linhas luminosas** que conectam esses pontos são as estradas: os **parâmetros**. E a "intensidade" da luz em cada linha representa o quão forte é aquela conexão.
+Cada **ponto brilhante** é um neurônio artificial: uma unidade matemática que recebe um sinal, faz um cálculo e passa o resultado adiante. As **linhas luminosas** que conectam esses pontos são as estradas: os **parâmetros**. E a "intensidade" da luz em cada linha representa o quão forte é aquela conexão.
 
-Uma Rede Neural é organizada em **camadas**: uma camada de entrada, várias camadas intermediárias (chamadas de "camadas ocultas") e uma camada de saída. O sinal entra pela esquerda, passa de coluna em coluna sendo processado, e sai pela direita como uma resposta. Quanto mais camadas ocultas, mais complexas as conexões que a rede consegue aprender — e é por isso que as LLMs modernas têm dezenas ou centenas de camadas empilhadas.
+Uma Rede Neural é organizada em **camadas**: uma camada de entrada, várias camadas intermediárias (chamadas de "camadas ocultas") e uma camada de saída. O sinal entra pela esquerda, passa de coluna em coluna sendo processado, e sai pela direita como uma resposta. Quanto mais camadas ocultas, mais complexas as conexões que a rede consegue aprender. É por isso que as LLMs modernas têm dezenas ou centenas de camadas empilhadas.
 
-Quando a pergunta *"Qual a capital do Brasil?"* entra na rede, é como acender uma lâmpada na entrada. Esse sinal elétrico vai se propagando pela rede — cada neurônio passa o sinal para o próximo, multiplicando pelo "peso" (o parâmetro) de cada conexão — até que, no final, a saída com maior sinal aceso é a palavra **"Brasília"**.
+Quando a pergunta *"Qual a capital do Brasil?"* entra na rede, é como acender uma lâmpada na entrada. Esse sinal elétrico vai se propagando pela rede: cada neurônio passa o sinal para o próximo, multiplicando pelo "peso" (o parâmetro) de cada conexão. Até que, no final, a saída com maior sinal aceso é a palavra **"Brasília"**.
 
-A IA não "pensa" em Brasília. Ela apenas **seguiu o caminho com mais voltagem** — o que foi treinado para ser o mais forte.
+A IA não "pensa" em Brasília. Ela apenas **seguiu o caminho com mais voltagem**, aquele que foi treinado para ser o mais forte.
 
 ### Como esses parâmetros foram ajustados?
 
 A IA não nasceu sabendo que "Brasília" é a capital do Brasil. Essa conexão foi construída aos poucos, através de trilhões de erros corrigidos. O ciclo funciona assim:
 
 1. A IA tenta prever a próxima palavra de um texto.
-2. Ela erra (quase sempre, no início — ela pode sugerir "Rio de Janeiro" no lugar de "Brasília").
+2. Ela erra (quase sempre, no início; ela pode sugerir "Rio de Janeiro" no lugar de "Brasília").
 3. Um algoritmo calcula o tamanho do erro e **aperta ou afrouxa o volume** de cada conexão da rede para tentar acertar da próxima vez.
 4. Ela processa outro texto e tenta de novo.
 5. Repete esse ciclo **bilhões de vezes**, até errar cada vez menos.
 
-É como afinar um instrumento musical: você vai girando as tarraxas até o som ficar certo. Cada tarraxa é um parâmetro. Um modelo moderno tem **bilhões de tarraxas** para afinar — e o processo de afinação consome meses de tempo e datacenters inteiros de energia elétrica.
+É como afinar um instrumento musical: você vai girando as tarraxas até o som ficar certo. Cada tarraxa é um parâmetro. Um modelo moderno tem **bilhões de tarraxas** para afinar, e o processo de afinação consome meses de tempo e datacenters inteiros de energia elétrica.
 
 :::info[Curiosidade: O nome do algoritmo]
-Esse processo de "calcular o erro e ajustar as conexões para trás" tem um nome técnico: **Backpropagation** (Retropropagação). É o coração de praticamente todo o treinamento de IA moderno — e foi descoberto nos anos 80, mas só se tornou viável computacionalmente décadas depois, com o poder das GPUs.
+Esse processo de "calcular o erro e ajustar as conexões para trás" tem um nome técnico: **Backpropagation** (Retropropagação). É o coração de praticamente todo o treinamento de IA moderno. Foi descoberto nos anos 80, mas só se tornou viável computacionalmente décadas depois, com o poder das GPUs.
 :::
 
 ## Por que o tamanho importa? (Os famosos 8B, 70B, 400B)
@@ -116,7 +116,7 @@ Nos primeiros anos da era moderna das LLMs, as grandes empresas viviam uma corri
 
 Até que os pesquisadores descobriram um problema incômodo: **isso não é linear**.
 
-Dobrar os parâmetros não dobra a inteligência. Mas dobra (ou mais) a infraestrutura necessária — servidores, consumo de energia, custo de treinamento.
+Dobrar os parâmetros não dobra a inteligência. Mas dobra (ou mais) a infraestrutura necessária: servidores, consumo de energia, custo de treinamento.
 
 :::warning[A Lei dos Retornos Decrescentes]
 Imagine que você está estudando para uma prova:

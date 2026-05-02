@@ -77,7 +77,7 @@ Se você está apenas conversando no chat normal, você não precisa se preocupa
 Se você for usar a API de uma IA para programar, vai notar que junto do botão de Temperatura, existe um outro chamado **`top_p`** (ou *nucleus sampling*). Ambos controlam a criatividade, mas usam estratégias completamente diferentes:
 
 - **Temperatura (A Distorção):** Muda as *porcentagens* de todas as palavras. Uma temperatura alta pega uma palavra rara (0,001% de chance) e infla ela artificialmente para 15%, tornando-a uma opção provável.
-- **Top-P (O Segurança da Porta):** Não muda a porcentagem de ninguém. Ele funciona como uma "nota de corte". Se você definir o `top_p` como `0.9` (90%), a IA vai somar as palavras mais prováveis da lista até dar 90%. Tudo o que estiver abaixo dessa linha de corte (os 10% mais bizarros do fundo do poço) é **sumariamente jogado no lixo** e a IA fica proibida de escolher.
+- **Top-P (O Segurança da Porta):** Não muda a porcentagem de ninguém. Ele funciona como uma "nota de corte". Se você definir o `top_p` como `0.9` (90%), a IA vai somar as palavras mais prováveis da lista até dar 90%. Tudo o que estiver abaixo dessa linha de corte (os 10% do fundo do poço) é **sumariamente jogado no lixo** e a IA fica proibida de escolher.
 
 **Em resumo:** A Temperatura altera o tamanho das fatias da pizza. O Top-P simplesmente joga as fatias ruins da pizza no lixo antes de você escolher. 
 

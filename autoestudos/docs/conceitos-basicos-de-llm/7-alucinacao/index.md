@@ -13,7 +13,7 @@ A Inteligência Artificial, por outro lado, diria com a voz mais séria e profis
 
 E o pior: ela diria isso com **tanta convicção e eloquência** que você quase acreditaria. 
 
-Esse fenômeno bizarro — quando a IA inventa uma mentira e a conta como se fosse a verdade absoluta — é o maior "calcanhar de Aquiles" dessa tecnologia. O nome oficial disso é **Alucinação**.
+Esse fenômeno, quando a IA inventa uma mentira e a conta como se fosse a verdade absoluta, é o maior "calcanhar de Aquiles" dessa tecnologia. O nome oficial disso é **Alucinação**.
 
 <div align="center">
 

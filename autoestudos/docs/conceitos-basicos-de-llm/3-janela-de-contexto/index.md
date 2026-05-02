@@ -67,7 +67,7 @@ Se você usa um modelo com uma Janela de Contexto de 8.000 tokens e envia um PDF
 
 ## O Tamanho da Janela no Mundo Real
 
-Nos primórdios (o tal do GPT-3 lá de 2020), a janela de contexto era minúscula. Cerca de 4.000 tokens — o tamanho de um artigo de blog. Hoje, a briga das grandes empresas é justamente para construir mesas de trabalho cada vez maiores!
+Nos primórdios (o tal do GPT-3 lá de 2020), a janela de contexto era minúscula. Cerca de 4.000 tokens, o tamanho de um artigo de blog. Hoje, a briga das grandes empresas é justamente para construir mesas de trabalho cada vez maiores!
 
 | Modelo | Lançamento | Janela de Contexto | O que cabe dentro |
 |:---|:---:|:---:|:---|

@@ -37,7 +37,7 @@ Olha só como a frase *"Today is a beautiful day outside."* seria quebrada pela 
 - `side`
 - `.`
 
-Reparou? A palavra "Today" foi quebrada em `To` + `day`. E "beautiful" virou `beaut` + `iful`! Isso porque a IA não encontrou um "Lego pronto" para essas palavras inteiras — ela teve que montar com peças menores. Já "is" e "a" são tão comuns que viram um token só cada.
+Reparou? A palavra "Today" foi quebrada em `To` + `day`. E "beautiful" virou `beaut` + `iful`! Isso porque a IA não encontrou um "Lego pronto" para essas palavras inteiras, então teve que montar com peças menores. Já "is" e "a" são tão comuns que viram um token só cada.
 
 :::info[O segredo do espaço e o terror dos programadores]
 Você reparou que `day` aparece duas vezes, mas com IDs diferentes (`1452` e `740`)? Isso acontece porque o tokenizador trata o **espaço antes da palavra como parte do token**. Então `day` (sem espaço, colado em "To") é um token diferente de ` day` (com espaço, palavra separada).
@@ -127,7 +127,7 @@ Isso quer dizer que processar textos em português costuma "gastar" mais tokens 
 
 ## Experimente você mesmo!
 
-A melhor forma de entender tokens é vendo na prática. A OpenAI disponibiliza uma ferramenta gratuita chamada **Tokenizer** onde você cola qualquer texto e ela te mostra exatamente como a IA quebra cada pedaço — cada token com uma cor diferente.
+A melhor forma de entender tokens é vendo na prática. A OpenAI disponibiliza uma ferramenta gratuita chamada **Tokenizer** onde você cola qualquer texto e ela te mostra exatamente como a IA quebra cada pedaço, com cada token em uma cor diferente.
 
 <div align="center">
 
@@ -147,4 +147,4 @@ Tokens são a moeda de troca e a unidade de pensamento das IAs. Quando você jog
 
 Beleza, agora você sabe que a IA engole "tokens" aos milhões. Mas será que a cabeça dela é infinita? Sabe quando você tá conversando com o ChatGPT há horas e, do nada, ele parece "esquecer" uma regra que você deu lá no começo do papo? 
 
-A culpa não é de uma falha no sistema, e sim do fato de que a "memória de curto prazo" da IA tem um limite estrito de tokens que ela consegue segurar de uma vez. Quando o limite estoura, o passado começa a ser apagado. E é exatamente sobre essa memória — a famosa **Janela de Contexto** — que vamos falar agora!
+A culpa não é de uma falha no sistema, e sim do fato de que a "memória de curto prazo" da IA tem um limite estrito de tokens que ela consegue segurar de uma vez. Quando o limite estoura, o passado começa a ser apagado. E é exatamente sobre essa memória, a famosa **Janela de Contexto**, que vamos falar agora!

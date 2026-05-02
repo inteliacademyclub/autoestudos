@@ -61,7 +61,7 @@ Nesse cenário, a IA atua como um **maestro**: ela recebe a ordem do usuário em
 :::warning[O Instinto Dev: Por que cada ferramenta "casa" com um modelo?]
 Você já deve ter percebido: ferramentas de IA para código parecem sempre “casar” com um modelo específico. Algumas funcionam melhor com modelos da OpenAI, outras com os da Anthropic (como o Claude no Cursor).
 
-Isso não é só uma decisão comercial — mas também não é um limite técnico rígido.
+Isso não é só uma decisão comercial, mas também não é um limite técnico rígido.
 
 As LLMs modernas são treinadas para interagir com ferramentas usando formatos estruturados (*tool calling*, JSON, *schemas*). Cada provedor implementa isso de um jeito um pouco diferente: muda o formato, muda o estilo de resposta e até o comportamento esperado.
 
