@@ -1,3 +1,11 @@
+---
+sidebar_position: 1
+sidebar_label: Fontes de Estudo
+title: Fontes de Estudo
+---
+
+# Fontes de Estudo
+
 Recursos de estudo para as tecnologias utilizadas no projeto do BTG Pactual para fazer um agente inteligente de análise e contextualização de ofertas primárias.
 
 As ferramentas estão organizadas em duas categorias: principais, que formam o núcleo do sistema, e complementares, que estendem suas capacidades em áreas específicas.
@@ -16,7 +24,6 @@ Parte central do projeto: orquestra o agente, conecta o modelo de linguagem às 
 - [Quickstart](https://docs.langchain.com/oss/python/langchain/quickstart) — Primeira aplicação funcional passo a passo. **Ponto de partida recomendado.**
 - [Agents](https://python.langchain.com/docs/concepts/agents/) — Como criar agentes que tomam decisões e encadeiam ações de forma autônoma.
 - [Tools](https://python.langchain.com/docs/concepts/tools/) — Integração do agente com funções externas como scraping, APIs e bancos de dados.
-- [Integração com Chroma](https://docs.langchain.com/oss/python/integrations/vectorstores/chroma) — Uso do banco vetorial ChromaDB com LangChain para armazenar e recuperar embeddings de emissões históricas.
 - [GitHub oficial](https://github.com/langchain-ai/langchain) — Código-fonte e exemplos prontos para explorar.
 
 #### Vídeos
@@ -24,7 +31,6 @@ Parte central do projeto: orquestra o agente, conecta o modelo de linguagem às 
 - [LangChain IA](https://www.youtube.com/watch?v=7L0MnVu1KEo) — Introdução.
 - [Tutorial básico](https://www.youtube.com/watch?v=nXynNB6XzAM) — Guia direto ao ponto para primeiros contatos.
 - [Criando Agentes de IA](https://www.youtube.com/watch?v=jnEmWGmXx8Y) — Implementação prática de agentes com ferramentas customizadas.
-- [RAG do ZERO](https://www.youtube.com/watch?v=3RD0nIAWoJw) — Implementação de busca semântica + resposta contextualizada, padrão usado para recuperar comparáveis históricos no projeto.
 - [Curso COMPLETO LangChain](https://www.youtube.com/watch?v=S98c7uxCluA) — Do básico ao avançado, cobrindo todos os componentes principais.
 
 ---
