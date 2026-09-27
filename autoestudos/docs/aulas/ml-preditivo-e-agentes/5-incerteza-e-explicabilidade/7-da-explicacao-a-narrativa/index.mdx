@@ -1,0 +1,486 @@
+---
+sidebar_position: 7
+sidebar_label: 'Da explicação à narrativa'
+title: 'Da explicação à narrativa'
+description: 'O subagente explicador ancorado: payload estruturado, prompt com regras, saída Pydantic, validador determinístico de fidelidade, LLM-as-a-judge e o exemplo completo de entrada e saída para o Short B da Lumina.'
+tags: [ml-preditivo, galaxies, explicabilidade, agente]
+---
+
+# Da Explicação à Narrativa: Um LLM que Só Conta o que o Modelo Disse
+
+<LessonMeta
+  tempo="45 min"
+  semana={3}
+  etapa="explicacao"
+  objetivos={[
+    'Montar o payload estruturado que o subagente explicador recebe, e decidir o que fica de fora',
+    'Escrever um prompt com regras de ancoragem e uma saída estruturada em Pydantic',
+    'Implementar um validador determinístico de fidelidade (números e fatores) e usá-lo num laço de correção',
+    'Avaliar fidelidade com LLM-as-a-judge num golden set, separando o papel do explicador do da persona da Galaxies',
+  ]}
+  prerequisitos={[
+    {label: 'SHAP na prática', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica'},
+    {label: 'Sinal de baixa confiança', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca'},
+    {label: 'LLM-as-a-judge e G-Eval', to: '/aulas/eval-driven-development/llm-as-a-judge-e-g-eval'},
+    {label: 'Alucinação', to: '/aulas/conceitos-basicos-de-llm/alucinacao'},
+  ]}
+/>
+
+A Galaxies pediu, com estas palavras, uma camada de raciocínio no agente: *"acho que vai viralizar por conta disso, disso e disso"*. Você já tem tudo o que é preciso para responder: a previsão, o intervalo, o `confidence_flag` e os `top_drivers` do SHAP. Falta transformar um JSON em três frases que o time de marketing leia em dez segundos.
+
+É o tipo de tarefa em que um LLM brilha, e é exatamente aí que mora o risco. Peça a um modelo de linguagem para "explicar por que o Short B vai bem" e ele vai escrever algo assim: *"B deve viralizar porque segue a trend de antes/depois que está em alta no TikTok, e o público jovem da Lumina adora transformações rápidas"*. Soa ótimo. **Nada disso está no modelo.** Não existe feature de trend, o modelo não sabe a idade do público, e a palavra "viralizar" não corresponde a nenhum número da previsão.
+
+Essa é a versão mais perigosa de [alucinação](/aulas/conceitos-basicos-de-llm/alucinacao): uma explicação plausível para um número verdadeiro. O leitor confere a previsão, vê que ela faz sentido, e passa a acreditar também na causa inventada. Esta aula constrói o subagente explicador de forma que ele **só possa narrar o que o modelo disse**, e mostra como provar isso.
+
+:::info[A ideia central]
+O **explicador ancorado** recebe um JSON fechado (previsão, intervalo, `relative_to_channel`, `top_drivers`, comparáveis, `confidence_flag`), segue regras explícitas e devolve uma **saída estruturada**. Um **validador determinístico** confere que todo número citado existe no JSON e que todo fator citado está em `top_drivers`; se falhar, o LLM recebe os problemas e tenta de novo. Offline, um **LLM-as-a-judge** mede a fidelidade num golden set. Opinião sobre o público não é papel dele: é da persona da Galaxies.
+:::
+
+---
+
+## A arquitetura do explicador
+
+<Sketch name="m5/explicador-ancorado" alt="Fluxo: o payload JSON (previsão e intervalo, relative_to_channel, top_drivers do SHAP, comparáveis, confidence_flag) entra no subagente explicador (LLM com temperatura 0, regras e schema Pydantic). A saída estruturada vai para o validador determinístico, que confere se os números estão no JSON e se os fatores estão em top_drivers. Se passar, vira o campo explanation do contrato da tool. Se falhar, os problemas voltam ao explicador numa nova tentativa. Embaixo, um LLM-as-a-judge offline mede a fidelidade num golden set a partir de amostras da saída, e a persona da Galaxies faz a leitura pela ótica do público, separada do explicador." caption="O LLM escreve; o código confere; o juiz audita. A opinião do público fica com a persona." />
+
+Cada peça existe por um motivo:
+
+- **O payload fechado** define o universo do que pode ser dito. Se não está no JSON, não pode aparecer no texto.
+- **O subagente** faz a parte que só um LLM faz bem: escolher palavras, ordenar, traduzir "multiplicador 1,33" em "cerca de 33% a mais".
+- **O validador determinístico** roda em toda chamada, em milissegundos, e pega as invenções mais comuns: números e fatores que não existem.
+- **O juiz** é caro e lento demais para toda chamada, mas pega o que o validador não enxerga (causas inventadas sem números, tom exagerado). Ele roda offline, como teste de regressão.
+
+---
+
+## O payload: o que entra e o que fica de fora
+
+O payload é o único contexto do explicador. Ele deve ser pequeno, já traduzido para unidades de negócio e completo para o que a explicação precisa dizer. O exemplo usa os números canônicos do Short B (ilustrativos, gerados pelo simulador da trilha).
+
+```python
+import json
+
+def montar_payload(criativo, previsao, top_drivers, comparaveis, flag, comparacao=None):
+    """Tudo o que o explicador pode citar, e nada além disso."""
+    return {
+        "criativo": criativo,
+        "predicted_metric": previsao["mediana"],
+        "interval_low": previsao["q10"],
+        "interval_high": previsao["q90"],
+        "nivel_intervalo": 0.8,
+        "mediana_canal_90d": previsao["mediana_canal"],
+        "relative_to_channel": round(previsao["mediana"] / previsao["mediana_canal"], 2),
+        "top_drivers": top_drivers,
+        "comparaveis": comparaveis,
+        "confidence_flag": flag,
+        "comparacao": comparacao,            # opcional: vem da tool de ordenação
+    }
+
+payload_b = montar_payload(
+    criativo={"id": "lumina-B", "titulo": "1 produto, 20 segundos", "setor": "beleza",
+              "duracao_s": 22, "publicacao": "quinta 19h"},
+    previsao={"mediana": 4380, "q10": 2300, "q90": 8300, "mediana_canal": 2300},
+    top_drivers=[
+        {"feature": "gancho", "valor": 8, "contribuicao_log": 0.28, "multiplicador": 1.33, "direcao": "aumenta"},
+        {"feature": "energia_musica", "valor": 7, "contribuicao_log": 0.10, "multiplicador": 1.11, "direcao": "aumenta"},
+        {"feature": "rosto", "valor": True, "contribuicao_log": 0.10, "multiplicador": 1.10, "direcao": "aumenta"},
+        {"feature": "texto_na_tela", "valor": True, "contribuicao_log": 0.08, "multiplicador": 1.08, "direcao": "aumenta"},
+        {"feature": "hora", "valor": 19, "contribuicao_log": 0.05, "multiplicador": 1.06, "direcao": "aumenta"},
+    ],
+    comparaveis=[   # ilustrativos: vêm da tool de comparáveis (aula 6.4)
+        {"titulo": "Antes/depois: corretivo em 15 s", "curtidas": 5100, "relativo_canal": 2.2},
+        {"titulo": "Base nova, teste de 1 dia", "curtidas": 3050, "relativo_canal": 1.3},
+    ],
+    flag={"baixa_confianca": False, "motivos": [], "posts_anteriores_canal": 142},
+    comparacao={"contra": "lumina-A", "prob_superar": 0.94, "predicted_contra": 1480,
+                "interval_contra": [780, 2800]},
+)
+```
+
+O que **não** entra, de propósito:
+
+- **O vetor SHAP inteiro.** Com 40 números, o LLM escolhe os que soam melhor. Os `top_drivers` já vêm ordenados e filtrados pela [aula 5.6](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica).
+- **Valores em log.** `contribuicao_log` está lá para rastreabilidade, mas as regras mandam falar em multiplicadores e porcentagens.
+- **A transcrição e o JSON bruto do VLM.** Eles convidam o LLM a tirar conclusões próprias sobre o vídeo ("a apresentadora é carismática"), que o modelo preditivo não usou. Se um atributo importa, ele aparece em `top_drivers`.
+- **Qualquer coisa sobre o público.** O modelo não sabe quem assiste.
+
+---
+
+## O prompt e a saída estruturada
+
+A saída é um schema Pydantic com três campos, pensado para ser validado campo a campo e renderizado pela persona da Galaxies ou por uma interface:
+
+```python
+from pydantic import BaseModel, Field
+
+class Fator(BaseModel):
+    fator: str = Field(description="nome EXATO de uma feature que está em top_drivers")
+    efeito: str = Field(description="direção e tamanho, citando o multiplicador do JSON")
+    evidencia: str = Field(description="o valor da feature no criativo, citado do JSON")
+
+class Explicacao(BaseModel):
+    resumo: str = Field(description="2 ou 3 frases para o marketing, com previsão e intervalo")
+    fatores: list[Fator] = Field(description="de 2 a 5 fatores, na ordem de top_drivers")
+    ressalvas: list[str] = Field(description="incerteza, confidence_flag e limites do modelo")
+```
+
+As regras do prompt (no bloco de código da chamada, mais abaixo) seguem uma lógica simples: cada regra fecha uma porta de invenção que aparece na prática.
+
+1. **Só fatos do JSON.** Fecha a porta das causas externas (trends, público, sazonalidade).
+2. **Números exatamente como no JSON**, com duas conversões autorizadas: multiplicador em porcentagem e probabilidade em porcentagem. Qualquer outra conta vira erro de arredondamento ou invenção.
+3. **Fatores com o nome exato de `top_drivers`, na mesma ordem.** Isso torna o texto conferível por código e impede que o LLM promova um fator menor porque "soa melhor".
+4. **Linguagem de marketing, sem jargão.** "SHAP", "log" e "feature" não ajudam quem decide.
+5. **Sempre citar o intervalo.** Uma explicação sem incerteza é mais convincente e menos honesta.
+6. **"Baixa confiança:" na primeira ressalva** quando o flag estiver ligado, com os motivos do JSON.
+7. **Associação, não causa.** O SHAP explica o modelo, não o mundo (aula 5.6).
+
+Use **temperatura 0**. Ela reduz a variação entre chamadas e deixa o texto mais previsível, o que facilita testar. Ela não garante fidelidade nem determinismo absoluto entre versões do modelo: quem garante a fidelidade é o validador.
+
+---
+
+## O validador determinístico
+
+O validador faz, em código, as checagens que cabem em código. Ele extrai todos os números do texto (no formato brasileiro: "4.380" é quatro mil trezentos e oitenta, "1,33" é um vírgula trinta e três) e compara com os números do payload, mais as conversões que o prompt autoriza. Depois confere os fatores, o intervalo e a regra do flag.
+
+```python
+import json
+import re
+
+NUM = re.compile(r"\d+(?:[.,]\d+)*")
+
+def _para_float(txt):
+    """'4.380' -> 4380; '1,33' -> 1.33 (convenção pt-BR)."""
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", txt):
+        return float(txt.replace(".", ""))
+    return float(txt.replace(".", "").replace(",", "."))
+
+def numeros_permitidos(payload):
+    """Todo número do JSON, mais as conversões que o prompt autoriza."""
+    ok = set()
+    def visitar(x):
+        if isinstance(x, bool):
+            return
+        if isinstance(x, (int, float)):
+            ok.update({round(float(x), 2), round(float(x) * 100)})      # 0.94 -> 94 (%)
+            if 0.5 < x < 3:
+                ok.add(round(abs(x - 1) * 100))                         # x1.33 -> 33 (%)
+        elif isinstance(x, str):
+            ok.update(_para_float(n) for n in NUM.findall(x))
+        elif isinstance(x, (list, dict)):
+            for v in (x.values() if isinstance(x, dict) else x):
+                visitar(v)
+    visitar(payload)
+    return ok
+
+def validar(explicacao: dict, payload: dict) -> list[str]:
+    """Checagem determinística de fidelidade. Lista vazia = passou."""
+    problemas = []
+    citados = {round(_para_float(n), 2) for n in NUM.findall(json.dumps(explicacao, ensure_ascii=False))}
+    for n in sorted(citados - numeros_permitidos(payload)):
+        problemas.append(f"número que não está no payload: {n:g}")
+    drivers = {d["feature"] for d in payload["top_drivers"]}
+    for f in explicacao["fatores"]:
+        if f["fator"] not in drivers:
+            problemas.append(f"fator fora de top_drivers: {f['fator']}")
+    for campo in ("interval_low", "interval_high"):
+        if round(float(payload[campo]), 2) not in citados:
+            problemas.append(f"o intervalo não foi citado ({campo})")
+    if not explicacao["ressalvas"]:
+        problemas.append("sem ressalvas: a incerteza precisa aparecer")
+    elif payload["confidence_flag"]["baixa_confianca"] and \
+            not explicacao["ressalvas"][0].startswith("Baixa confiança"):
+        problemas.append("confidence_flag = true, mas as ressalvas não começam com 'Baixa confiança'")
+    return problemas
+```
+
+Três explicações de teste: uma fiel, uma com um fator inventado e uma que troca o intervalo por "viralizar" e inventa um detalhe do vídeo.
+
+```python
+boa = Explicacao(
+    resumo="O Short B deve render cerca de 4.380 curtidas, 1,9 vez o Short típico da Lumina "
+           "(2.300). Em 80% dos cenários, fica entre 2.300 e 8.300 curtidas.",
+    fatores=[
+        {"fator": "gancho", "efeito": "é o principal motor: cerca de 33% a mais (x1,33)",
+         "evidencia": "gancho com nota 8"},
+        {"fator": "energia_musica", "efeito": "cerca de 11% a mais (x1,11)",
+         "evidencia": "música com energia 7"},
+        {"fator": "rosto", "efeito": "cerca de 10% a mais (x1,10)", "evidencia": "rosto na tela"},
+    ],
+    ressalvas=["A chance de B superar A é de 94%, mas os intervalos dos dois se sobrepõem.",
+               "Os fatores são associações aprendidas pelo modelo, não causas comprovadas."],
+).model_dump()
+
+inventada = {**boa, "fatores": boa["fatores"] + [
+    {"fator": "tendencia_do_tiktok", "efeito": "cerca de 40% a mais", "evidencia": "trend viral"}]}
+sem_intervalo = {**boa, "resumo": "O Short B deve viralizar: o gancho prende nos primeiros 2 segundos."}
+
+for nome, exp_ in [("boa", boa), ("inventada", inventada), ("sem_intervalo", sem_intervalo)]:
+    print(f"{nome:<14}", validar(exp_, payload_b))
+```
+
+```text
+boa            []
+inventada      ['número que não está no payload: 40', 'fator fora de top_drivers: tendencia_do_tiktok']
+sem_intervalo  ['número que não está no payload: 2', 'o intervalo não foi citado (interval_low)', 'o intervalo não foi citado (interval_high)']
+```
+
+Repare no "2 segundos". O briefing do caso diz que o gancho de B acontece nos primeiros 2 s, e isso é verdade **no mundo**; mas não está no payload, então o modelo não sabe disso, e o explicador não pode dizer. O validador é literal de propósito. Se um fato é importante para a explicação, o lugar dele é o payload, não a memória do LLM. Pelo mesmo motivo, o intervalo de A (780 a 2.800) está no campo `comparacao`: sem ele, a frase "os intervalos se sobrepõem entre 2.300 e 2.800" seria reprovada, com razão.
+
+:::warning[O que o validador não pega]
+Ele não enxerga afirmações sem números nem nomes de feature, como "o público jovem adora transformações". E pode aprovar por coincidência: o número 10 passa porque ×1,10 vira "10%". Por isso ele é **necessário, mas não suficiente**, e o juiz existe.
+:::
+
+---
+
+## A chamada ao LLM, com correção
+
+O trecho abaixo **requer `GOOGLE_API_KEY`** e o pacote `langchain-google-genai==4.4.0` (veja o bloco "Ambiente" da [aula 5.1](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/por-que-um-numero-so-nao-basta)). As chamadas foram conferidas contra a API do `langchain==1.4.2`: `init_chat_model` aceita o formato `"provedor:modelo"` e `with_structured_output` aceita a classe Pydantic. O laço de correção foi testado com um modelo falso que primeiro devolve uma explicação inválida e depois uma válida.
+
+```python
+from langchain.chat_models import init_chat_model
+
+REGRAS = """Você explica previsões de performance de YouTube Shorts para um time de marketing.
+Você recebe um JSON com a saída de um modelo treinado. Regras:
+1. Use SOMENTE fatos do JSON. Não invente causas, tendências, públicos nem números.
+2. Cite os números exatamente como estão no JSON (curtidas, intervalo, multiplicadores).
+   Você pode converter multiplicador em porcentagem (1.33 = 33% a mais) e probabilidade
+   em porcentagem (0.94 = 94%). Nenhuma outra conta.
+3. Cada fator precisa ser uma feature de top_drivers, com o nome exato, na mesma ordem.
+4. Escreva em português, em linguagem de marketing, sem jargão (nada de SHAP, log, feature).
+5. Sempre cite o intervalo (interval_low e interval_high) no resumo.
+6. Se confidence_flag.baixa_confianca for true, a primeira ressalva começa com
+   "Baixa confiança:" e cita os motivos do JSON.
+7. Os fatores são associações aprendidas pelo modelo, não causas comprovadas. Diga isso."""
+
+llm = init_chat_model("google_genai:gemini-3.5-flash-lite", temperature=0)  # requer GOOGLE_API_KEY
+explicador = llm.with_structured_output(Explicacao)
+
+def explicar(payload, tentativas=2):
+    """Gera a explicação, valida e, se falhar, devolve os problemas ao LLM uma vez."""
+    mensagens = [("system", REGRAS), ("human", json.dumps(payload, ensure_ascii=False))]
+    for _ in range(tentativas):
+        saida = explicador.invoke(mensagens).model_dump()
+        problemas = validar(saida, payload)
+        if not problemas:
+            return saida
+        mensagens += [("ai", json.dumps(saida, ensure_ascii=False)),
+                      ("human", "Corrija estes problemas e responda de novo: " + "; ".join(problemas))]
+    raise ValueError(f"explicação infiel após {tentativas} tentativas: {problemas}")
+```
+
+Duas decisões de engenharia:
+
+- **Uma nova tentativa, não cinco.** Se o LLM falhou duas vezes com a lista de problemas na mão, insistir custa latência e dinheiro. Registre o caso para o golden set.
+- **Falhe fechado.** Em vez de devolver o texto reprovado, a tool pode cair num **texto de modelo** montado sem LLM ("Previsão de 4.380 curtidas, entre 2.300 e 8.300. Principais fatores: gancho (x1,33), energia da música (x1,11)..."). Menos elegante, sempre fiel.
+
+---
+
+## Avaliando fidelidade com LLM-as-a-judge
+
+O validador roda em toda chamada. A pergunta "as explicações são fiéis **em geral**?" pede outra ferramenta: um juiz que quebre cada explicação em afirmações e confira cada uma contra o JSON. É a mesma métrica de *faithfulness* que você viu na [tríade do RAG](/aulas/eval-driven-development/avaliando-pipelines-rag-a-triade-do-rag), com o payload no papel do contexto recuperado. O código **requer `GOOGLE_API_KEY`** e foi testado com um juiz falso:
+
+```python
+class Afirmacao(BaseModel):
+    texto: str = Field(description="uma afirmação atômica tirada da explicação")
+    sustentada: bool = Field(description="true se o JSON sustenta a afirmação")
+    evidencia: str = Field(description="campo do JSON que sustenta, ou 'nenhum'")
+
+class Veredito(BaseModel):
+    afirmacoes: list[Afirmacao]
+
+JUIZ = """Você audita explicações de previsões. Quebre a EXPLICAÇÃO em afirmações atômicas.
+Para cada uma, diga se o JSON a sustenta e cite o campo. Afirmações sobre causas,
+públicos, tendências ou números que não estão no JSON são sempre sustentada=false."""
+
+juiz = init_chat_model("google_genai:gemini-3.8-flash", temperature=0) \
+    .with_structured_output(Veredito)                                  # requer GOOGLE_API_KEY
+
+def fidelidade(explicacao, payload):
+    """Fração de afirmações sustentadas pelo payload (1,0 = totalmente fiel)."""
+    v = juiz.invoke([("system", JUIZ), ("human",
+        f"JSON:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+        f"EXPLICAÇÃO:\n{json.dumps(explicacao, ensure_ascii=False)}")])
+    return sum(a.sustentada for a in v.afirmacoes) / max(len(v.afirmacoes), 1), v
+```
+
+Como usar sem se enganar, seguindo o que o módulo de [LLM-as-a-judge](/aulas/eval-driven-development/llm-as-a-judge-e-g-eval) já ensinou:
+
+- **Golden set de payloads, não de textos.** Monte de 20 a 40 payloads variados: criativos fortes e fracos, com e sem `confidence_flag`, de setores diferentes, e alguns "armadilha" (payload sem comparáveis, fator negativo no topo). Rode o explicador e o juiz em todos a cada mudança de prompt ou de modelo.
+- **Juiz diferente do explicador.** Aqui, `gemini-3.8-flash` julga o `gemini-3.5-flash-lite`. O mesmo modelo tende a concordar consigo mesmo.
+- **Calibre o juiz.** Rotule à mão umas 20 afirmações (sustentada ou não) e confira se o juiz concorda. Sem isso, a nota do juiz é só mais uma opinião.
+- **Reporte duas métricas:** taxa de aprovação no validador (primeira tentativa e após correção) e fidelidade média do juiz. As duas entram no README.
+
+---
+
+## Explicador e persona: dois papéis que não se misturam
+
+A Galaxies já tem personas sintéticas que assistem aos criativos e dão opinião ("a transformação me prendeu, a música cansa um pouco"). É tentador pedir ao explicador para fazer isso também. Não peça.
+
+| | Explicador (esta aula) | Persona da Galaxies |
+| :--- | :--- | :--- |
+| **Fala sobre** | o que o **modelo** aprendeu com Shorts reais | como um **espectador** reage ao vídeo |
+| **Fonte** | só o payload | o vídeo e a construção da persona |
+| **Tipo de frase** | "o modelo associa o gancho forte a cerca de 33% a mais" | "os primeiros segundos me fizeram parar de rolar" |
+| **Como avaliar** | fidelidade ao JSON | outro problema, de outra equipe |
+
+Misturar os papéis destrói a propriedade mais valiosa do explicador: tudo que ele diz é **conferível**. A resposta final do agente pode trazer os dois textos, lado a lado e rotulados. O papel da sua camada é garantir que a parte estatística seja verificável.
+
+---
+
+## O exemplo completo: Short B
+
+**Entrada** (o `payload_b` do código acima, serializado; 0.1 e 1.1 aparecem sem o zero final, como o Python os imprime):
+
+```json
+{
+  "criativo": {"id": "lumina-B", "titulo": "1 produto, 20 segundos", "setor": "beleza",
+               "duracao_s": 22, "publicacao": "quinta 19h"},
+  "predicted_metric": 4380, "interval_low": 2300, "interval_high": 8300, "nivel_intervalo": 0.8,
+  "mediana_canal_90d": 2300, "relative_to_channel": 1.9,
+  "top_drivers": [
+    {"feature": "gancho", "valor": 8, "contribuicao_log": 0.28, "multiplicador": 1.33, "direcao": "aumenta"},
+    {"feature": "energia_musica", "valor": 7, "contribuicao_log": 0.1, "multiplicador": 1.11, "direcao": "aumenta"},
+    {"feature": "rosto", "valor": true, "contribuicao_log": 0.1, "multiplicador": 1.1, "direcao": "aumenta"},
+    {"feature": "texto_na_tela", "valor": true, "contribuicao_log": 0.08, "multiplicador": 1.08, "direcao": "aumenta"},
+    {"feature": "hora", "valor": 19, "contribuicao_log": 0.05, "multiplicador": 1.06, "direcao": "aumenta"}
+  ],
+  "comparaveis": [
+    {"titulo": "Antes/depois: corretivo em 15 s", "curtidas": 5100, "relativo_canal": 2.2},
+    {"titulo": "Base nova, teste de 1 dia", "curtidas": 3050, "relativo_canal": 1.3}
+  ],
+  "confidence_flag": {"baixa_confianca": false, "motivos": [], "posts_anteriores_canal": 142},
+  "comparacao": {"contra": "lumina-A", "prob_superar": 0.94, "predicted_contra": 1480,
+                 "interval_contra": [780, 2800]}
+}
+```
+
+**Saída esperada.** O texto abaixo foi escrito para ilustrar o formato e o tom (não é a resposta de uma chamada real ao LLM) e **passa no validador** (`validar(...)` devolve `[]`):
+
+```json
+{
+  "resumo": "O Short B deve render cerca de 4.380 curtidas, 1,9 vez o Short típico da Lumina (2.300). Em 80% dos cenários, o resultado fica entre 2.300 e 8.300 curtidas, e a chance de B superar o Short A é de 94%.",
+  "fatores": [
+    {"fator": "gancho", "efeito": "é o principal motor da previsão: cerca de 33% a mais (x1,33)", "evidencia": "gancho com nota 8"},
+    {"fator": "energia_musica", "efeito": "cerca de 11% a mais (x1,11)", "evidencia": "música com energia 7"},
+    {"fator": "rosto", "efeito": "cerca de 10% a mais (x1,10)", "evidencia": "rosto aparece na tela"},
+    {"fator": "texto_na_tela", "efeito": "cerca de 8% a mais (x1,08)", "evidencia": "texto grande na tela"},
+    {"fator": "hora", "efeito": "cerca de 6% a mais (x1,06)", "evidencia": "publicação na quinta às 19h"}
+  ],
+  "ressalvas": [
+    "Os intervalos de A e B se sobrepõem entre 2.300 e 2.800 curtidas: B é o favorito, não uma certeza.",
+    "Os fatores são padrões que o modelo aprendeu com Shorts anteriores, não causas comprovadas.",
+    "Dois Shorts parecidos do canal ficaram com 5.100 e 3.050 curtidas, na mesma faixa da previsão."
+  ]
+}
+```
+
+Compare com a frase da Galaxies: *"acho que vai viralizar por conta disso, disso e disso"*. A versão fiel troca "viralizar" por um número com intervalo, troca "acho" por uma probabilidade, e cada "disso" vira um fator com tamanho e evidência. É menos empolgante e muito mais útil.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+- **O campo `explanation` do contrato** recebe o objeto `Explicacao` (resumo, fatores, ressalvas), gerado a partir do mesmo payload que também alimenta `predicted_metric`, `interval_low`, `interval_high`, `confidence_flag`, `relative_to_channel` e `top_drivers`. Nenhum número da explicação nasce fora da tool.
+- **Short A** recebe a mesma estrutura: resumo com 1.480 curtidas (0,64 vez o típico, entre 780 e 2.800), fatores que **reduzem** (gancho fraco ×0,85, duração de 55 s ×0,87, música calma ×0,91) e a ressalva de que o rosto na tela ajuda (×1,10), mas não compensa.
+- **Para a decisão A vs. B**, a tool de ordenação passa `prob_superar = 0,94` e os dois intervalos; o explicador só narra. Se algum dos dois tivesse `confidence_flag` ligado, a primeira ressalva seria "Baixa confiança: ...", e o ranking deveria dizer isso.
+- **No README**, publique: a taxa de aprovação do validador na primeira tentativa, a fidelidade média do juiz no golden set e um exemplo reprovado com o motivo. Isso mostra que a camada de raciocínio é auditável, que é o que a Galaxies pediu.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Dar contexto demais ao explicador.** Transcrição, JSON do VLM e SHAP completo viram matéria-prima para invenção.
+2. **Deixar o LLM calcular.** Somar porcentagens, arredondar ou comparar números é trabalho do código; o prompt só autoriza duas conversões.
+3. **Confiar na temperatura 0.** Ela reduz variação, não garante fidelidade. A garantia é o validador.
+4. **Afrouxar o validador quando ele reprova um fato verdadeiro.** Se o fato importa, ponha-o no payload.
+5. **Usar o mesmo modelo como explicador e juiz**, ou um juiz nunca calibrado contra rótulos humanos.
+6. **Misturar explicação e persona.** "O público vai amar" não é explicação do modelo.
+7. **Esconder o intervalo e o flag para o texto ficar mais convincente.** É exatamente o que a camada existe para impedir.
+:::
+
+<Quiz
+  id="m5-a7"
+  perguntas={[
+    {
+      pergunta: 'O explicador escreveu: "O Short B deve render 4.380 curtidas graças ao gancho forte nos primeiros 2 segundos". O validador reprovou pelo número 2. O que fazer?',
+      opcoes: [
+        {texto: 'Liberar números pequenos no validador, já que "2 segundos" é verdade no briefing.', explicacao: 'O fato é verdadeiro no mundo, mas não está no payload: o modelo não o usou. Afrouxar o validador abre a porta para qualquer número "verdadeiro" que o LLM lembrar.'},
+        {texto: 'Se o momento do gancho importa, incluí-lo no payload (por exemplo, como valor de uma feature); caso contrário, manter a reprovação.', correta: true, explicacao: 'Exato. O payload define o que pode ser dito. Fato importante entra no JSON; o resto fica fora do texto.'},
+        {texto: 'Aumentar a temperatura para o LLM reescrever de outro jeito.', explicacao: 'Temperatura mais alta aumenta a variação e a chance de invenção; não resolve o problema.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas frases o explicador ancorado pode escrever sobre o Short B?',
+      multipla: true,
+      opcoes: [
+        {texto: '"O gancho é o principal fator: cerca de 33% a mais (x1,33)."', correta: true, explicacao: 'O fator está em top_drivers e o número é a conversão autorizada do multiplicador.'},
+        {texto: '"O público jovem da Lumina adora transformações rápidas."', explicacao: 'O modelo não sabe nada sobre o público. Isso é papel da persona, não do explicador.'},
+        {texto: '"Em 80% dos cenários, B fica entre 2.300 e 8.300 curtidas."', correta: true, explicacao: 'Intervalo e nível estão no payload, como a regra 5 exige.'},
+        {texto: '"Gancho e energia juntos somam 44% a mais."', explicacao: 'Porcentagens não somam: 1,33 × 1,11 ≈ 1,48. E a regra 2 proíbe contas além das duas conversões.'},
+      ],
+    },
+    {
+      pergunta: 'Por que existir um LLM-as-a-judge se já existe o validador determinístico?',
+      opcoes: [
+        {texto: 'Para substituir o validador em produção, que é lento.', explicacao: 'É o contrário: o validador é rápido e roda sempre; o juiz é caro e roda offline.'},
+        {texto: 'Porque o validador só confere números e nomes de fatores; afirmações qualitativas inventadas passam por ele.', correta: true, explicacao: 'Exato. O juiz decompõe o texto em afirmações e confere cada uma, pegando causas e generalizações que não têm número.'},
+        {texto: 'Porque o juiz melhora a explicação automaticamente.', explicacao: 'O juiz mede; quem melhora é você, mudando prompt, payload ou modelo a partir do que ele encontra.'},
+      ],
+    },
+    {
+      pergunta: 'O confidence_flag de um criativo está true com o motivo "canal_novo". O que a explicação precisa ter para passar no validador desta aula?',
+      opcoes: [
+        {texto: 'Nada de especial: o flag é só um campo técnico.', explicacao: 'A regra 6 e o validador exigem que a incerteza epistêmica apareça primeiro.'},
+        {texto: 'A primeira ressalva começando com "Baixa confiança", citando o motivo do JSON.', correta: true, explicacao: 'É a checagem implementada, e é a forma de comunicação defendida na aula 5.4: aviso na frente, motivo concreto.'},
+        {texto: 'Omitir a previsão e o intervalo.', explicacao: 'O validador exige o intervalo, e a aula 5.4 recomenda não esconder o número.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: o explicador do seu agente]
+1. Monte o payload real de 10 criativos do seu teste (inclua pelo menos 3 com `confidence_flag` ligado).
+2. Escreva à mão, para 2 deles, uma explicação fiel e uma infiel, e confira se o validador separa as duas.
+3. Com uma chave de API, rode `explicar` nos 10 e registre: aprovação na primeira tentativa, aprovação após correção e falhas.
+4. Rode `fidelidade` nos aprovados e leia as afirmações marcadas como não sustentadas. O que o validador deixou passar?
+5. Faça uma mudança no prompt ou no payload para corrigir o problema mais frequente e meça de novo.
+:::
+
+<details>
+<summary>Ver dicas e o que costuma aparecer</summary>
+
+- Três falhas que vale procurar primeiro: números recalculados (porcentagem de uma soma), o intervalo esquecido e fatores com nome "traduzido" (`energia da música` em vez de `energia_musica`). A terceira se resolve pedindo o nome exato em `fator` e a tradução só em `efeito`.
+- Se o juiz marcar como não sustentada uma frase como "os fatores são associações, não causas", ajuste o prompt dele: ressalvas metodológicas são sustentadas pela própria natureza do modelo. Esse é o tipo de caso que a calibração com rótulos humanos revela.
+- Para os criativos com flag, confira se o texto não "compensa" a baixa confiança com adjetivos ("mesmo assim, o criativo é excelente"). Se isso aparecer, acrescente uma regra.
+- Guarde os payloads e as saídas reprovadas: eles viram o golden set do módulo de [testes do agente](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente).
+
+</details>
+
+---
+
+## Resumo
+
+- O **explicador ancorado** recebe um **payload fechado** (previsão, intervalo, `relative_to_channel`, `top_drivers`, comparáveis, `confidence_flag`) e só pode citar o que está nele.
+- O **prompt** fecha as portas de invenção com regras explícitas; a **saída estruturada** (Pydantic: resumo, fatores, ressalvas) torna o texto conferível; a **temperatura baixa** reduz variação, mas não garante fidelidade.
+- O **validador determinístico** confere números, fatores, intervalo e flag em toda chamada, com **uma** tentativa de correção e um texto de modelo como plano B.
+- O **LLM-as-a-judge** mede **fidelidade** offline num golden set, com juiz diferente e calibrado.
+- **Explicador e persona** têm papéis separados: evidência do modelo de um lado, opinião do público do outro.
+
+## Referências
+
+- Lundberg e Lee. [*A Unified Approach to Interpreting Model Predictions*](https://arxiv.org/abs/1705.07874). NeurIPS, 2017.
+- Jacovi e Goldberg. [*Towards Faithfully Interpretable NLP Systems: How should we define and evaluate faithfulness?*](https://arxiv.org/abs/2004.03685). ACL, 2020.
+- Es, James, Espinosa-Anke e Schockaert. [*Ragas: Automated Evaluation of Retrieval Augmented Generation*](https://arxiv.org/abs/2309.15217). EACL (demos), 2024.
+- Zheng et al. [*Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena*](https://arxiv.org/abs/2306.05685). NeurIPS Datasets and Benchmarks, 2023.
+- Liu et al. [*G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment*](https://arxiv.org/abs/2303.16634). EMNLP, 2023.
+- Documentação do LangChain: [structured output](https://docs.langchain.com/oss/python/langchain/structured-output).
+- Na trilha: [LLM-as-a-judge e G-Eval](/aulas/eval-driven-development/llm-as-a-judge-e-g-eval) e [A tríade do RAG](/aulas/eval-driven-development/avaliando-pipelines-rag-a-triade-do-rag).
+
+**Próxima aula:** [O LLM orquestra, o modelo prevê](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/o-llm-orquestra-o-modelo-preve): como juntar previsão, intervalo, flag e explicação num agente em LangGraph e expor tudo como uma tool.

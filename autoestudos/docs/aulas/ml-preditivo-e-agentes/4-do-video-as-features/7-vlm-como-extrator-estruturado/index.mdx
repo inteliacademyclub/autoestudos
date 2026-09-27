@@ -1,0 +1,571 @@
+---
+sidebar_position: 7
+sidebar_label: 'VLM como extrator estruturado'
+title: 'VLM como extrator estruturado'
+description: 'A rubrica do briefing como schema Pydantic, o Gemini com structured output e backoff, o orçamento de tokens e como medir se as respostas do VLM são confiáveis.'
+tags: [ml-preditivo, multimodal, vlm]
+---
+
+import VlmBudgetCalculator from '@site/src/components/interativos/VlmBudgetCalculator';
+
+# VLM como Extrator Estruturado: Um Formulário, Não um Oráculo
+
+<LessonMeta
+  tempo="55 min"
+  semana={2}
+  etapa="multimodal"
+  objetivos={[
+    'Escrever a rubrica do briefing como um schema Pydantic com âncoras em cada nota',
+    'Chamar o Gemini com vídeo, structured output, temperatura zero e backoff para 429',
+    'Estimar o orçamento de tokens e de dias do free tier antes de processar a base',
+    'Medir a confiabilidade da rubrica com teste-reteste e concordância com detectores',
+  ]}
+  prerequisitos={[
+    {label: 'Detectores leves: rosto, texto e objetos', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/detectores-leves'},
+    {label: 'Function calling', to: '/aulas/conceitos-basicos-de-llm/function-calling'},
+    {label: 'LLM-as-a-judge e G-Eval', to: '/aulas/eval-driven-development/llm-as-a-judge-e-g-eval'},
+  ]}
+/>
+
+Há dois jeitos de pôr um <Termo id="vlm">VLM</Termo> no pipeline. No primeiro, você pergunta: *"esse Short vai viralizar?"*. A resposta vem bem escrita e convincente, e é inútil para o modelo preditivo: é um número sem régua, que muda com a formulação da pergunta e que o GBM não tem como auditar.
+
+No segundo, você entrega ao VLM um **formulário**: 18 perguntas fechadas, cada uma com uma escala ancorada ("0 = logo parado; 5 = pessoa começa a falar; 10 = resultado visual no primeiro segundo"). O VLM vira um anotador incansável que assiste a cada vídeo e preenche as mesmas colunas, na mesma escala, para a base inteira. Quem decide se a resposta importa, e quanto, é o GBM, com validação temporal.
+
+Esta aula monta o segundo jeito. É o mesmo desenho do *Understanding Virality* (Gupta et al., arXiv:2512.21402), em que um VLM extraiu atributos de 11 mil Shorts e um XGBoost aprendeu a relação com o engajamento, e do *LLMs Are Natural Video Popularity Predictors* (Kayal et al., Findings of ACL 2025), em que descrições geradas por VLM alimentaram a previsão. A diferença está no cuidado com a medição: schema validado, orçamento contado e confiabilidade medida.
+
+:::info[A ideia central]
+O VLM **extrai atributos**; ele não prevê. Cada campo da rubrica é uma coluna `vlm_*` com escala fixa e âncoras explícitas. Três regras sustentam o resto da aula:
+- a resposta é **validada por um schema** (Pydantic), e o que não passa não entra;
+- a extração tem **custo contado** (tokens e dias de cota) antes de começar;
+- a rubrica tem **confiabilidade medida** (teste-reteste e concordância com detectores) antes de virar feature.
+:::
+
+---
+
+## O fluxo
+
+<Sketch name="m4/a7-vlm-rubrica" alt="Fluxo da extração com VLM: URL pública do Short, prompt com âncoras e regras do setor e schema Pydantic de 18 campos entram no Gemini com temperatura zero, response_schema, 1 frame por segundo e baixa resolução. O Gemini devolve JSON, que passa pela validação Pydantic e vira vlm_*.parquet com uma linha por vídeo. Erros 429 e 5xx disparam espera com backoff exponencial e nova tentativa. O parquet alimenta uma caixa de confiabilidade: teste-reteste e concordância com detectores. Uma nota avisa que potencial_viral é opinião do modelo e que, no free tier, os dados podem ser usados pelo Google." caption="O VLM preenche um formulário; o Pydantic confere; o cache guarda." />
+
+---
+
+## A rubrica como schema Pydantic
+
+A rubrica do briefing vira uma classe. Três decisões de desenho importam mais que o resto:
+
+- **Âncoras dentro do schema.** A `description` de cada nota diz o que significam 0, 5 e 10. O Gemini recebe o schema junto com o pedido, então as âncoras chegam ao modelo sem você repeti-las no prompt.
+- **Restrições que o Pydantic cobra.** `ge=0, le=10` para notas, `Literal` para categorias e `max_length=5` para listas. Uma resposta fora disso é rejeitada, não "corrigida".
+- **Campos objetivos e subjetivos lado a lado.** `tem_rosto` e `texto_na_tela` têm detector equivalente (aula 4.6) e servem para medir o VLM; `forca_hook_0a10` e `clareza_beneficio_produto_0a10` só o VLM consegue julgar.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+
+
+def nota(ancoras: str):
+    """Campo inteiro de 0 a 10; as âncoras vão para o schema que o modelo lê."""
+    return Field(ge=0, le=10, description=ancoras)
+
+
+class Rubrica(BaseModel):
+    """Atributos de um Short, respondidos pelo VLM. Uma linha por vídeo."""
+
+    hook_primeiros_3s: str = Field(description="O que acontece de 0:00 a 0:03, em uma frase.")
+    forca_hook_0a10: int = nota("0 = logo ou tela parada; 5 = pessoa começa a falar do tema; "
+                                "10 = resultado visual ou pergunta forte já no 1º segundo.")
+    tem_rosto: bool = Field(description="Aparece um rosto humano em algum momento.")
+    close_up_produto: bool = Field(description="O produto aparece em close, ocupando boa parte do quadro.")
+    before_after_ou_transformacao: bool = Field(description="Mostra antes/depois ou uma transformação.")
+    try_on_ou_demonstracao: bool = Field(description="Alguém usa, veste, aplica ou dirige o produto.")
+    texto_na_tela: bool = Field(description="Há texto sobreposto (legenda automática não conta).")
+    densidade_texto_0a10: int = nota("0 = nenhum texto; 5 = uma frase curta por cena; "
+                                     "10 = texto ocupa a tela o tempo todo.")
+    ritmo_cortes_0a10: int = nota("0 = plano único; 5 = um corte a cada ~3 s; 10 = cortes a cada ~0,5 s.")
+    energia_musica_0a10: int = nota("0 = sem música; 5 = música de fundo discreta; "
+                                    "10 = música alta e acelerada que guia a edição.")
+    tom_narracao: Literal["ausente", "calmo", "animado", "instrucional"] = Field(
+        description="Tom da voz principal; 'ausente' se ninguém fala.")
+    brilho_saturacao_0a10: int = nota("0 = escuro e dessaturado; 5 = neutro; 10 = muito claro e saturado.")
+    cor_dominante: str = Field(description="Uma cor, em português. Ex.: 'bege', 'preto'.")
+    estetica_geral_0a10: int = nota("0 = amador e tremido; 5 = cuidado, mas simples; 10 = produção de estúdio.")
+    clareza_beneficio_produto_0a10: int = nota("0 = não dá para saber o que é vendido; 5 = produto claro, "
+                                               "benefício vago; 10 = benefício explícito e demonstrado.")
+    elementos_video_top5: list[str] = Field(min_length=1, max_length=5,
+                                            description="Até 5 elementos visuais marcantes, frases curtas.")
+    elementos_audio_top5: list[str] = Field(min_length=1, max_length=5,
+                                            description="Até 5 elementos sonoros marcantes, frases curtas.")
+    potencial_viral_0a10: int = nota("OPINIÃO do modelo. 0 = nenhum; 5 = típico do nicho; 10 = excepcional.")
+
+
+if __name__ == "__main__":
+    schema = Rubrica.model_json_schema()
+    print(len(schema["properties"]), "campos; obrigatórios:", len(schema["required"]))
+    print(schema["properties"]["forca_hook_0a10"])
+    print(schema["properties"]["tom_narracao"])
+```
+
+```text
+18 campos; obrigatórios: 18
+{'description': '0 = logo ou tela parada; 5 = pessoa começa a falar do tema; 10 = resultado visual ou pergunta forte já no 1º segundo.', 'maximum': 10, 'minimum': 0, 'title': 'Forca Hook 0A10', 'type': 'integer'}
+{'description': "Tom da voz principal; 'ausente' se ninguém fala.", 'enum': ['ausente', 'calmo', 'animado', 'instrucional'], 'title': 'Tom Narracao', 'type': 'string'}
+```
+
+A função `nota` existe porque um objeto `Field(...)` não deve ser reaproveitado entre campos: cada chamada cria um novo.
+
+Antes de gastar um único token, teste o schema contra respostas plausíveis e contra os erros que um VLM comete de verdade:
+
+```python
+import json
+from pydantic import ValidationError
+
+# resposta plausível do VLM para o Short B (escrita à mão para o teste)
+resposta_b = """{
+  "hook_primeiros_3s": "Metade do rosto sem maquiagem ao lado da metade pronta.",
+  "forca_hook_0a10": 8, "tem_rosto": true, "close_up_produto": true,
+  "before_after_ou_transformacao": true, "try_on_ou_demonstracao": true,
+  "texto_na_tela": true, "densidade_texto_0a10": 6, "ritmo_cortes_0a10": 7,
+  "energia_musica_0a10": 7, "tom_narracao": "ausente", "brilho_saturacao_0a10": 7,
+  "cor_dominante": "bege", "estetica_geral_0a10": 7,
+  "clareza_beneficio_produto_0a10": 8,
+  "elementos_video_top5": ["antes/depois lado a lado", "texto grande", "close do frasco"],
+  "elementos_audio_top5": ["música pop acelerada", "batida marcada"],
+  "potencial_viral_0a10": 7
+}"""
+b = Rubrica.model_validate_json(resposta_b)
+print("ok:", b.forca_hook_0a10, b.tom_narracao, b.elementos_video_top5[0])
+
+# três erros que um VLM comete de verdade
+ruins = {
+    "nota fora da escala": {"forca_hook_0a10": 12},
+    "categoria inventada": {"tom_narracao": "empolgado"},
+    "lista longa demais": {"elementos_audio_top5": ["a", "b", "c", "d", "e", "f"]},
+}
+for nome, patch in ruins.items():
+    try:
+        Rubrica.model_validate({**json.loads(resposta_b), **patch})
+    except ValidationError as e:
+        erro = e.errors()[0]
+        print(f"{nome:22s} -> {erro['loc'][0]}: {erro['msg']}")
+```
+
+```text
+ok: 8 ausente antes/depois lado a lado
+nota fora da escala    -> forca_hook_0a10: Input should be less than or equal to 10
+categoria inventada    -> tom_narracao: Input should be 'ausente', 'calmo', 'animado' or 'instrucional'
+lista longa demais     -> elementos_audio_top5: List should have at most 5 items after validation, not 6
+```
+
+---
+
+## O prompt: regras gerais e adaptação por setor
+
+O schema diz **o que** responder; o prompt diz **como olhar**. Ele é curto, e a parte que muda por setor define o que conta como close, demonstração e antes/depois em cada nicho.
+
+```python
+BASE = """Você é um analista de criativos de YouTube Shorts. Assista ao vídeo inteiro
+e preencha a rubrica em JSON. Regras:
+- Descreva só o que VÊ e OUVE; não adivinhe métricas de audiência.
+- Use as âncoras de cada nota (0, 5, 10) descritas no schema; notas intermediárias
+  são permitidas. Na dúvida entre duas notas, escolha a MENOR.
+- "hook_primeiros_3s" considera apenas 0:00 a 0:03.
+- Listas: frases curtas (2 a 5 palavras), em português, sem repetir itens.
+"""
+
+POR_SETOR = {
+    "beleza": """Setor BELEZA. close_up_produto = frasco/batom/paleta ocupando
+boa parte do quadro. try_on_ou_demonstracao = aplicação na pele, lábios ou swatch
+no braço. before_after = rosto sem e com o produto.""",
+    "moda": """Setor MODA. try_on_ou_demonstracao = alguém vestindo a peça (provador,
+look do dia). Diferencie corpo inteiro (look) de detalhe (tecido, costura) nos
+elementos visuais. before_after = transformação de look.""",
+    "automotivo": """Setor AUTOMOTIVO. close_up_produto = detalhe do carro (farol,
+roda, painel). try_on_ou_demonstracao = alguém dirigindo ou operando (POV, test
+drive). Registre em elementos_video se o plano é interior, exterior ou POV.""",
+}
+
+
+def montar_prompt(setor: str) -> str:
+    return BASE + "\n" + POR_SETOR[setor]
+```
+
+A regra "na dúvida, escolha a menor" não elimina vieses do modelo na hora de dar notas, mas os torna mais consistentes entre vídeos, e consistência é o que o GBM precisa: ele aprende a relação com o alvo, qualquer que seja o ponto zero da escala. Frases curtas nas listas preparam o terreno para a [aula 4.8](/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao), que transforma `elementos_video_top5` em clusters.
+
+---
+
+## A chamada ao Gemini
+
+O Gemini aceita **URL pública do YouTube** como vídeo: nada de baixar arquivo para esta etapa. A chamada abaixo usa `generate_content`, que segue suportado no SDK `google-genai` 2.25 (a documentação agora abre com a Interactions API, mas o structured output com Pydantic é direto aqui).
+
+```python
+from google import genai
+from google.genai import errors, types
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
+
+# Rubrica e montar_prompt vêm dos blocos anteriores
+MODELO = "gemini-3.5-flash-lite"   # ou "gemini-2.5-flash-lite" (mais barato)
+
+
+def _limite_ou_instavel(e: BaseException) -> bool:
+    """429 (limite de taxa) e 5xx (instabilidade) merecem nova tentativa; 400 não."""
+    return isinstance(e, errors.APIError) and (e.code == 429 or e.code >= 500)
+
+
+def montar_pedido(url_youtube: str, setor: str, baixa_res: bool = True):
+    video = types.Part(
+        file_data=types.FileData(file_uri=url_youtube),
+        video_metadata=types.VideoMetadata(fps=1),         # 1 frame/s (o padrão)
+    )
+    config = types.GenerateContentConfig(
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=Rubrica,                             # structured output
+        media_resolution=(types.MediaResolution.MEDIA_RESOLUTION_LOW
+                          if baixa_res else None),           # 66 vs 258 tokens/frame
+    )
+    return [video, montar_prompt(setor)], config
+
+
+@retry(retry=retry_if_exception(_limite_ou_instavel),
+       wait=wait_random_exponential(multiplier=2, max=120),  # 2 s, 4 s, 8 s... até 2 min
+       stop=stop_after_attempt(6), reraise=True)
+def extrair_rubrica(cliente: genai.Client, url_youtube: str, setor: str) -> tuple[Rubrica, int]:
+    # requer GEMINI_API_KEY
+    conteudo, config = montar_pedido(url_youtube, setor)
+    resp = cliente.models.generate_content(model=MODELO, contents=conteudo, config=config)
+    # resp.parsed vira None, em silêncio, se o JSON não passar no schema: valide você
+    rubrica = Rubrica.model_validate_json(resp.text)       # levanta ValidationError
+    return rubrica, resp.usage_metadata.total_token_count
+```
+
+Quatro detalhes que o teste revelou ou confirmou:
+
+1. **`resp.parsed` falha em silêncio.** Quando o JSON devolvido viola o schema (uma nota 12, por exemplo), o SDK não levanta erro: `resp.parsed` simplesmente vira `None`. Por isso a função valida `resp.text` com o Pydantic, que levanta `ValidationError`.
+2. **O backoff só vale para erros transitórios.** O 429 (cota por minuto estourada) e os 5xx passam; um 400 (pedido malformado) falha na hora, porque repetir não vai consertar. `wait_random_exponential` espalha as tentativas no tempo, o que evita que vários processos batam na API juntos. O SDK também tem `types.HttpRetryOptions`, se você preferir configurar a repetição no cliente.
+3. **Temperatura zero não garante determinismo.** Ela reduz a variação, mas o mesmo pedido pode voltar diferente. É por isso que existe o teste-reteste, mais abaixo.
+4. **Baixa resolução por padrão.** Para as perguntas da rubrica (há rosto? há texto? qual o ritmo?), 66 tokens por frame bastam na maior parte dos casos. Se `densidade_texto` sair ruim, teste a resolução padrão num subconjunto.
+
+Não há como testar a chamada real sem chave, mas dá para testar **tudo em volta dela** com um servidor falso. O `httpx.MockTransport` intercepta o pedido que o SDK montou e devolve uma resposta pronta:
+
+```python
+import json
+import httpx
+from google import genai
+from google.genai import types
+from pydantic import ValidationError
+
+# teste SEM chave: um "servidor" falso responde no lugar da API do Gemini
+resposta_ok = json.loads(resposta_b)                       # JSON do bloco de validação
+pedidos = []
+
+
+def servidor_falso(req: httpx.Request) -> httpx.Response:
+    pedidos.append(json.loads(req.content))
+    corpo = dict(resposta_ok, forca_hook_0a10=12) if len(pedidos) == 3 else resposta_ok
+    return httpx.Response(200, json={
+        "candidates": [{"content": {"role": "model", "parts": [{"text": json.dumps(corpo)}]},
+                        "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 3100, "candidatesTokenCount": 260,
+                          "totalTokenCount": 3360}})
+
+
+cliente = genai.Client(api_key="falsa", http_options=types.HttpOptions(
+    httpx_client=httpx.Client(transport=httpx.MockTransport(servidor_falso))))
+rub, tokens = extrair_rubrica(cliente, "https://www.youtube.com/watch?v=XXXXXXXXXXX", "beleza")
+print(type(rub).__name__, rub.forca_hook_0a10, tokens)
+corpo = pedidos[0]
+print(corpo["contents"][0]["parts"][0])
+print({k: v for k, v in corpo["generationConfig"].items() if k != "responseSchema"})
+extrair_rubrica(cliente, "https://www.youtube.com/watch?v=XXXXXXXXXXX", "moda")
+try:
+    extrair_rubrica(cliente, "https://www.youtube.com/watch?v=XXXXXXXXXXX", "moda")  # 3º: nota 12
+except ValidationError as e:
+    print("3ª resposta rejeitada:", e.errors()[0]["loc"], e.errors()[0]["msg"])
+```
+
+```text
+Rubrica 8 3360
+{'fileData': {'file_uri': 'https://www.youtube.com/watch?v=XXXXXXXXXXX'}, 'videoMetadata': {'fps': 1.0}}
+{'temperature': 0.0, 'responseMimeType': 'application/json', 'mediaResolution': 'MEDIA_RESOLUTION_LOW'}
+3ª resposta rejeitada: ('forca_hook_0a10',) Input should be less than or equal to 10
+```
+
+O corpo capturado confirma o que vai para a API: o vídeo como `fileData` com `videoMetadata` de 1 fps, temperatura zero, JSON como saída e resolução baixa. Os números de tokens desse teste são inventados pelo servidor falso.
+
+---
+
+## Orçamento: tokens e dias de cota
+
+O custo de um vídeo no Gemini é previsível. A 1 frame por segundo, cada frame custa 66 tokens em resolução baixa ou 258 na padrão, e o áudio custa 32 tokens por segundo. Para um vídeo de $$d$$ segundos:
+
+$$
+\text{tokens} \approx d \cdot (t_{\text{frame}} + 32) + t_{\text{prompt+schema}} + t_{\text{resposta}}
+$$
+
+| Duração | Resolução baixa (98 tokens/s) | Resolução padrão (290 tokens/s) |
+| :--- | ---: | ---: |
+| 30 s | 2.940 | 8.700 |
+| 60 s | 5.880 | 17.400 |
+
+Some cerca de 1.000 a 1.500 tokens de prompt, schema e resposta (estimativa pelo tamanho do texto; o valor real aparece em `usage_metadata`). Há ainda um limite que pesa mais que os tokens: no free tier, a API processa **no máximo 8 horas de vídeo do YouTube por dia**. Uma base de 3.000 Shorts com 35 s em média soma 105.000 s, ou seja, cerca de **3,6 dias** só por esse limite, antes de considerar as requisições por dia de cada modelo, que o Google não publica mais em número (veja no AI Studio).
+
+<VlmBudgetCalculator />
+
+A calculadora usa as mesmas regras de tokens; ajuste a duração média e o tamanho da sua base. A conclusão prática: **comece a extração com VLM na semana 2**, em lotes com cache, e não na véspera da entrega.
+
+:::danger[Free tier e privacidade]
+No free tier, os dados enviados **podem ser usados pelo Google e lidos por revisores humanos**. Para Shorts públicos da sua base, isso é aceitável. Para os criativos **ainda não publicados** de uma marca (como os Shorts A e B da Lumina), não é: use o tier pago, um VLM local ou peça autorização explícita.
+:::
+
+---
+
+## Etapa cacheada, um setor por vez
+
+A etapa segue o padrão do módulo: `cache_por_video` e `processar_lote` da [aula 4.1](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short). Como o prompt depende do setor, o lote roda um setor por vez.
+
+```python
+import pandas as pd
+from google import genai
+
+# cache_por_video, processar_lote e consolidar vêm da aula 4.1
+cliente = genai.Client()  # requer GEMINI_API_KEY no ambiente
+
+
+@cache_por_video("rubrica_vlm", versao=1)
+def etapa_vlm(video_id: str, setor: str) -> dict:
+    url = f"https://www.youtube.com/watch?v={video_id}"   # só vídeos públicos
+    rub, tokens = extrair_rubrica(cliente, url, setor)
+    # colunas com "_" são de controle: ficam na tabela, mas nunca viram feature
+    return {**rub.model_dump(), "_tokens": tokens, "_modelo_vlm": MODELO}
+
+
+# base: a tabela da sua coleta (módulo 1), com video_id e setor
+base = pd.DataFrame({"video_id": ["aB3dE5fG7hI", "Zx9Yw8Vu7Ts", "Qw1Er2Ty3Ui"],
+                     "setor": ["beleza", "beleza", "automotivo"]})
+for setor, ids in base.groupby("setor")["video_id"]:
+    df = processar_lote(etapa_vlm, ids.tolist(), setor=setor)
+    print(f"{setor}: {len(df)} ok, {df['_tokens'].sum()} tokens")
+print(consolidar(etapa_vlm)[["video_id", "forca_hook_0a10", "tom_narracao", "_tokens"]])
+```
+
+```text
+automotivo: 1 ok, 3360 tokens
+beleza: 2 ok, 6720 tokens
+      video_id  forca_hook_0a10 tom_narracao  _tokens
+0  Qw1Er2Ty3Ui                8      ausente     3360
+1  Zx9Yw8Vu7Ts                8      ausente     3360
+2  aB3dE5fG7hI                8      ausente     3360
+```
+
+A saída acima veio do servidor falso (por isso as três respostas são iguais). Uma resposta que falha na validação vai para `cache/rubrica_vlm_v1/_erros/`, com o traceback, e é refeita na próxima rodada. Mudou o prompt ou o schema? Suba a `versao`: o cache antigo fica guardado, e você pode comparar as duas versões.
+
+**Alternativas locais.** Se a cota ou a privacidade forem um problema, modelos abertos rodam na T4 do Colab: **Qwen3-VL** 2B, 4B ou 8B (Apache-2.0), **Gemma 4** (Apache-2.0, com entrada de vídeo) e **SmolVLM2** (256M, 500M e 2.2B, Apache-2.0). A T4 não suporta Flash Attention 2, então carregue o modelo em 4 bits (`BitsAndBytesConfig`) com `attn_implementation="eager"` e passe de 8 a 16 frames em vez do vídeo inteiro. Não testamos esses modelos nesta aula: meça o tempo por vídeo e compare a rubrica local com a do Gemini num subconjunto de 30 vídeos, com as mesmas métricas da próxima seção.
+
+---
+
+## A rubrica é confiável?
+
+Um anotador que responde coisas diferentes para o mesmo vídeo não é um bom anotador, seja ele humano ou modelo. Duas medições baratas respondem se a rubrica merece virar feature:
+
+1. **Teste-reteste.** Rode a rubrica **duas vezes** nos mesmos 30 vídeos (com `versao=2` no cache, para não reaproveitar a primeira rodada). Para campos booleanos, use o **kappa de Cohen**, que desconta a concordância esperada pelo acaso. Para notas de 0 a 10, use o **kappa ponderado quadrático**, que pune mais uma discordância de 2 contra 9 do que de 6 contra 7, e a correlação de Spearman.
+2. **Concordância com detectores.** Compare `tem_rosto` e `texto_na_tela` com as colunas `det_*` da [aula 4.6](/aulas/ml-preditivo-e-agentes/do-video-as-features/detectores-leves).
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.metrics import cohen_kappa_score
+
+
+def teste_reteste(r1: pd.DataFrame, r2: pd.DataFrame) -> pd.DataFrame:
+    """r1, r2: a mesma rubrica rodada 2x nos mesmos vídeos (índice = video_id)."""
+    linhas = []
+    for col in r1.columns:
+        a, b = r1[col], r2.loc[r1.index, col]
+        if a.dtype == bool:
+            linhas.append({"campo": col, "concordancia": (a == b).mean(),
+                           "kappa": cohen_kappa_score(a, b), "spearman": np.nan})
+        else:
+            linhas.append({"campo": col, "concordancia": (a == b).mean(),
+                           "kappa": cohen_kappa_score(a, b, weights="quadratic"),
+                           "spearman": spearmanr(a, b).statistic})
+    return pd.DataFrame(linhas).set_index("campo").round(2)
+
+
+# simulação: 30 vídeos; o gancho é estável, o "potencial viral" oscila muito
+rng = np.random.default_rng(7)
+n = 30
+verdade = rng.integers(2, 9, n)
+
+
+def rodada(ruido_hook, ruido_viral, erro_rosto):
+    return pd.DataFrame({
+        "forca_hook_0a10": np.clip(verdade + rng.integers(-ruido_hook, ruido_hook + 1, n), 0, 10),
+        "potencial_viral_0a10": np.clip(6 + rng.integers(-ruido_viral, ruido_viral + 1, n), 0, 10),
+        "tem_rosto": (verdade > 4) ^ (rng.random(n) < erro_rosto),
+    }, index=[f"v{i:02d}" for i in range(n)])
+
+
+r1, r2 = rodada(1, 2, 0.05), rodada(1, 2, 0.05)
+print(teste_reteste(r1, r2))
+
+# concordância com um detector (ex.: MediaPipe diz se há rosto em algum keyframe)
+mediapipe_rosto = (verdade > 4) ^ (rng.random(n) < 0.08)
+print("VLM vs MediaPipe (tem_rosto): kappa =",
+      round(cohen_kappa_score(r1["tem_rosto"], mediapipe_rosto), 2))
+```
+
+```text
+                      concordancia  kappa  spearman
+campo                                              
+forca_hook_0a10               0.53   0.91      0.92
+potencial_viral_0a10          0.10  -0.18     -0.19
+tem_rosto                     0.93   0.86       NaN
+VLM vs MediaPipe (tem_rosto): kappa = 0.86
+```
+
+Os dados são **simulados** com efeitos conhecidos, para mostrar a leitura. Repare na primeira linha: a concordância exata do gancho é só 53%, mas o kappa ponderado é 0,91. Notas vizinhas (6 contra 7) quase não pesam, e é isso que interessa para uma feature ordinal. Na segunda linha, a simulação dá ao "potencial viral" apenas ruído em volta de 6: o kappa perto de zero (ou negativo) diz que o campo **não mede nada estável**. Uma referência comum (Landis e Koch, 1977) chama kappas de 0,61 a 0,80 de concordância "substancial" e acima de 0,80 de "quase perfeita"; trate isso como convenção, não como lei.
+
+:::warning[`potencial_viral_0a10` é opinião]
+Esse campo é o LLM respondendo diretamente a pergunta que o projeto quer responder com dados. Ele pode ajudar (Kayal et al. mostraram que LLMs têm algum sinal zero-shot), mas também pode só repetir os outros campos com ruído. Mantenha-o na rubrica, meça a estabilidade e deixe a **ablação da [aula 4.8](/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao)** decidir se ele fica no modelo.
+:::
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Uma rubrica plausível para os dois Shorts da Lumina:
+
+| Campo | Short A (tutorial) | Short B (antes/depois) |
+| :--- | :--- | :--- |
+| `hook_primeiros_3s` | logo da marca, depois a apresentadora | metade do rosto sem maquiagem |
+| `forca_hook_0a10` | 3 | 8 |
+| `energia_musica_0a10` | 3 | 7 |
+| `tom_narracao` | instrucional | ausente |
+| `texto_na_tela` | false | true |
+| `before_after_ou_transformacao` | false | true |
+
+No simulador da trilha, o gancho é o atributo de conteúdo que mais pesa: `forca_hook_0a10 = 8` empurra a previsão do B em cerca de +0,28 em log (×1,33), e `= 3` puxa a do A em −0,17 (×0,85). São números **ilustrativos**; o seu modelo vai estimar os dele.
+
+Há um detalhe operacional importante: **A e B ainda não foram publicados**, então não há URL do YouTube. Para eles, suba o arquivo pela Files API e troque a parte de vídeo do pedido:
+
+```python
+import time
+from google.genai import types
+
+
+def parte_de_arquivo(cliente, caminho: str) -> types.Part:
+    """Criativo ainda não publicado: sobe o arquivo e espera o processamento."""
+    # requer GEMINI_API_KEY (assinaturas conferidas no google-genai 2.25.0; não executado)
+    arq = cliente.files.upload(file=caminho)
+    while arq.state == types.FileState.PROCESSING:
+        time.sleep(5)
+        arq = cliente.files.get(name=arq.name)
+    if arq.state != types.FileState.ACTIVE:
+        raise RuntimeError(f"processamento falhou: {arq.error}")
+    return types.Part(file_data=types.FileData(file_uri=arq.uri, mime_type=arq.mime_type),
+                      video_metadata=types.VideoMetadata(fps=1))
+```
+
+Lembre do aviso de privacidade: criativo não publicado de cliente não vai para o free tier.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Perguntar a previsão ao VLM.** O VLM preenche a rubrica; o número vem do GBM.
+2. **Notas sem âncora.** "Dê uma nota de 0 a 10 para o gancho" gera escalas diferentes a cada chamada. Escreva o que significam 0, 5 e 10.
+3. **Confiar em `resp.parsed`.** Ele vira `None` sem erro quando o JSON viola o schema. Valide com o Pydantic.
+4. **Repetir qualquer erro.** Backoff é para 429 e 5xx. Um 400 repetido seis vezes só gasta cota.
+5. **Deixar a extração para o fim.** Com 8 h de vídeo do YouTube por dia no free tier, uma base de 3.000 Shorts leva dias.
+6. **Mudar o prompt no meio da base.** Metade dos vídeos com um prompt e metade com outro é uma quebra de regime dentro das features. Mudou? Suba a versão e reprocesse tudo.
+:::
+
+<Quiz
+  id="m4-a7"
+  perguntas={[
+    {
+      pergunta: 'O Gemini devolveu um JSON com `"forca_hook_0a10": 12`. O que acontece com `resp.parsed` no google-genai 2.25?',
+      opcoes: [
+        {texto: 'O SDK levanta uma exceção de validação.', explicacao: 'No teste com o servidor falso, nenhuma exceção foi levantada.'},
+        {texto: '`resp.parsed` vira `None`, sem erro; por isso validamos `resp.text` com o Pydantic.', correta: true, explicacao: 'Exato. Sem a validação explícita, uma resposta inválida passaria como "vazia" sem ninguém perceber.'},
+        {texto: 'O SDK corta o valor para 10.', explicacao: 'Não há correção automática; e corrigir em silêncio esconderia um problema de rubrica.'},
+      ],
+    },
+    {
+      pergunta: 'Quais erros devem disparar nova tentativa com backoff exponencial? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: '429 (limite de taxa)', correta: true, explicacao: 'É transitório: esperar resolve.'},
+        {texto: '503 (serviço indisponível)', correta: true, explicacao: 'Erros 5xx costumam ser transitórios.'},
+        {texto: '400 (pedido inválido)', explicacao: 'O pedido está errado; repetir não conserta e gasta cota.'},
+        {texto: 'ValidationError do Pydantic', explicacao: 'Com temperatura zero, a resposta tende a se repetir. Registre o erro e revise o prompt ou o schema.'},
+      ],
+    },
+    {
+      pergunta: 'Um Short de 60 s em resolução baixa custa quantos tokens de vídeo e áudio, aproximadamente?',
+      opcoes: [
+        {texto: 'Cerca de 1.900', explicacao: 'Isso seria só o áudio (60 × 32). Faltam os frames.'},
+        {texto: 'Cerca de 5.900', correta: true, explicacao: '60 × (66 + 32) = 5.880 tokens, mais o prompt e a resposta.'},
+        {texto: 'Cerca de 17.400', explicacao: 'Esse é o custo na resolução padrão (258 tokens por frame).'},
+      ],
+    },
+    {
+      pergunta: 'No teste-reteste, `forca_hook_0a10` teve concordância exata de 53% e kappa ponderado de 0,91. Como ler?',
+      opcoes: [
+        {texto: 'O campo é instável: só metade das notas se repetiu.', explicacao: 'A concordância exata ignora que 6 contra 7 é quase a mesma resposta numa escala ordinal.'},
+        {texto: 'O campo é estável como feature ordinal: as discordâncias são entre notas vizinhas.', correta: true, explicacao: 'O kappa ponderado quadrático pune pouco discordâncias pequenas. Para o GBM, isso é o que importa.'},
+        {texto: 'Os números são contraditórios; houve erro no cálculo.', explicacao: 'Não há contradição: as duas métricas medem coisas diferentes.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: piloto de 30 vídeos antes da base inteira]
+1. Escolha 30 Shorts da sua base (10 por setor) e rode `etapa_vlm` com `versao=1`.
+2. Rode de novo com `versao=2` (mesmo prompt) e calcule o teste-reteste de todos os campos.
+3. Calcule a concordância de `tem_rosto` e `texto_na_tela` com as colunas `det_*` da aula 4.6.
+4. Some os `_tokens` e projete o custo e os dias para a base inteira.
+5. Decida: quais campos ficam, quais saem e qual resolução usar.
+:::
+
+<details>
+<summary>Critérios sugeridos para decidir</summary>
+
+- **Fica** o campo com kappa (ponderado, para notas) acima de cerca de 0,6 no teste-reteste. Abaixo disso, reescreva as âncoras e rode de novo antes de desistir do campo.
+- **Campos com detector equivalente**: se a concordância com o detector passar de 0,8, os dois medem a mesma coisa; prefira o detector (mais barato e determinístico) e use o campo do VLM só para auditoria.
+- **`potencial_viral_0a10`** fica na tabela, mas entra no modelo só se a ablação da aula 4.8 mostrar ganho com intervalo de confiança acima de zero.
+- **Resolução**: se `densidade_texto_0a10` e `close_up_produto` forem estáveis em resolução baixa, fique nela; o custo cai para cerca de um terço.
+- **Projeção**: com 30 vídeos, você tem a média real de tokens por vídeo. Multiplique pela base e compare com o limite de 8 h de vídeo do YouTube por dia.
+
+</details>
+
+---
+
+## Resumo
+
+- O VLM é um **extrator**: preenche uma rubrica fixa, com âncoras em cada nota; quem prevê é o GBM.
+- **Schema Pydantic** com `ge`/`le`, `Literal` e `max_length`, validado explicitamente, porque `resp.parsed` falha em silêncio.
+- **Gemini** com URL do YouTube, `temperature=0`, `response_schema`, 1 fps e resolução baixa; **backoff** exponencial só para 429 e 5xx.
+- **Orçamento**: cerca de 98 tokens por segundo em resolução baixa e, no free tier, 8 h de vídeo do YouTube por dia. Comece cedo.
+- **Confiabilidade** antes de feature: teste-reteste com **kappa ponderado** e concordância com detectores. `potencial_viral` é opinião e passa pela ablação.
+
+## Referências
+
+- Google. [Video understanding](https://ai.google.dev/gemini-api/docs/video-understanding) (Gemini API): URL do YouTube, limites do free tier e processamento de vídeo.
+- Google. [Structured output](https://ai.google.dev/gemini-api/docs/structured-output) (Gemini API).
+- [google-genai](https://github.com/googleapis/python-genai): SDK Python usado na aula (versão 2.25.0).
+- Gupta et al. [*Understanding Virality: A Rubric based Vision-Language Model Framework for Short-Form Edutainment Evaluation*](https://arxiv.org/abs/2512.21402). arXiv, 2025.
+- Kayal, Mettes, Dehmamy e Park. [*Large Language Models Are Natural Video Popularity Predictors*](https://aclanthology.org/2025.findings-acl.597/). Findings of ACL, 2025.
+- Cohen, J. *Weighted kappa: Nominal scale agreement with provision for scaled disagreement or partial credit*. Psychological Bulletin, 1968.
+- Landis, J. R. e Koch, G. G. *The Measurement of Observer Agreement for Categorical Data*. Biometrics, 1977.
+- [Tenacity](https://tenacity.readthedocs.io/): `retry_if_exception` e `wait_random_exponential`.
+
+**Próxima aula:** [Fusão e ablação multimodal](/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao): como juntar todos os blocos numa tabela só e provar, com validação temporal e bootstrap, quais deles valem a pena.

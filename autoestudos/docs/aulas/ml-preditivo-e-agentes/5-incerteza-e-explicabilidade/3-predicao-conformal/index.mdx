@@ -1,0 +1,407 @@
+---
+sidebar_position: 3
+sidebar_label: 'Predição conformal'
+title: 'Predição conformal'
+description: 'Split conformal e CQR: como calibrar intervalos com garantia de cobertura, por que o tempo quebra a garantia, como usar o MAPIE 1.5 com corte temporal e por que cobertura marginal não é condicional.'
+tags: [ml-preditivo, galaxies, incerteza, conformal]
+---
+
+import IntervalExplorer from '@site/src/components/interativos/IntervalExplorer';
+
+# Predição Conformal: Uma Garantia de Cobertura com uma Letra Miúda
+
+<LessonMeta
+  tempo="50 min"
+  semana={3}
+  etapa="incerteza"
+  objetivos={[
+    'Explicar o split conformal: scores de não conformidade, conjunto de calibração e o quantil ajustado',
+    'Demonstrar a garantia de cobertura e dizer exatamente qual hipótese ela exige',
+    'Calibrar com a fatia temporal mais recente e medir o efeito do drift',
+    'Usar o MAPIE 1.5 (SplitConformalRegressor e ConformalizedQuantileRegressor) com modelos já treinados',
+    'Diferenciar cobertura marginal de condicional e medi-la por setor',
+  ]}
+  prerequisitos={[
+    {label: 'Regressão quantílica e pinball loss', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica'},
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+  ]}
+/>
+
+A aula anterior terminou com um incômodo: o intervalo de 80% da regressão quantílica cobriu 76% do teste. Não é um desastre, mas é uma promessa quebrada. E se a Lumina perguntar "como vocês sabem que o intervalo de vocês vale 80%?", a resposta "porque treinamos com a perda certa" não sustenta nada: o modelo aprendeu os quantis nos mesmos dados em que se ajustou, e fora deles fica confiante demais.
+
+Existe um jeito de consertar isso que não depende de o modelo estar certo, nem de o ruído ser normal, nem de nenhuma forma de distribuição. Ele pega um modelo qualquer, mede quanto ele erra num conjunto de dados que ele nunca viu e usa esses erros para ajustar o intervalo. Com uma única hipótese sobre os dados, o resultado vem com **garantia matemática** de cobertura.
+
+Essa hipótese é a letra miúda da aula. Ela se chama **permutabilidade**, e o tempo, que é justamente o eixo do seu projeto, a quebra.
+
+:::info[A ideia central]
+A <Termo id="conformal">predição conformal</Termo> separa um **conjunto de calibração**, mede nele um **score de não conformidade** (o tamanho do erro) para cada exemplo e usa um quantil ligeiramente inflado desses scores como margem. Se calibração e futuro forem **permutáveis**, o intervalo cobre o resultado real com probabilidade de pelo menos $$1 - \alpha$$, para qualquer modelo. Com dados que mudam no tempo, a garantia vira aproximação: calibre com a fatia **mais recente** e monitore.
+:::
+
+---
+
+## A ideia em quatro passos
+
+<Sketch name="m5/split-conformal" alt="Linha do tempo com três blocos: treino (passado mais antigo), calibração (fatia mais recente) e teste ou futuro. Passo 1: treina o modelo pontual ou quantílico só com o treino. Passo 2: na calibração, mede o erro com o score de não conformidade, que é o valor absoluto de y menos y chapéu, ou o máximo entre q baixo menos y e y menos q alto. Passo 3: q chapéu é o quantil de ordem teto de n mais 1 vezes 1 menos alfa, dividido por n, dos scores. Passo 4: split conformal dá y chapéu mais ou menos q chapéu, com a mesma largura para todos; CQR dá q baixo menos q chapéu até q alto mais q chapéu, com largura que acompanha a dificuldade. Nota: a garantia vale na média se calibração e futuro forem permutáveis; drift quebra a hipótese." caption="Split conformal: o modelo é treinado num bloco e julgado em outro." />
+
+Na versão mais simples, o **split conformal**:
+
+1. Separe os dados em treino e calibração. Treine o modelo $$\hat{f}$$ só no treino.
+2. Para cada um dos $$n$$ exemplos da calibração, calcule o **score de não conformidade** (*nonconformity score*), que mede o quanto o exemplo "não se conforma" à previsão. Para regressão, o mais comum é o erro absoluto: $$s_i = |y_i - \hat{f}(x_i)|$$.
+3. Calcule $$\hat{q}$$, o $$k$$-ésimo menor score, com $$k = \lceil (n+1)(1-\alpha) \rceil$$. Em termos de quantil, é o quantil de nível $$\lceil (n+1)(1-\alpha) \rceil / n$$, um pouco acima de $$1 - \alpha$$.
+4. Para um criativo novo, o intervalo é $$\hat{f}(x) \pm \hat{q}$$.
+
+É só isso. Nenhuma suposição sobre $$\hat{f}$$: pode ser um LightGBM ruim, uma regressão linear ou a mediana do canal. Um modelo pior gera scores maiores e, portanto, intervalos mais largos, mas a cobertura continua valendo.
+
+---
+
+## Por que funciona: o argumento do ranking
+
+Chame de $$s_{n+1}$$ o score do criativo novo, calculado com o resultado real que você ainda não conhece. O intervalo cobre esse resultado exatamente quando $$s_{n+1} \le \hat{q}$$.
+
+Agora a hipótese: os $$n + 1$$ pares $$(x_i, y_i)$$, os $$n$$ da calibração mais o novo, são **permutáveis** (*exchangeable*): a distribuição conjunta não muda se você embaralhar a ordem deles. Dados i.i.d. são permutáveis. Se são, os $$n+1$$ scores também são, e qualquer um deles tem a mesma chance de ocupar qualquer posição no ranking. Então a posição de $$s_{n+1}$$ entre os $$n+1$$ scores é uniforme em $$\{1, \dots, n+1\}$$ (sem empates). Cobrir significa que $$s_{n+1}$$ ficou entre os $$k$$ menores:
+
+$$
+P\big(y_{n+1} \in \hat{C}(x_{n+1})\big) = P\big(\text{posição de } s_{n+1} \le k\big) = \frac{k}{n+1} = \frac{\lceil (n+1)(1-\alpha) \rceil}{n+1} \;\ge\; 1 - \alpha
+$$
+
+E, sem empates, também vale o teto $$1 - \alpha + \frac{1}{n+1}$$: com 1.351 exemplos de calibração, a cobertura fica entre 80,0% e 80,1%. O "+1" do quantil ajustado vem daí: ele conta o criativo novo como mais um participante do ranking. Se $$n$$ for tão pequeno que $$k > n$$ (com $$\alpha = 0{,}2$$, menos de 4 exemplos), o intervalo correto é infinito.
+
+Três detalhes da garantia que costumam ser lidos errado:
+
+- Ela é **marginal**: vale na média sobre criativos novos e sobre o sorteio da calibração, não para cada criativo individualmente.
+- Ela **não diz nada sobre largura**. Um modelo inútil gera intervalos enormes e ainda assim cobre 80%.
+- Ela exige **permutabilidade entre calibração e futuro**, não entre treino e futuro. O treino pode ser de outra época; o que precisa se parecer com o futuro é a calibração.
+
+---
+
+## Por que o tempo quebra a garantia
+
+No seu projeto, o futuro não é um embaralhamento do passado. O algoritmo do YouTube muda, a concorrência por atenção em Shorts cresce, canais crescem, e a contagem de views já mudou de regime duas vezes. Com <Termo id="drift">drift</Termo>, os scores de erro de hoje tendem a ser diferentes dos de seis meses atrás, e o argumento do ranking deixa de valer.
+
+Não existe uma solução perfeita, mas existe uma regra que reduz o estrago: **a calibração deve ser a fatia temporal mais recente antes do teste** (e, em produção, antes de hoje). Ela é, entre os dados que você tem, a mais parecida com o futuro. O corte fica assim:
+
+| Bloco | Período | Uso |
+| :--- | :--- | :--- |
+| Treino | mais antigo | ajustar o modelo (e os quantis) |
+| Calibração | as semanas imediatamente anteriores ao teste | medir scores e calcular $$\hat{q}$$ |
+| Teste | o mais recente | medir cobertura e largura, uma vez |
+
+Por isso a função `train_conformalize_test_split` do MAPIE **não serve** para este projeto: ela sorteia os três blocos aleatoriamente, misturando passado e futuro, exatamente o erro de <Termo id="split-temporal">validação</Termo> que o módulo 2 ensinou a evitar. Separe por data, à mão.
+
+:::warning[Um detalhe que só existe em engajamento]
+O alvo é "curtidas em 30 dias". Um Short publicado há 10 dias ainda não tem alvo. Em produção, a calibração mais recente possível termina **30 dias antes de hoje**. Se você recalibrar toda semana, use os posts que acabaram de completar 30 dias.
+:::
+
+---
+
+## Split conformal na mão
+
+Antes da biblioteca, o método inteiro em numpy. Os dados são sintéticos, com o mesmo ruído heterocedástico da aula anterior e um ingrediente a mais: o ruído **cresce com o tempo**, um drift controlado. Os blocos desta seção formam um único script.
+
+```python
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+def gerar_base(n=8_000, seed=7):
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "dia": np.sort(rng.integers(0, 900, n)),
+        "nivel_canal": rng.normal(6.5, 1.2, n),
+        "posts_anteriores": rng.integers(0, 120, n),
+        "gancho": rng.integers(0, 11, n),
+        "automotivo": (rng.random(n) < 0.3).astype(float),
+    })
+    ruido = 0.25 + 0.55 * np.exp(-df.posts_anteriores / 15) + 0.25 * df.automotivo
+    ruido *= 1 + 0.6 * df.dia / 900           # drift: a plataforma fica mais volátil
+    df["y"] = df.nivel_canal + 0.09 * (df.gancho - 5) + rng.normal(0, 1, n) * ruido
+    return df
+
+FEATURES = ["nivel_canal", "posts_anteriores", "gancho", "automotivo"]
+df = gerar_base()
+treino = df[df.dia < 600]                        # passado
+calib = df[(df.dia >= 600) & (df.dia < 750)]     # fatia mais recente antes do teste
+teste = df[df.dia >= 750]                        # "futuro"
+X_tr, y_tr = treino[FEATURES].to_numpy(), treino.y.to_numpy()
+X_cal, y_cal = calib[FEATURES].to_numpy(), calib.y.to_numpy()
+X_te, y_te = teste[FEATURES].to_numpy(), teste.y.to_numpy()
+
+def gbm(**kw):
+    """LightGBM com a mesma configuração da aula 5.2, treinado só no treino."""
+    return lgb.LGBMRegressor(n_estimators=400, learning_rate=0.03, num_leaves=15,
+                             min_child_samples=40, verbose=-1, **kw).fit(X_tr, y_tr)
+```
+
+O split conformal cabe em sete linhas:
+
+```python
+def split_conformal(pred_cal, y_cal, pred_novo, alpha=0.2):
+    """Intervalo (1 - alpha) de largura constante, calibrado nos resíduos."""
+    n = len(y_cal)
+    scores = np.sort(np.abs(y_cal - pred_cal))        # nonconformity scores, ordenados
+    k = int(np.ceil((n + 1) * (1 - alpha)))           # posição do quantil ajustado
+    q_hat = scores[k - 1] if k <= n else np.inf       # k-ésimo menor score
+    return pred_novo - q_hat, pred_novo + q_hat, q_hat
+
+modelo = gbm(objective="regression_l1")              # prevê a mediana
+lo, hi, q_hat = split_conformal(modelo.predict(X_cal), y_cal, modelo.predict(X_te))
+print(f"n_cal={len(y_cal)}  q_hat={q_hat:.3f}  "
+      f"cobertura no teste={np.mean((y_te >= lo) & (y_te <= hi)):.1%}  largura={np.mean(hi - lo):.3f}")
+```
+
+```text
+n_cal=1351  q_hat=0.728  cobertura no teste=77.0%  largura=1.456
+```
+
+A cobertura ficou em 77%, e não em 80%, porque o teste é mais ruidoso que a calibração: o drift está fazendo efeito. Para confirmar que o método em si funciona, fiz um controle com os mesmos dados: sorteei calibração e teste **dentro do mesmo período** (dias 600 a 899), ou seja, blocos permutáveis por construção. Em 20 sorteios, a cobertura média foi de 80,2%, variando entre 78,1% e 83,0%. A garantia vale quando a hipótese vale; a diferença entre 80% e 77% é o preço do tempo.
+
+:::tip[Se você já viu outra versão do código]
+O artigo de Angelopoulos e Bates usa `np.quantile(scores, np.ceil((n+1)*(1-alpha))/n, method="higher")`. Pela forma como o numpy indexa, isso devolve o $$k$$-ésimo score ou o seguinte, ou seja, é igual ou ligeiramente mais conservador. Com milhares de exemplos, a diferença é desprezível; aqui usei a estatística de ordem exata para bater com a teoria e com o MAPIE.
+:::
+
+---
+
+## Split vs. CQR: largura constante ou adaptativa
+
+O split conformal com erro absoluto dá **a mesma margem para todo mundo**: $$\pm 0{,}728$$ em log, tanto para a Lumina quanto para um canal de 3 posts. Você perdeu a largura adaptativa que a regressão quantílica tinha conquistado.
+
+A **Conformalized Quantile Regression** (CQR), de Romano, Patterson e Candès (2019), junta os dois mundos. Ela parte das bandas quantílicas $$[\hat{q}_{\text{lo}}(x), \hat{q}_{\text{hi}}(x)]$$ e usa como score a distância, com sinal, até a banda:
+
+$$
+s_i = \max\big(\hat{q}_{\text{lo}}(x_i) - y_i,\; y_i - \hat{q}_{\text{hi}}(x_i)\big)
+$$
+
+O score é positivo quando $$y_i$$ ficou fora da banda (quanto fora) e negativo quando ficou dentro (quão folgado). O intervalo final é $$[\hat{q}_{\text{lo}}(x) - \hat{q},\ \hat{q}_{\text{hi}}(x) + \hat{q}]$$. Se os quantis crus subcobrem, $$\hat{q} > 0$$ e a banda alarga; se sobrecobrem, $$\hat{q} < 0$$ e ela estreita. A garantia de cobertura é a mesma do split, e a forma da banda, mais larga onde o ruído é maior, é preservada.
+
+---
+
+## Com o MAPIE 1.5, a partir de modelos já treinados
+
+O MAPIE 1.x organiza tudo em três verbos: `fit` → `conformalize` → `predict_interval`. Como você já treinou os modelos (e quer controlar o split temporal), use `prefit=True` e pule o `fit`. Duas convenções que valem ouro:
+
+- `confidence_level=0.8` é a cobertura desejada (não o $$\alpha$$).
+- No `ConformalizedQuantileRegressor` com `prefit=True`, a lista de modelos vem na ordem **[inferior, superior, mediana]**, e os quantis precisam ser $$(1-c)/2$$, $$(1+c)/2$$ e 0,5. Para 80%: 0,1, 0,9 e 0,5.
+
+```python
+from mapie.regression import ConformalizedQuantileRegressor, SplitConformalRegressor
+
+def resumo(nome, lo, hi):
+    dentro = (y_te >= lo) & (y_te <= hi)
+    auto = X_te[:, 3] == 1                            # coluna "automotivo"
+    print(f"{nome:<6} cobertura={dentro.mean():.1%}  largura={np.mean(hi - lo):.3f} | "
+          f"moda/beleza {dentro[~auto].mean():.1%} (larg. {np.mean((hi - lo)[~auto]):.2f})  "
+          f"automotivo {dentro[auto].mean():.1%} (larg. {np.mean((hi - lo)[auto]):.2f})")
+
+# 1) split conformal: um modelo pontual já treinado (prefit=True)
+split = SplitConformalRegressor(gbm(objective="regression_l1"),
+                                confidence_level=0.8, prefit=True)
+split.conformalize(X_cal, y_cal)
+pontos, iv = split.predict_interval(X_te)            # iv.shape = (n, 2, 1)
+resumo("split", iv[:, 0, 0], iv[:, 1, 0])
+
+# 2) CQR: três quantílicos já treinados, na ordem [inferior, superior, mediana]
+q_lo, q_hi, q_med = (gbm(objective="quantile", alpha=a) for a in (0.1, 0.9, 0.5))
+cqr = ConformalizedQuantileRegressor([q_lo, q_hi, q_med], confidence_level=0.8, prefit=True)
+cqr.conformalize(X_cal, y_cal)
+pontos, iv = cqr.predict_interval(X_te)
+resumo("CQR", iv[:, 0, 0], iv[:, 1, 0])
+
+# referência: os quantis crus da aula 5.2, sem conformal
+resumo("cru", q_lo.predict(X_te), q_hi.predict(X_te))
+```
+
+```text
+split  cobertura=77.0%  largura=1.456 | moda/beleza 85.9% (larg. 1.46)  automotivo 56.4% (larg. 1.46)
+INFO:root:The predictions are ill-sorted.
+CQR    cobertura=76.2%  largura=1.489 | moda/beleza 79.6% (larg. 1.31)  automotivo 68.5% (larg. 1.92)
+cru    cobertura=64.9%  largura=1.182 | moda/beleza 66.6% (larg. 1.00)  automotivo 60.8% (larg. 1.61)
+```
+
+Primeiro, confira que o split do MAPIE bate com a versão na mão: mesma cobertura (77,0%) e mesma largura (1,456). A mensagem `The predictions are ill-sorted` é um aviso de log do MAPIE: em algumas linhas, a mediana prevista ficou fora da banda $$[\hat{q}_{\text{lo}}, \hat{q}_{\text{hi}}]$$. Ele só avisa; ordene os quantis na saída da sua tool, como na aula anterior. O `predict_interval` devolve um array de forma `(n, 2, n_niveis)`: por isso o `[:, 0, 0]` e o `[:, 1, 0]`.
+
+Agora, a comparação que interessa:
+
+- **Quantis crus:** 64,9%. Com o drift deste exemplo, a subcobertura da regressão quantílica ficou pior que na aula anterior.
+- **Split e CQR:** os dois sobem para perto de 77%, a melhor cobertura possível com uma calibração mais calma que o teste.
+- **A distribuição da cobertura é muito diferente.** O split cobre 86% de moda/beleza e só **56%** do automotivo, porque dá a mesma margem para os dois. O CQR alarga o automotivo (1,92 contra 1,31) e chega a 80% e 68,5%.
+
+---
+
+## Cobertura marginal não é cobertura condicional
+
+A garantia conformal é **marginal**: $$P(y \in \hat{C}(x)) \ge 1 - \alpha$$ na média sobre todos os criativos. O que a Lumina gostaria é da **condicional**: $$P(y \in \hat{C}(x) \mid x) \ge 1 - \alpha$$ para o criativo dela. A segunda é muito mais forte e, sem hipóteses sobre a distribuição, é impossível de garantir com amostras finitas de forma útil (Foygel Barber e colegas, 2021, formalizam esse limite).
+
+O que dá para fazer na prática, em ordem de esforço:
+
+1. **Use scores que se adaptam** (CQR em vez de split com erro absoluto). Foi o que aproximou o automotivo de 80%.
+2. **Meça a cobertura por grupo** (setor, faixa de tamanho do canal, formato). É barato e revela onde a promessa falha.
+3. **Calibre por grupo** (*Mondrian conformal*): um $$\hat{q}$$ separado para cada setor, calculado só com a calibração daquele setor. A garantia passa a valer dentro de cada grupo, desde que cada um tenha exemplos suficientes na calibração (algumas centenas é um bom ponto de partida).
+4. **Sinalize o que não dá para calibrar.** Um grupo com 20 exemplos não sustenta intervalo confiável: é caso para o `confidence_flag` da [próxima aula](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca).
+
+---
+
+## Quanto a escolha da calibração importa
+
+O último experimento compara três escolhas de calibração para o mesmo CQR, com o mesmo teste (dias 750 a 899). O treino encolhe para os dias 0 a 449, para sobrar história para comparar.
+
+```python
+def cqr_na_mao(lo_cal, hi_cal, y_cal, lo_novo, hi_novo, alpha=0.2):
+    """CQR (Romano et al., 2019): alarga (ou estreita) as bandas quantílicas."""
+    n = len(y_cal)
+    scores = np.sort(np.maximum(lo_cal - y_cal, y_cal - hi_cal))   # > 0 se ficou fora
+    q_hat = scores[int(np.ceil((n + 1) * (1 - alpha))) - 1]
+    return lo_novo - q_hat, hi_novo + q_hat
+
+tr = df[df.dia < 450]                                      # treino menor, para sobrar história
+opcoes = {"no próprio treino (erro)": tr,
+          "antiga (dias 450-599)": df[(df.dia >= 450) & (df.dia < 600)],
+          "recente (dias 600-749)": df[(df.dia >= 600) & (df.dia < 750)]}
+q = {a: lgb.LGBMRegressor(objective="quantile", alpha=a, n_estimators=400, learning_rate=0.03,
+                          num_leaves=15, min_child_samples=40, verbose=-1)
+        .fit(tr[FEATURES].to_numpy(), tr.y.to_numpy()) for a in (0.1, 0.9)}
+for nome, cal in opcoes.items():
+    Xc = cal[FEATURES].to_numpy()
+    lo, hi = cqr_na_mao(q[0.1].predict(Xc), q[0.9].predict(Xc), cal.y.to_numpy(),
+                        q[0.1].predict(X_te), q[0.9].predict(X_te))
+    print(f"calibração {nome:<26} cobertura no teste={np.mean((y_te >= lo) & (y_te <= hi)):.1%}  "
+          f"largura={np.mean(hi - lo):.3f}")
+```
+
+```text
+calibração no próprio treino (erro)   cobertura no teste=61.7%  largura=1.117
+calibração antiga (dias 450-599)      cobertura no teste=74.7%  largura=1.435
+calibração recente (dias 600-749)     cobertura no teste=76.0%  largura=1.475
+```
+
+- **Calibrar no treino** é o erro clássico: o modelo já se ajustou àqueles dados, os scores ficam pequenos demais e a cobertura despenca para 62%. Isso não é conformal; é autoengano.
+- **Antiga vs. recente:** a fatia recente cobre mais, porque se parece mais com o teste. A diferença aqui é modesta (1,3 ponto) porque o drift simulado é lento; com uma quebra de regime, ela seria bem maior.
+- **Nenhuma chega a 80%.** Com drift contínuo, qualquer calibração do passado é um pouco otimista. A resposta completa é recalibrar continuamente, e o método para isso, o *Adaptive Conformal Inference* (ACI), está na aula opcional [Conformal adaptativo e drift](/aulas/ml-preditivo-e-agentes/ir-alem/conformal-adaptativo).
+
+O componente abaixo (dados **simulados** pelo simulador da trilha) mostra o conformal em ação: explore como a calibração muda a banda e a cobertura.
+
+<IntervalExplorer />
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+- **O que entra na tool:** os três modelos quantílicos da aula 5.2, mais **um número**, o $$\hat{q}$$ do CQR, calculado na fatia mais recente de posts já maduros (30 dias). A saída passa a ser `interval_low = expm1(q0,1 − q̂)` e `interval_high = expm1(q0,9 + q̂)`. Versione o $$\hat{q}$$ e a data da calibração junto com o modelo.
+- **Lumina A vs. B:** os intervalos canônicos do caso (780 a 2.800 para A, 2.300 a 8.300 para B; ilustrativos, do simulador da trilha) são os **já calibrados**. A calibração alargou os dois igualmente em log, então a conclusão da aula 5.1 continua de pé: $$P(B > A) \approx 0{,}94$$.
+- **No README:** publique a tabela split vs. CQR vs. cru, com cobertura e largura, total e por setor. É a prova de que o "80%" da resposta do agente foi medido, não declarado.
+- **O que ainda escapa:** um canal novo da beleza, com 4 posts, pode receber um intervalo "calibrado na média" que, para ele, cobre bem menos que 80%. Isso é tarefa da próxima aula.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Usar `train_conformalize_test_split`.** Ele é aleatório. Separe treino, calibração e teste por data.
+2. **Calibrar no treino.** Os scores ficam pequenos e a cobertura cai muito; no exemplo, 62%.
+3. **Calibrar com posts imaturos.** Sem 30 dias, o alvo ainda está crescendo e os scores ficam enviesados.
+4. **Ler a garantia como condicional.** Ela vale na média, não para cada criativo nem para cada setor. Meça por grupo.
+5. **Esquecer a ordem da lista do CQR com `prefit=True`:** [inferior, superior, mediana].
+6. **Trocar `confidence_level` por `alpha`.** No MAPIE 1.x, 0,8 significa cobertura de 80%.
+7. **Calibrar uma vez e esquecer.** Com drift, o $$\hat{q}$$ envelhece. Recalibre periodicamente e monitore a cobertura realizada.
+:::
+
+<Quiz
+  id="m5-a3"
+  perguntas={[
+    {
+      pergunta: 'Você tem 99 exemplos de calibração e quer um intervalo de 90%. Qual score vira o q̂ do split conformal?',
+      opcoes: [
+        {texto: 'O 89º menor score (o quantil 0,9 comum de 99 valores).', explicacao: 'Faltou o ajuste de amostra finita. O criativo novo entra no ranking como o 100º participante.'},
+        {texto: 'O 90º menor score, porque k = teto((99 + 1) × 0,9) = 90.', correta: true, explicacao: 'Exato. Com n + 1 = 100 participantes permutáveis, ficar entre os 90 menores tem probabilidade 90/100.'},
+        {texto: 'O maior score, para garantir cobertura de 100%.', explicacao: 'Isso cobriria mais que o pedido e produziria intervalos desnecessariamente largos.'},
+      ],
+    },
+    {
+      pergunta: 'Qual hipótese a garantia de cobertura do split conformal exige?',
+      opcoes: [
+        {texto: 'Que os resíduos do modelo sejam normais.', explicacao: 'Não. O método é livre de distribuição: não supõe nenhuma forma para os erros.'},
+        {texto: 'Que o modelo esteja bem especificado.', explicacao: 'Não. Um modelo ruim gera intervalos largos, mas a cobertura continua valendo.'},
+        {texto: 'Que os exemplos de calibração e o exemplo novo sejam permutáveis.', correta: true, explicacao: 'É a única hipótese. Drift temporal a viola, por isso a calibração deve ser a fatia mais recente.'},
+        {texto: 'Que treino, calibração e teste venham do mesmo período.', explicacao: 'O treino pode ser de outra época. O que precisa se parecer com o futuro é a calibração.'},
+      ],
+    },
+    {
+      pergunta: 'Seu split conformal cobre 80% no total, mas 58% no setor automotivo. O que explica e o que fazer?',
+      opcoes: [
+        {texto: 'É um bug do MAPIE; trocar de biblioteca resolve.', explicacao: 'Não é bug. A garantia é marginal, e o split dá a mesma margem para setores com ruídos diferentes.'},
+        {texto: 'A garantia é marginal; usar CQR, medir por grupo e, havendo dados, calibrar por setor (Mondrian).', correta: true, explicacao: 'Exato. Scores adaptativos e calibração por grupo aproximam a cobertura condicional.'},
+        {texto: 'Aumentar o confidence_level para 0,95 em todos os setores.', explicacao: 'Alarga tudo, inclusive onde já sobra cobertura, e ainda pode não resolver o automotivo.'},
+      ],
+    },
+    {
+      pergunta: 'No CQR, o q̂ calculado na calibração deu negativo (−0,05). O que isso significa?',
+      opcoes: [
+        {texto: 'Um erro de implementação: scores de não conformidade não podem ser negativos.', explicacao: 'No CQR podem: o score é negativo quando o valor real ficou dentro da banda, com folga.'},
+        {texto: 'Que as bandas quantílicas cruas estavam largas demais, e o CQR vai estreitá-las.', correta: true, explicacao: 'Exato. q̂ < 0 significa que a banda crua sobrecobria; o intervalo final fica mais estreito e ainda calibrado.'},
+        {texto: 'Que o modelo não serve e deve ser descartado.', explicacao: 'Pelo contrário: significa que ele era conservador. O CQR aproveita e deixa o intervalo mais útil.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: conformalize a sua tool]
+1. Divida a sua base em treino, calibração (as 6 a 8 semanas anteriores ao teste, só com posts de 30 dias ou mais) e teste, por data.
+2. Aplique split conformal e CQR (com o MAPIE ou com as funções desta aula) sobre os modelos da aula 5.2.
+3. Monte a tabela: cru, split e CQR, com cobertura e largura, total e por setor.
+4. Escolha um setor mal coberto e teste o Mondrian: calcule um $$\hat{q}$$ só com a calibração desse setor. A cobertura dele melhorou? Quantos exemplos de calibração ele tinha?
+:::
+
+<details>
+<summary>Ver dicas e uma implementação do Mondrian</summary>
+
+O Mondrian é o CQR aplicado grupo a grupo. Reaproveitando `cqr_na_mao`:
+
+```python
+def cqr_mondrian(lo_cal, hi_cal, y_cal, g_cal, lo_novo, hi_novo, g_novo, alpha=0.2):
+    """Um q̂ por grupo (ex.: setor). Grupos sem calibração ficam com intervalo infinito."""
+    lo_out = np.full(len(lo_novo), -np.inf)
+    hi_out = np.full(len(hi_novo), np.inf)
+    for g in np.unique(g_novo):
+        c, t = g_cal == g, g_novo == g
+        if c.sum() >= 1 / alpha:                   # mínimo para k <= n
+            lo_out[t], hi_out[t] = cqr_na_mao(lo_cal[c], hi_cal[c], y_cal[c],
+                                              lo_novo[t], hi_novo[t], alpha)
+    return lo_out, hi_out
+```
+
+- Com os dados sintéticos desta aula (grupo = coluna `automotivo`), o Mondrian levou o automotivo de 68,5% para 78,8% de cobertura, alargando a banda dele (1,92 para 2,27 em log), e estreitou moda/beleza (1,31 para 1,20), que caiu de 79,6% para 76,1%.
+- O mínimo `1 / alpha` só evita o intervalo infinito; para um $$\hat{q}$$ estável, mire em algumas centenas de exemplos por grupo.
+- Espere que o setor mal coberto melhore e o bem coberto **estreite**. Se a melhora for pequena, o problema pode ser drift, não o setor: compare a cobertura por mês.
+- Um intervalo infinito é uma resposta honesta ("não sei"), mas a tool precisa tratá-lo: é um motivo automático de baixa confiança.
+
+</details>
+
+---
+
+## Resumo
+
+- **Split conformal:** treine em um bloco, calcule **scores de não conformidade** em outro e use o $$\lceil (n+1)(1-\alpha) \rceil$$-ésimo menor como margem.
+- A garantia $$1 - \alpha \le P(\text{cobrir}) \le 1 - \alpha + \frac{1}{n+1}$$ exige só **permutabilidade** entre calibração e futuro, e é **marginal**.
+- O tempo quebra a permutabilidade: **calibre com a fatia mais recente** de posts maduros, nunca no treino, e recalibre.
+- **CQR** (Romano et al., 2019) conformaliza bandas quantílicas e mantém a **largura adaptativa**; o split dá a mesma margem para todos.
+- No **MAPIE 1.5**: `prefit=True` → `conformalize(X_cal, y_cal)` → `predict_interval(X)`; CQR recebe [inferior, superior, mediana]. Meça a cobertura **por grupo**.
+
+## Referências
+
+- Angelopoulos e Bates. [*A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification*](https://arxiv.org/abs/2107.07511). arXiv, 2021.
+- Romano, Patterson e Candès. [*Conformalized Quantile Regression*](https://arxiv.org/abs/1905.03222). NeurIPS, 2019.
+- Vovk, Gammerman e Shafer. [*Algorithmic Learning in a Random World*](https://link.springer.com/book/10.1007/b106715). Springer, 2005.
+- Lei, G'Sell, Rinaldo, Tibshirani e Wasserman. [*Distribution-Free Predictive Inference for Regression*](https://arxiv.org/abs/1604.04173). JASA, 2018.
+- Foygel Barber, Candès, Ramdas e Tibshirani. [*The limits of distribution-free conditional predictive inference*](https://arxiv.org/abs/1903.04684). Information and Inference, 2021.
+- Gibbs e Candès. [*Adaptive Conformal Inference Under Distribution Shift*](https://arxiv.org/abs/2106.00170). NeurIPS, 2021.
+- Documentação do [MAPIE](https://mapie.readthedocs.io/).
+
+**Próxima aula:** [Sinal de baixa confiança](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca): o que fazer quando o criativo está fora do que o modelo conhece, e como dizer isso em uma frase.

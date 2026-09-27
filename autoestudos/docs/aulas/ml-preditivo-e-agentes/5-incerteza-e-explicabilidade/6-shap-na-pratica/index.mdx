@@ -1,0 +1,505 @@
+---
+sidebar_position: 6
+sidebar_label: 'SHAP na prática'
+title: 'SHAP na prática'
+description: 'TreeExplainer no LightGBM e no CatBoost, valor base e aditividade em log, conversão para multiplicadores, gráficos locais e globais, blocos de embeddings, armadilhas e a função top_drivers do contrato.'
+tags: [ml-preditivo, galaxies, explicabilidade, shap]
+---
+
+import ShapWaterfall from '@site/src/components/interativos/ShapWaterfall';
+
+# SHAP na Prática: Do Valor em Log à Frase "o Gancho Rende 33% a Mais"
+
+<LessonMeta
+  tempo="50 min"
+  semana={3}
+  etapa="explicacao"
+  objetivos={[
+    'Calcular SHAP exato em LightGBM e CatBoost com o TreeExplainer e conferir a aditividade',
+    'Converter contribuições em log para multiplicadores de curtidas sem errar a conta',
+    'Escolher o background certo para responder à pergunta do marketing',
+    'Agrupar as colunas de PCA do embedding num bloco "visual" e montar os top_drivers do contrato',
+    'Reconhecer as armadilhas: correlação, causalidade, background e escala',
+  ]}
+  prerequisitos={[
+    {label: 'Shapley values: a intuição', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shapley-values'},
+    {label: 'LightGBM, CatBoost e XGBoost na prática', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost'},
+    {label: 'Embeddings visuais: CLIP e SigLIP 2', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais'},
+  ]}
+/>
+
+Você roda `shap.TreeExplainer(modelo)` no seu LightGBM, pede a explicação do Short B e recebe um vetor de 16 números. O maior deles diz `log_mediana_canal: +0,94`. Depois vem `gancho: +0,23`, e lá embaixo uma fileira de `visual_pca_2: −0,015`, `visual_pca_5: −0,008`... A soma de todos dá 1,43, e o valor base é 6,81.
+
+Nada disso pode ir para a Lumina desse jeito. "+1,02" de quê? O que é `visual_pca_3`? E por que a maior explicação para o desempenho de um criativo é "o canal é grande", se a marca quer saber por que **este** Short deve render mais que o **outro**, do mesmo canal?
+
+Esta aula transforma a matemática da aula anterior, via <Termo id="shap">SHAP</Termo>, em um objeto que o agente consegue usar: uma lista curta de fatores, com valor, contribuição em log, multiplicador em curtidas e direção. É o campo `top_drivers` do contrato. No caminho, você vai ver que três escolhas (o background, a escala e o agrupamento das colunas) mudam completamente a história que o SHAP conta.
+
+:::info[A ideia central]
+Para modelos de árvores, o **TreeSHAP** calcula valores de Shapley **exatos** e rápidos. Como o modelo prevê $$\log(1 + \text{curtidas})$$, as contribuições **somam em log** e, portanto, **multiplicam em curtidas**: uma contribuição $$\phi$$ vira um multiplicador $$e^{\phi}$$. Para comparar criativos do mesmo canal, use como background os posts recentes **do próprio canal**, agrupe as colunas do embedding num bloco "visual" e publique os $$k$$ maiores fatores.
+:::
+
+---
+
+## TreeSHAP: exato, rápido e com dois modos
+
+Na aula anterior, a força bruta avaliou $$2^p$$ coalizões. O TreeSHAP (Lundberg e colegas, 2020) usa a estrutura das árvores para calcular os mesmos valores em tempo polinomial, da ordem de $$O(T L D^2)$$ para $$T$$ árvores com $$L$$ folhas e profundidade $$D$$, em vez de exponencial no número de features. Na prática, milhares de Shorts são explicados em segundos na CPU. O `TreeExplainer` do SHAP 0.52 (que exige Python 3.12 ou mais novo) tem dois modos:
+
+| Modo | Como chamar | O que "remover uma feature" significa |
+| :--- | :--- | :--- |
+| `tree_path_dependent` | `shap.TreeExplainer(modelo)` | segue os dois ramos de cada divisão, ponderados pela quantidade de exemplos de treino que passou por cada um |
+| `interventional` | `shap.TreeExplainer(modelo, data=fundo, feature_perturbation="interventional")` | troca as features "ausentes" por valores de cada linha do background, como na força bruta da aula 5.5 |
+
+O primeiro não precisa de background e é o mais rápido. O segundo é mais lento (o custo cresce com o tamanho do background, limitado a 100 linhas por padrão), mas deixa **você** escolher a referência. Você vai usar os dois nesta aula.
+
+---
+
+## Na prática: SHAP num modelo de Shorts
+
+Os blocos desta aula formam um único script, na ordem. Os dados são **sintéticos**, com os mesmos efeitos do simulador dos componentes interativos (gancho, rosto, texto na tela, energia da música, duração, horário nobre), mais 8 colunas de PCA de um embedding visual em que só a primeira tem efeito, e pequeno. O efeito do conteúdo é centralizado por setor, para que `log_mediana_canal` seja o nível do Short típico do canal.
+
+```python
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+n = 8_000
+PCA = [f"visual_pca_{i}" for i in range(8)]       # embedding visual reduzido por PCA
+df = pd.DataFrame(rng.normal(0, 1, (n, 8)), columns=PCA)
+df["dia"] = np.sort(rng.integers(0, 900, n))
+df["log_mediana_canal"] = rng.normal(6.8, 1.3, n)   # log1p da mediana dos últimos 90 dias
+df["setor_beleza"] = (rng.random(n) < 0.35).astype(int)
+df["gancho"] = np.clip(np.round(rng.normal(5, 2, n)), 0, 10)   # força do gancho (0-10)
+df["rosto"] = (rng.random(n) < 0.7).astype(int)
+df["texto_na_tela"] = (rng.random(n) < 0.5).astype(int)
+df["energia_musica"] = np.clip(np.round(rng.normal(5, 2.2, n)), 0, 10)
+df["duracao_s"] = np.clip(np.round(rng.normal(28, 12, n)), 8, 90)
+df["hora"] = np.where(rng.random(n) < 0.4, rng.integers(18, 23, n), rng.integers(7, 24, n))
+conteudo = (0.09 * df.gancho + df.rosto * (0.10 + 0.25 * df.setor_beleza)
+            + 0.15 * df.texto_na_tela + 0.05 * df.energia_musica
+            - 0.005 * df.duracao_s + 0.12 * df.hora.between(18, 22) + 0.06 * df.visual_pca_0)
+# centraliza por setor: assim log_mediana_canal é o nível do Short "típico" do canal
+conteudo -= conteudo.groupby(df.setor_beleza).transform("mean")
+df["y"] = df.log_mediana_canal + conteudo + rng.normal(0, 0.5, n)   # log1p(curtidas)
+
+FEATURES = ["log_mediana_canal", "setor_beleza", "gancho", "rosto", "texto_na_tela",
+            "energia_musica", "duracao_s", "hora"] + PCA
+treino, teste = df[df.dia < 750], df[df.dia >= 750]
+modelo = lgb.LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=15,
+                           min_child_samples=30, verbose=-1).fit(treino[FEATURES], treino.y)
+```
+
+Primeiro, a explicação "de fábrica", sem background:
+
+```python
+import shap
+
+explainer = shap.TreeExplainer(modelo)             # TreeSHAP exato, sem background
+exp = explainer(teste[FEATURES])                   # objeto shap.Explanation
+base = float(exp.base_values[0])
+print(f"valor base (média das previsões no treino): {base:.3f} -> {np.expm1(base):,.0f} curtidas")
+
+i = 0                                              # um Short qualquer do teste
+pred = modelo.predict(teste[FEATURES].iloc[[i]])[0]
+print(f"previsão {pred:.3f} = base {base:.3f} + soma dos SHAP {exp.values[i].sum():+.3f}")
+assert np.allclose(exp.values.sum(axis=1) + base, modelo.predict(teste[FEATURES]), atol=1e-4)
+
+for f, s in sorted(zip(FEATURES, exp.values[i]), key=lambda t: -abs(t[1]))[:4]:
+    print(f"  {f:<18} {s:+.3f} em log -> x{np.exp(s):.2f} nas curtidas")
+
+imp = np.abs(exp.values).mean(axis=0)              # importância global: média de |SHAP|
+print("importância global (média de |SHAP|):")
+for f, v in sorted(zip(FEATURES, imp), key=lambda t: -t[1])[:6]:
+    print(f"  {f:<18} {v:.3f}")
+```
+
+```text
+valor base (média das previsões no treino): 6.808 -> 904 curtidas
+previsão 5.130 = base 6.808 + soma dos SHAP -1.677
+  log_mediana_canal  -1.899 em log -> x0.15 nas curtidas
+  gancho             +0.211 em log -> x1.23 nas curtidas
+  visual_pca_0       -0.105 em log -> x0.90 nas curtidas
+  energia_musica     +0.058 em log -> x1.06 nas curtidas
+importância global (média de |SHAP|):
+  log_mediana_canal  1.053
+  gancho             0.136
+  energia_musica     0.089
+  hora               0.064
+  rosto              0.061
+  texto_na_tela      0.058
+```
+
+Três coisas para ler aqui:
+
+- **O `assert` passou:** valor base + soma dos SHAP = previsão, em todos os Shorts do teste. É o axioma da eficiência, e é o teste que você deve deixar no código da tool.
+- **O canal domina.** Globalmente, `log_mediana_canal` pesa quase 8 vezes mais que o gancho. É o que a literatura diz (as features do canal dominam) e é o motivo de a explicação "de fábrica" não servir para comparar criativos do mesmo canal.
+- **A importância global recupera a ordem dos efeitos simulados**: gancho, energia, horário, rosto, texto. Com dados reais você não terá o gabarito, mas é um bom teste de sanidade para o pipeline.
+
+---
+
+## De log para multiplicador
+
+O modelo prevê $$y = \log(1 + \text{curtidas})$$. O SHAP decompõe essa previsão em soma:
+
+$$
+\log(1 + \hat{c}) = \phi_0 + \sum_{j} \phi_j
+\quad\Longrightarrow\quad
+1 + \hat{c} = e^{\phi_0} \cdot \prod_{j} e^{\phi_j}
+$$
+
+em que $$\phi_0$$ é o valor base. Somar em log é multiplicar em curtidas: cada contribuição vira um **multiplicador** $$e^{\phi_j}$$. Uma contribuição de +0,30 em log vale $$e^{0{,}30} \approx 1{,}35$$, ou seja, "cerca de 35% a mais"; uma de −0,20 vale $$e^{-0{,}20} \approx 0{,}82$$, "cerca de 18% a menos". Com milhares de curtidas, o "+1" do log1p é desprezível.
+
+<Sketch name="m5/log-para-multiplicador" alt="Waterfall horizontal do Short B. Começa no Short típico da Lumina, log 7,74, 2.300 curtidas. Depois: gancho igual a 8, mais 0,28, vezes 1,33; energia da música igual a 7, mais 0,10, vezes 1,11; rosto, mais 0,10, vezes 1,10; texto na tela, mais 0,08, vezes 1,08; hora 19h, mais 0,05, vezes 1,06; duração de 22 segundos, mais 0,03, vezes 1,03. Termina na previsão B, log 8,38, 4.380 curtidas. Notas: em log, 7,74 mais as contribuições dá 8,38; em curtidas, 2.300 vezes os multiplicadores dá cerca de 4.400, ou 4.380 sem arredondar." caption="O caso canônico do Short B: a mesma decomposição em log e em curtidas." />
+
+Duas regras de aritmética que evitam os erros mais comuns ao escrever a explicação:
+
+1. **Porcentagens não somam.** Gancho (×1,33) e energia (×1,11) juntos dão $$1{,}33 \times 1{,}11 \approx 1{,}48$$, ou seja, +48%, e não +44%. Some em log ($$0{,}28 + 0{,}10 = 0{,}38$$, e $$e^{0{,}38} \approx 1{,}46$$ antes de arredondar) e converta no fim.
+2. **O multiplicador é relativo ao valor base.** "×1,33" significa "33% acima do que o valor base sozinho indicaria", e o valor base depende do background. Sempre diga qual é a referência.
+
+---
+
+## Os gráficos, e o que cada um responde
+
+O SHAP tem gráficos prontos; todos recebem o objeto `Explanation`. O trecho salva as figuras em arquivos para rodar em qualquer ambiente; num notebook, troque `show=False` e `savefig` por `show=True`.
+
+```python
+import matplotlib.pyplot as plt
+
+shap.plots.waterfall(exp[0], max_display=8, show=False)      # local: um Short
+plt.savefig("shap_waterfall.png", bbox_inches="tight"); plt.close()
+shap.plots.beeswarm(exp, max_display=10, show=False)         # global: distribuição
+plt.savefig("shap_beeswarm.png", bbox_inches="tight"); plt.close()
+shap.plots.bar(exp, max_display=10, show=False)              # global: média de |SHAP|
+plt.savefig("shap_bar.png", bbox_inches="tight"); plt.close()
+shap.plots.scatter(exp[:, "gancho"], color=exp[:, "energia_musica"], show=False)
+plt.savefig("shap_scatter_gancho.png", bbox_inches="tight"); plt.close()
+```
+
+| Gráfico | Escopo | Pergunta que responde |
+| :--- | :--- | :--- |
+| `waterfall` | local | como a previsão **deste** Short sai do valor base, feature por feature |
+| `bar` | global | quais features mexem mais nas previsões, em média (a tabela acima) |
+| `beeswarm` | global | além do tamanho, a **direção**: valores altos da feature empurram para cima ou para baixo? |
+| `scatter` (dependência) | global | como o SHAP de uma feature varia com o valor dela; a cor de outra feature revela **interações** |
+
+No `scatter` do gancho, com estes dados, os pontos formam uma escada crescente e quase linear (cerca de −0,4 no gancho 0 até +0,4 no gancho 10), e a cor da energia da música não separa faixas, porque o simulador não tem interação entre as duas. Na sua base, faixas de cor separadas no mesmo valor de x são sinal de interação; para medi-la, o `TreeExplainer` também calcula `shap_interaction_values`.
+
+O componente abaixo mostra o waterfall do caso Lumina com os números do **simulador** da trilha; ligue e desligue features para ver a conta fechar:
+
+<ShapWaterfall />
+
+---
+
+## A pergunta certa pede o background certo
+
+Para a Lumina, "o canal é grande" não é explicação: os dois Shorts são do mesmo canal. A pergunta do marketing é **"o que este criativo tem de diferente de um Short típico nosso?"**. Isso se responde trocando a referência: background = posts que representam o canal. No exemplo sintético, isso é simulado com 100 posts de beleza do teste, com as features de canal da Lumina.
+
+```python
+LUMINA = {"log_mediana_canal": np.log1p(2_300), "setor_beleza": 1}
+VISUAL_TIPICO = {c: 0.0 for c in PCA}                       # centro do espaço PCA
+A = {**LUMINA, "gancho": 3, "rosto": 1, "texto_na_tela": 0, "energia_musica": 3,
+     "duracao_s": 55, "hora": 14, **VISUAL_TIPICO}
+B = {**LUMINA, "gancho": 8, "rosto": 1, "texto_na_tela": 1, "energia_musica": 7,
+     "duracao_s": 22, "hora": 19, **VISUAL_TIPICO}
+X_ab = pd.DataFrame([A, B])[FEATURES]
+
+# background = "o que a Lumina costuma postar": posts de beleza com o nível da Lumina
+fundo = teste[teste.setor_beleza == 1].sample(100, random_state=0)[FEATURES].assign(**LUMINA)
+explainer_canal = shap.TreeExplainer(modelo, data=fundo, feature_perturbation="interventional")
+exp_ab = explainer_canal(X_ab)
+base_canal = float(exp_ab.base_values[0])
+print(f"base (Short típico da Lumina): {base_canal:.3f} -> {np.expm1(base_canal):,.0f} curtidas")
+for nome, k in [("A", 0), ("B", 1)]:
+    pred = modelo.predict(X_ab.iloc[[k]])[0]
+    soma = exp_ab.values[k].sum()
+    print(f"{nome}: previsão {np.expm1(pred):,.0f} curtidas | soma SHAP {soma:+.3f} -> x{np.exp(soma):.2f}")
+    for f, s in sorted(zip(FEATURES, exp_ab.values[k]), key=lambda t: -abs(t[1]))[:5]:
+        print(f"   {f:<16} {s:+.3f}  x{np.exp(s):.2f}")
+dif = exp_ab.values[1] - exp_ab.values[0]                  # mesmo background: pode subtrair
+print("B - A:", {f: round(float(d), 2) for f, d in zip(FEATURES, dif) if abs(d) >= 0.01})
+```
+
+```text
+base (Short típico da Lumina): 7.726 -> 2,265 curtidas
+A: previsão 1,301 curtidas | soma SHAP -0.554 -> x0.57
+   gancho           -0.194  x0.82
+   duracao_s        -0.158  x0.85
+   energia_musica   -0.081  x0.92
+   texto_na_tela    -0.078  x0.92
+   hora             -0.072  x0.93
+B: previsão 3,762 curtidas | soma SHAP +0.507 -> x1.66
+   gancho           +0.219  x1.25
+   energia_musica   +0.114  x1.12
+   texto_na_tela    +0.058  x1.06
+   rosto            +0.058  x1.06
+   hora             +0.041  x1.04
+B - A: {'gancho': 0.41, 'texto_na_tela': 0.14, 'energia_musica': 0.2, 'duracao_s': 0.2, 'hora': 0.11, 'visual_pca_6': 0.01}
+```
+
+Agora a história mudou. O valor base virou o Short típico da Lumina (2.265 curtidas, perto da mediana de 2.300), e a soma dos SHAP de cada criativo é o log do quanto ele se afasta do típico: B fica ×1,66 acima, A fica ×0,57. As features de canal sumiram da lista, porque têm o mesmo valor no background e nos dois Shorts: pelo axioma do jogador nulo, recebem zero.
+
+A última linha é a resposta direta à pergunta "por que B e não A": como os dois usam o **mesmo background**, dá para subtrair feature a feature, e as diferenças somam exatamente $$\log$$ da razão entre as previsões (0,41 + 0,14 + 0,20 + 0,20 + 0,11 + 0,01 ≈ 1,06, e $$e^{1{,}06} \approx 2{,}9$$, a razão entre 3.762 e 1.301; o `dict` só mostra diferenças de pelo menos 0,01).
+
+:::tip[Por que o código não dá exatamente o caso canônico]
+O caso canônico da trilha (B com 4.380 curtidas e gancho +0,28) sai do simulador, que conhece os efeitos verdadeiros. O LightGBM acima **estimou** esses efeitos a partir de dados com ruído e encolheu um pouco os extremos (gancho +0,22 em vez de +0,27 verdadeiros). A ordem dos fatores é a mesma. Essa diferença é normal, e é mais um motivo para publicar a explicação junto do intervalo.
+:::
+
+---
+
+## Blocos: o embedding vira "visual"
+
+As colunas `visual_pca_0` a `visual_pca_7` não significam nada para o marketing, e isoladas cada uma tem contribuição pequena, mesmo quando o bloco inteiro importa. Pelo axioma da eficiência, você pode **somar** o SHAP das colunas de um bloco e reportar um fator só, "visual", sem quebrar a conta. Um cuidado: a soma dos valores individuais não é idêntica ao valor de Shapley que o bloco teria se fosse tratado como **um único jogador**; os dois diferem quando o bloco interage com features de fora dele.
+
+As duas funções abaixo fecham o formato que a aula 5.7 e o módulo 6 vão consumir. `top_drivers` recebe uma linha de SHAP, os nomes e, opcionalmente, os valores das features, e devolve uma lista de dicionários `{feature, valor, contribuicao_log, multiplicador, direcao}`.
+
+```python
+import numpy as np
+
+def agrupar_blocos(shap_row, valores, feature_names, blocos):
+    """Soma o SHAP das colunas de cada bloco (ex.: 8 PCs -> 'visual')."""
+    shap_row, valores = np.asarray(shap_row, float), list(valores)
+    novos_nomes, novos_shap, novos_valores, usados = [], [], [], set()
+    for nome, cols in blocos.items():
+        idx = [feature_names.index(c) for c in cols]
+        novos_nomes.append(nome)
+        novos_shap.append(shap_row[idx].sum())
+        novos_valores.append(None)                    # um bloco não tem "valor" único
+        usados.update(idx)
+    for i, f in enumerate(feature_names):
+        if i not in usados:
+            novos_nomes.append(f)
+            novos_shap.append(shap_row[i])
+            novos_valores.append(valores[i])
+    return np.array(novos_shap), novos_valores, novos_nomes
+
+def top_drivers(shap_row, feature_names, k=5, valores=None, min_abs=0.01):
+    """As k features que mais mexeram na previsão (escala log), no formato do contrato."""
+    shap_row = np.asarray(shap_row, dtype=float)
+    ordem = np.argsort(-np.abs(shap_row))[:k]
+    saida = []
+    for i in ordem:
+        c = float(shap_row[i])
+        if abs(c) < min_abs:                          # ignora contribuições desprezíveis
+            continue
+        v = None if valores is None else valores[i]
+        saida.append({
+            "feature": feature_names[i],
+            "valor": v.item() if hasattr(v, "item") else v,
+            "contribuicao_log": round(c, 3),
+            "multiplicador": round(float(np.exp(c)), 2),
+            "direcao": "aumenta" if c > 0 else "reduz",
+        })
+    return saida
+```
+
+```python
+import json
+
+shap_b, valores_b, nomes = agrupar_blocos(exp_ab.values[1], X_ab.iloc[1].tolist(),
+                                          FEATURES, {"visual": PCA})
+print(json.dumps(top_drivers(shap_b, nomes, k=5, valores=valores_b), ensure_ascii=False))
+```
+
+```text
+[{"feature": "gancho", "valor": 8.0, "contribuicao_log": 0.219, "multiplicador": 1.25, "direcao": "aumenta"}, {"feature": "energia_musica", "valor": 7.0, "contribuicao_log": 0.114, "multiplicador": 1.12, "direcao": "aumenta"}, {"feature": "texto_na_tela", "valor": 1.0, "contribuicao_log": 0.058, "multiplicador": 1.06, "direcao": "aumenta"}, {"feature": "rosto", "valor": 1.0, "contribuicao_log": 0.058, "multiplicador": 1.06, "direcao": "aumenta"}, {"feature": "hora", "valor": 19.0, "contribuicao_log": 0.041, "multiplicador": 1.04, "direcao": "aumenta"}]
+```
+
+O bloco "visual" não entrou no top 5 de B: no exemplo, o criativo tem o visual típico (PCs zerados) e o efeito visual simulado é pequeno. Isso é coerente com o que a literatura observa, em que o visual soma pouco sobre as features de canal e de texto.
+
+---
+
+## Alternativas nativas e permutation importance
+
+Você não precisa do pacote SHAP para ter os valores: LightGBM e CatBoost calculam TreeSHAP internamente. E existe uma técnica diferente, a *permutation importance*, que responde a outra pergunta.
+
+```python
+from catboost import CatBoostRegressor, Pool
+from sklearn.inspection import permutation_importance
+
+X_te = teste[FEATURES]
+# 1) LightGBM nativo: uma coluna por feature + a última com o valor base
+contrib = modelo.predict(X_te, pred_contrib=True)
+print("LightGBM pred_contrib igual ao TreeExplainer?",
+      np.allclose(contrib[:, :-1], exp.values, atol=1e-6), "| base:", round(contrib[0, -1], 4))
+
+# 2) CatBoost nativo: mesma convenção (n, p + 1)
+cb = CatBoostRegressor(iterations=500, depth=4, learning_rate=0.05, verbose=0,
+                       random_seed=0).fit(treino[FEATURES], treino.y)
+sv = cb.get_feature_importance(Pool(X_te), type="ShapValues")
+print("CatBoost: base + SHAP = previsão?", np.allclose(sv.sum(axis=1), cb.predict(X_te), atol=1e-4))
+
+# 3) permutation importance: quanto o MAE piora ao embaralhar cada coluna no teste
+pi = permutation_importance(modelo, X_te, teste.y, scoring="neg_mean_absolute_error",
+                            n_repeats=5, random_state=0)
+for f, m in sorted(zip(FEATURES, pi.importances_mean), key=lambda t: -t[1])[:5]:
+    print(f"  permutação: {f:<18} MAE piora {m:.3f}")
+```
+
+```text
+LightGBM pred_contrib igual ao TreeExplainer? True | base: 6.8076
+CatBoost: base + SHAP = previsão? True
+  permutação: log_mediana_canal  MAE piora 1.132
+  permutação: gancho             MAE piora 0.051
+  permutação: energia_musica     MAE piora 0.019
+  permutação: visual_pca_0       MAE piora 0.009
+  permutação: hora               MAE piora 0.008
+```
+
+- `pred_contrib=True` no LightGBM devolve **os mesmos** valores do `TreeExplainer` no modo `tree_path_dependent`. Na tool em produção, isso elimina uma dependência.
+- No CatBoost, `get_feature_importance(type="ShapValues")` segue a mesma convenção: a última coluna é o valor base.
+- A **permutation importance** mede quanto o **erro** piora quando uma coluna é embaralhada. Ela fala de desempenho global, não da previsão de um Short, e por isso não serve para `top_drivers`. Serve para a <Termo id="ablacao">ablação</Termo> e para conferir se o SHAP global conta a mesma história, como aqui.
+
+---
+
+## As armadilhas
+
+**1. Correlação divide o crédito.** Acrescente ao modelo uma segunda medida do mesmo fenômeno, a quantidade de caracteres lidos por OCR, correlacionada com `texto_na_tela`:
+
+```python
+rng2 = np.random.default_rng(1)
+# uma segunda medida do MESMO fenômeno: caracteres lidos por OCR (correlacionada)
+df["chars_ocr"] = df.texto_na_tela * rng2.integers(15, 60, len(df)) + rng2.integers(0, 4, len(df))
+print("correlação:", round(df[["texto_na_tela", "chars_ocr"]].corr().iloc[0, 1], 3))
+
+for cols in [FEATURES, FEATURES + ["chars_ocr"]]:
+    m = lgb.LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=15,
+                          min_child_samples=30, verbose=-1, random_state=0).fit(df[cols], df.y)
+    imp = np.abs(shap.TreeExplainer(m)(df[cols].iloc[:2000]).values).mean(axis=0)
+    partes = {c: round(float(v), 3) for c, v in zip(cols, imp) if c in ("texto_na_tela", "chars_ocr")}
+    print(f"{len(cols)} features -> {partes}")
+```
+
+```text
+correlação: 0.895
+16 features -> {'texto_na_tela': 0.063}
+17 features -> {'texto_na_tela': 0.016, 'chars_ocr': 0.048}
+```
+
+O efeito do texto não mudou (0,016 + 0,048 ≈ 0,063), mas foi repartido, e a coluna original parece 4 vezes menos importante. Se o explicador listar só `texto_na_tela`, vai subestimar o texto. Remédio: agrupe colunas que medem a mesma coisa num bloco, como fez com o visual.
+
+**2. SHAP explica o modelo, não o mundo.** "+0,05 para o horário das 19h" diz que o **modelo** usa o horário assim. Não diz que mudar a publicação de A para as 19h vai render 5% a mais: talvez os criadores melhores publiquem à noite, e o modelo aprendeu essa correlação. Para afirmar causa, é preciso experimento (por exemplo, um teste A/B de horário). Na explicação, prefira "o modelo associa" a "causa".
+
+**3. O background define a pergunta.** A mesma previsão de B tem valor base de 904 curtidas com o background de fábrica e de 2.265 com o do canal. Nenhum está errado; eles respondem perguntas diferentes. Escolha pelo uso e registre a escolha no payload.
+
+**4. A escala é log.** Nunca publique "+0,22" sem converter. E nunca some porcentagens.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Com os números canônicos do caso (ilustrativos, gerados pelo simulador da trilha), os `top_drivers` de B, com background de posts recentes da Lumina, são:
+
+```json
+[
+  {"feature": "gancho", "valor": 8, "contribuicao_log": 0.28, "multiplicador": 1.33, "direcao": "aumenta"},
+  {"feature": "energia_musica", "valor": 7, "contribuicao_log": 0.10, "multiplicador": 1.11, "direcao": "aumenta"},
+  {"feature": "rosto", "valor": true, "contribuicao_log": 0.10, "multiplicador": 1.10, "direcao": "aumenta"},
+  {"feature": "texto_na_tela", "valor": true, "contribuicao_log": 0.08, "multiplicador": 1.08, "direcao": "aumenta"},
+  {"feature": "hora", "valor": 19, "contribuicao_log": 0.05, "multiplicador": 1.06, "direcao": "aumenta"}
+]
+```
+
+- **Leitura:** partindo do Short típico do canal (2.300), o gancho forte é o principal motor (×1,33), seguido da música animada e do rosto. Somando todos em log, B fica ×1,90 acima do típico, e é daí que vem o `relative_to_channel = 1,90`.
+- **Short A**, com o mesmo background: gancho fraco (−0,17, ×0,85), duração de 55 s (−0,13, ×0,87), música calma (−0,10, ×0,91), sem texto (−0,07, ×0,93) e horário das 14h (−0,07, ×0,94), compensados em parte pelo rosto (+0,10, ×1,10). Resultado: ×0,64. (Os multiplicadores do caso canônico são calculados antes de arredondar as contribuições, por isso −0,17 aparece como ×0,85.)
+- **Para o ranking:** as diferenças B − A somam cerca de 1,08 em log (gancho +0,45, energia +0,20, duração +0,16, texto +0,15, horário +0,12; o rosto empata), o que dá B cerca de 3 vezes A (4.380 contra 1.480).
+- **O que vai para o explicador:** exatamente esse JSON, mais a previsão, o intervalo e o `confidence_flag`. Nenhum número a mais.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Publicar SHAP em log.** Converta para multiplicador ($$e^{\phi}$$) e diga a referência.
+2. **Somar porcentagens.** Some em log e converta no fim.
+3. **Explicar criativos do mesmo canal com o background da base inteira.** O canal vai dominar e a comparação some.
+4. **Comparar SHAP de A e B com backgrounds diferentes.** Só subtraia com o mesmo background.
+5. **Listar componentes de PCA.** Agrupe em "visual" (e agrupe colunas redundantes, como texto e OCR).
+6. **Ler SHAP como efeito causal.** É a lógica do modelo; causa exige experimento.
+7. **Não testar a aditividade.** Deixe o `assert` de base + soma = previsão no código da tool.
+:::
+
+<Quiz
+  id="m5-a6"
+  perguntas={[
+    {
+      pergunta: 'O SHAP do gancho de um Short é +0,40 e o do texto é +0,10, em log1p. Qual frase está correta?',
+      opcoes: [
+        {texto: 'Juntos, gancho e texto aumentam a previsão em 50%.', explicacao: 'Isso somou os valores em log como se fossem porcentagens. O correto é converter: e^0,50 é cerca de 1,65.'},
+        {texto: 'Juntos, eles multiplicam a previsão por cerca de 1,65 em relação ao valor base.', correta: true, explicacao: 'Em log, 0,40 + 0,10 = 0,50; em curtidas, e^0,50 ≈ 1,65, ou seja, cerca de 65% a mais.'},
+        {texto: 'O gancho acrescenta 0,40 curtida e o texto 0,10 curtida.', explicacao: 'Os valores estão em escala log, não em curtidas.'},
+      ],
+    },
+    {
+      pergunta: 'Você explica B com `shap.TreeExplainer(modelo)` sem background e a maior contribuição é `log_mediana_canal`. Para comparar B com A, do mesmo canal, o que fazer?',
+      opcoes: [
+        {texto: 'Remover `log_mediana_canal` do modelo.', explicacao: 'A feature é essencial para a previsão. O problema é a referência da explicação, não o modelo.'},
+        {texto: 'Usar como background posts recentes do próprio canal, no modo intervencional.', correta: true, explicacao: 'Com o canal como referência, as features de canal recebem zero e sobram as diferenças de conteúdo.'},
+        {texto: 'Ignorar o primeiro fator e publicar os seguintes.', explicacao: 'Os demais valores continuam relativos à média da base inteira, e a conta deixa de fechar.'},
+      ],
+    },
+    {
+      pergunta: 'O LightGBM oferece `predict(X, pred_contrib=True)`. O que ele devolve?',
+      opcoes: [
+        {texto: 'A importância global de cada feature (ganho).', explicacao: 'Isso é `feature_importances_`. O `pred_contrib` é local, por linha.'},
+        {texto: 'Uma matriz com o SHAP de cada feature por linha e, na última coluna, o valor base.', correta: true, explicacao: 'São os mesmos valores do TreeExplainer no modo tree_path_dependent, como o código confirmou.'},
+        {texto: 'As previsões de cada árvore separadamente.', explicacao: 'Isso seria `pred_leaf` ou a previsão por iteração, não contribuições de features.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas afirmações o SHAP permite fazer sobre o Short B?',
+      multipla: true,
+      opcoes: [
+        {texto: 'O modelo previu mais para B principalmente por causa do gancho forte.', correta: true, explicacao: 'É exatamente o que o SHAP mede: a lógica do modelo para esta previsão.'},
+        {texto: 'Se a Lumina trocar o horário de A para 19h, A vai render 6% a mais.', explicacao: 'Isso é uma afirmação causal sobre uma intervenção. O SHAP descreve o modelo; o efeito real exige experimento (e o what-if do módulo 7 só re-pontua o modelo).'},
+        {texto: 'A soma das contribuições, em log, mais o valor base dá a previsão de B.', correta: true, explicacao: 'É a eficiência: a conta sempre fecha.'},
+        {texto: 'O texto na tela importa pouco, porque tem SHAP baixo, mesmo existindo uma coluna de OCR correlacionada.', explicacao: 'Com colunas correlacionadas, o crédito é dividido. Agrupe texto e OCR antes de concluir.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: os top_drivers do seu modelo]
+1. No seu modelo final, calcule o SHAP de 20 Shorts do teste com `pred_contrib=True` e confira a aditividade.
+2. Escolha dois Shorts do **mesmo canal** e explique-os com background = últimos 100 posts desse canal publicados **antes** deles.
+3. Agrupe as colunas do embedding em "visual" e as de texto que forem redundantes num bloco "texto".
+4. Gere os `top_drivers` (k = 5) dos dois e a diferença entre eles.
+5. Escreva uma frase de marketing para cada fator do Short melhor, com multiplicador e referência.
+:::
+
+<details>
+<summary>Ver dicas</summary>
+
+- O background precisa respeitar o tempo: só posts publicados **antes** do Short explicado. Usar posts futuros do canal é vazamento na explicação.
+- Canais com menos de 100 posts: use todos os anteriores. Com menos de 10, a explicação relativa ao canal é fraca, e o `confidence_flag` já deve estar ligado.
+- Para agrupar texto, crie o bloco com as colunas de OCR, contagem de palavras da legenda e o que mais medir "texto": `{"visual": PCA, "texto": ["texto_na_tela", "chars_ocr"]}`.
+- Se o fator principal for algo que o marketing não controla (dia da semana, duração imposta pelo formato), diga isso na frase. É informação útil.
+
+</details>
+
+---
+
+## Resumo
+
+- O **TreeSHAP** calcula Shapley exato em árvores; o `TreeExplainer` tem os modos `tree_path_dependent` (sem background) e `interventional` (com background). LightGBM (`pred_contrib=True`) e CatBoost (`type="ShapValues"`) têm versões nativas.
+- Em log1p, as contribuições **somam em log e multiplicam em curtidas**: multiplicador $$= e^{\phi}$$. Porcentagens não somam.
+- O **background define a pergunta**: base da base inteira explica o nível; posts recentes do próprio canal explicam o **conteúdo**, que é o que A vs. B precisa.
+- **Agrupe blocos** (PCA do embedding, colunas redundantes) somando SHAP, e publique os **`top_drivers`** no formato `{feature, valor, contribuicao_log, multiplicador, direcao}`.
+- SHAP explica o **modelo**, não a causa; features correlacionadas **dividem crédito**.
+
+## Referências
+
+- Lundberg e Lee. [*A Unified Approach to Interpreting Model Predictions*](https://arxiv.org/abs/1705.07874). NeurIPS, 2017.
+- Lundberg, Erion, Chen, DeGrave, Prutkin, Nair, Katz, Himmelfarb, Bansal e Lee. [*From local explanations to global understanding with explainable AI for trees*](https://doi.org/10.1038/s42256-019-0138-9). Nature Machine Intelligence 2, 2020 ([preprint](https://arxiv.org/abs/1905.04610)).
+- Chen, Janizek, Lundberg e Lee. [*True to the Model or True to the Data?*](https://arxiv.org/abs/2006.16234). arXiv, 2020.
+- Molnar. [*Interpretable Machine Learning*, capítulo "SHAP"](https://christophm.github.io/interpretable-ml-book/shap.html).
+- Documentação do [SHAP](https://shap.readthedocs.io/en/latest/), do [CatBoost (ShapValues)](https://catboost.ai/docs/en/concepts/shap-values) e do scikit-learn ([permutation importance](https://scikit-learn.org/stable/modules/permutation_importance.html)).
+
+**Próxima aula:** [Da explicação à narrativa](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa): o subagente que transforma este JSON em texto de marketing, sem inventar nada, e como provar isso.

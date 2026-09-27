@@ -1,0 +1,387 @@
+---
+sidebar_position: 1
+sidebar_label: 'Por que um número só não basta'
+title: 'Por que um número só não basta'
+description: 'Previsão pontual vs. distribuição, intervalo de predição vs. de confiança, incerteza aleatória vs. epistêmica, cobertura e como decidir entre A e B quando os intervalos se sobrepõem.'
+tags: [ml-preditivo, galaxies, incerteza]
+---
+
+# Por que um Número Só Não Basta: Previsão com Margem de Erro
+
+<LessonMeta
+  tempo="40 min"
+  semana={3}
+  etapa="incerteza"
+  objetivos={[
+    'Diferenciar previsão pontual de distribuição preditiva e ler um intervalo como um par de quantis',
+    'Explicar com precisão a diferença entre intervalo de predição e intervalo de confiança',
+    'Separar incerteza aleatória de incerteza epistêmica e dizer qual delas mais dados reduzem',
+    'Converter intervalos em escala log para curtidas e entender por que ficam assimétricos',
+    'Calcular P(B > A) a partir dos intervalos de dois criativos e usar isso na decisão',
+  ]}
+  prerequisitos={[
+    {label: 'Engajamento é cauda longa', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa'},
+    {label: 'Métricas de erro e de ordenação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao'},
+    {label: 'LightGBM, CatBoost e XGBoost na prática', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost'},
+  ]}
+/>
+
+O seu modelo já funciona. Você roda os dois criativos da Lumina e ele devolve: **Short A, 1.480 curtidas; Short B, 4.380 curtidas**. O time de marketing lê isso e conclui, com toda a razão aparente: "B rende três vezes mais que A. Vamos impulsionar B."
+
+Agora imagine duas situações. Na primeira, o modelo erra, em média, 10% para cima ou para baixo. Na segunda, ele erra por um fator de 3: um Short previsto em 4.380 pode terminar com 1.500 ou com 13.000. O número que o modelo devolveu é **o mesmo** nas duas situações, mas a decisão certa não é. Na primeira, B é quase certamente melhor. Na segunda, a diferença entre A e B some no meio do ruído.
+
+Um número sozinho esconde exatamente a informação de que o marketing precisa para decidir: **quanto dá para confiar nele**. É por isso que o contrato da tool de predição do projeto não tem só `predicted_metric`, mas também `interval_low`, `interval_high` e `confidence_flag`. Este módulo inteiro existe para preencher esses campos com honestidade, e depois explicar o número com SHAP.
+
+:::info[A ideia central]
+Para um criativo novo, o resultado real não é um número fixo que o modelo tenta adivinhar: é uma **distribuição** de resultados possíveis. A previsão pontual é um resumo dessa distribuição (a mediana). O **intervalo de predição** é outro resumo: dois quantis que, juntos, cercam o resultado com uma probabilidade declarada, por exemplo 80%. Um intervalo só vale alguma coisa se essa probabilidade for **verificada** no teste.
+:::
+
+:::info[Ambiente deste módulo]
+Todo o código do módulo 5 foi executado com Python 3.12 e estas versões:
+
+```bash
+uv add numpy==2.5.3 pandas==3.0.6 scipy==1.18.1 scikit-learn==1.9.1 \
+  lightgbm==4.7.0 catboost==1.2.10 shap==0.52.0 mapie==1.5.0 \
+  pydantic==2.13.5 langchain==1.4.2 langchain-core==1.6.5 matplotlib==3.11.2
+# só para a chamada ao LLM da aula 5.7 (Gemini via LangChain):
+uv add langchain-google-genai==4.4.0
+```
+
+- As aulas 5.1 a 5.6 rodam em CPU em segundos. Os dados são **sintéticos**, gerados dentro de cada trecho, com efeitos conhecidos: os números servem para você conferir o método, não representam o YouTube real.
+- O SHAP 0.52 exige Python 3.12 ou mais novo.
+- A aula 5.7 só precisa de chave (`GOOGLE_API_KEY`) na chamada ao LLM; o resto roda sem chave.
+:::
+
+---
+
+## Da previsão pontual à distribuição
+
+Quando você treinou o modelo com erro quadrático, ele aprendeu a aproximar a **média condicional** $$\mathbb{E}[y \mid x]$$; com erro absoluto, a **mediana condicional**. Em ambos os casos, ele colapsa uma distribuição inteira num ponto. Mas, para um mesmo vetor de <Termo id="feature">features</Termo> $$x$$ (mesmo canal, mesmo gancho, mesmo horário), o alvo $$y = \log(1 + \text{curtidas})$$ varia. Essa variação é a **distribuição preditiva** $$p(y \mid x)$$.
+
+Uma forma prática de descrever $$p(y \mid x)$$ sem supor nenhuma forma (normal, log-normal...) é por <Termo id="quantil">quantis</Termo>. O quantil $$q_\alpha(x)$$ é o valor que o resultado fica abaixo com probabilidade $$\alpha$$:
+
+$$
+P\big(y \le q_\alpha(x) \mid x\big) = \alpha
+$$
+
+Com três quantis você já tem o que o contrato pede:
+
+| Campo do contrato | Quantil | Leitura |
+| :--- | :---: | :--- |
+| `interval_low` | $$q_{0,1}$$ | 10% de chance de ficar abaixo |
+| `predicted_metric` | $$q_{0,5}$$ | mediana: metade das vezes acima, metade abaixo |
+| `interval_high` | $$q_{0,9}$$ | 10% de chance de ficar acima |
+
+O par $$[q_{0,1}, q_{0,9}]$$ é um **<Termo id="intervalo-predicao">intervalo de predição</Termo> de 80%**: $$P(q_{0,1} \le y \le q_{0,9}) = 0{,}9 - 0{,}1 = 0{,}8$$. A trilha usa 80% porque, com os dados de Shorts, um intervalo de 95% costuma ficar tão largo que não ajuda a decidir nada. É uma escolha de produto, não uma lei; o que não é negociável é declarar o nível e medir a <Termo id="cobertura">cobertura</Termo>.
+
+---
+
+## Intervalo de predição não é intervalo de confiança
+
+Essa é a confusão mais comum desta etapa, e ela muda a largura do intervalo por um fator de 10 ou mais.
+
+- **Intervalo de confiança (IC):** cerca um **parâmetro** desconhecido, como a média de curtidas (em log) de todos os Shorts possíveis do canal. Ele descreve quanto você não sabe sobre esse parâmetro porque só viu $$n$$ posts. Com mais dados, ele encolhe até virar um ponto.
+- **Intervalo de predição (IP):** cerca **um novo resultado** individual, o próximo Short. Ele soma duas coisas: a incerteza sobre o parâmetro e o ruído do próprio resultado. Com mais dados, ele encolhe até uma largura mínima, que é o ruído.
+
+No caso mais simples, com $$n$$ observações de média $$\bar{y}$$ e desvio-padrão $$s$$, e $$t$$ o quantil 0,9 da distribuição t de Student com $$n-1$$ graus de liberdade (um intervalo de 80% deixa 10% de fora em cada ponta):
+
+$$
+\text{IC}_{80\%}: \ \bar{y} \pm t \cdot \frac{s}{\sqrt{n}}
+\qquad\qquad
+\text{IP}_{80\%}: \ \bar{y} \pm t \cdot s\sqrt{1 + \frac{1}{n}}
+$$
+
+O $$1$$ dentro da raiz do IP é o ruído de um post individual, e ele não vai embora quando $$n \to \infty$$. O código abaixo simula um canal com $$\sigma = 0{,}5$$ em log e mede, em 2.000 repetições, a largura de cada intervalo e quantas vezes o **próximo** post caiu dentro dele.
+
+```python
+import numpy as np
+from scipy.stats import t
+
+rng = np.random.default_rng(42)
+MEDIA_REAL, SIGMA = 7.7, 0.5   # log1p(curtidas) de um canal: média e ruído
+REPETICOES = 2_000
+
+for n in [30, 300, 3000]:
+    larg_ic, larg_ip, cob_ic, cob_ip = [], [], [], []
+    tq = t.ppf(0.9, df=n - 1)                        # ~1,28 para n grande
+    for _ in range(REPETICOES):
+        y = rng.normal(MEDIA_REAL, SIGMA, size=n)    # n posts do passado
+        m, s = y.mean(), y.std(ddof=1)
+        meia_ic = tq * s / np.sqrt(n)                # IC 80% para a MÉDIA
+        meia_ip = tq * s * np.sqrt(1 + 1 / n)        # IP 80% para UM post novo
+        novo = rng.normal(MEDIA_REAL, SIGMA)         # o próximo post
+        larg_ic.append(2 * meia_ic)
+        larg_ip.append(2 * meia_ip)
+        cob_ic.append(abs(novo - m) <= meia_ic)
+        cob_ip.append(abs(novo - m) <= meia_ip)
+    print(f"n={n:>5}  largura IC={np.mean(larg_ic):.3f}  largura IP={np.mean(larg_ip):.3f}  "
+          f"post novo dentro do IC={np.mean(cob_ic):.0%}  dentro do IP={np.mean(cob_ip):.0%}")
+```
+
+```text
+n=   30  largura IC=0.238  largura IP=1.324  post novo dentro do IC=18%  dentro do IP=78%
+n=  300  largura IC=0.074  largura IP=1.286  post novo dentro do IC=6%  dentro do IP=80%
+n= 3000  largura IC=0.023  largura IP=1.282  post novo dentro do IC=2%  dentro do IP=81%
+```
+
+Leia a última coluna com calma. O IC de 80% chega a conter só 2% dos posts novos: ele nunca prometeu contê-los, porque fala da **média**. O IP continua perto de 80% e sua largura para de cair em torno de $$2 \times 1{,}28 \times 0{,}5 \approx 1{,}28$$ em log. Se alguém entregar à Lumina um "intervalo" calculado como erro-padrão da média, ele parecerá preciso e estará errado quase sempre. **O contrato da tool pede intervalo de predição.**
+
+---
+
+## Duas incertezas: aleatória e epistêmica
+
+Por que um post novo nunca é previsto com exatidão? Existem duas razões, e elas têm remédios diferentes.
+
+<Sketch name="m5/aleatoria-vs-epistemica" alt="Duas colunas. À esquerda, incerteza aleatória: o ruído do mundo; o mesmo Short publicado de novo teria outro resultado; mais dados não a reduzem. À direita, incerteza epistêmica: o que o modelo não viu, como canal com 4 posts, setor raro, estilo visual novo ou data muito depois dos dados; mais dados parecidos a reduzem, e até lá entra o sinal de baixa confiança. As duas convergem para o intervalo de predição, que precisa refletir ambas." caption="Ruído do mundo vs. ignorância do modelo." />
+
+**Incerteza aleatória** (do latim *alea*, dado) é o ruído irredutível. O mesmo criativo, publicado duas vezes em universos paralelos, teria resultados diferentes: o algoritmo testa o vídeo com públicos diferentes nas primeiras horas, outro Short viraliza no mesmo dia e rouba atenção, um perfil grande comenta por acaso. Nenhuma *feature* disponível antes da publicação captura isso. Ela também pode variar com $$x$$: canais novos e o setor automotivo, por exemplo, podem ser mais voláteis. Nesse caso o ruído é **heterocedástico**, e o intervalo deveria ser mais largo para eles.
+
+**Incerteza epistêmica** (do grego *episteme*, conhecimento) é a ignorância do modelo. Ela aparece quando o criativo cai numa região do espaço de *features* com poucos exemplos: um canal com 4 posts anteriores, um nicho de moda que quase não aparece na sua base, um estilo visual inédito, uma data de publicação meses depois do fim dos dados. Ali o modelo está extrapolando, e árvores de decisão extrapolam de forma "plana": elas devolvem o valor da folha mais próxima, com toda a segurança.
+
+Uma decomposição clássica do erro quadrático esperado num ponto $$x$$ ajuda a separar as duas:
+
+$$
+\mathbb{E}\big[(y - \hat{f}(x))^2\big] = \underbrace{\sigma^2(x)}_{\text{aleatória}} + \underbrace{\operatorname{Var}\big[\hat{f}(x)\big] + \text{Viés}\big[\hat{f}(x)\big]^2}_{\text{epistêmica (grosso modo)}}
+$$
+
+O primeiro termo não diminui com mais dados. Os outros dois, sim. Na prática da trilha:
+
+- a **regressão quantílica** (aula 5.2) aprende principalmente $$\sigma^2(x)$$: onde os dados são ruidosos, os quantis se afastam;
+- a **predição conformal** (aula 5.3) corrige a largura total usando erros reais medidos fora do treino, o que inclui um pouco de cada;
+- o **sinal de baixa confiança** (aula 5.4) é o remédio para a epistêmica: se o caso está fora do que o modelo conhece, diga isso explicitamente, porque o intervalo quantílico pode não perceber.
+
+:::tip[Um limite honesto]
+Separar exatamente as duas incertezas é um problema aberto, e os métodos formais (ensembles, modelos bayesianos) custam caro. Para o projeto, a separação funcional acima basta: intervalos calibrados para a aleatória, regras explícitas para a epistêmica. A revisão de Hüllermeier e Waegeman, nas referências, é o melhor mapa se você quiser ir além.
+:::
+
+---
+
+## Em log, simétrico; em curtidas, assimétrico
+
+O modelo trabalha em $$y = \log(1 + \text{curtidas})$$ (<Termo id="log1p">log1p</Termo>), e o marketing lê curtidas. A conversão tem uma propriedade que joga a seu favor: **quantis atravessam funções crescentes**. Se $$g$$ é estritamente crescente, então
+
+$$
+q_\alpha\big(g(Y)\big) = g\big(q_\alpha(Y)\big)
+$$
+
+Como $$\text{curtidas} = e^{y} - 1$$ é crescente, basta aplicar `np.expm1` aos três quantis: a mediana em log vira a mediana em curtidas, e o intervalo de 80% em log vira um intervalo de 80% em curtidas, **exatamente**. O mesmo não vale para a média: se $$y$$ é normal com média $$\mu$$ e desvio $$\sigma$$, a média de $$e^{y}$$ é $$e^{\mu + \sigma^2/2}$$, e não $$e^{\mu}$$. É por isso que `predicted_metric` é a **mediana** convertida, e não "a exponencial da média".
+
+A consequência visual é a assimetria. Um intervalo simétrico em log, $$\hat{y} \pm d$$, vira em curtidas $$[e^{\hat{y}}/e^{d},\ e^{\hat{y}} \cdot e^{d}]$$: ele é simétrico **em proporção**, não em unidades. Com os números da Lumina:
+
+<Sketch name="m5/intervalos-lumina" alt="Eixo de curtidas em escala log de 500 a 10 mil. Short A: intervalo de 780 a 2.800 com mediana 1.480. Short B: intervalo de 2.300 a 8.300 com mediana 4.380. Uma linha tracejada marca o Short típico do canal, 2.300 curtidas. Os intervalos se sobrepõem entre 2.300 e 2.800. Notas: em log cada intervalo é simétrico, em curtidas a cauda de cima é mais longa (B vai de menos 2.080 a mais 3.920 em torno de 4.380); mesmo com sobreposição, P(B > A) é cerca de 0,94 com erros independentes." caption="Dois intervalos de 80% que se tocam, e ainda assim B é muito provavelmente melhor." />
+
+O limite superior de B está 3.920 curtidas acima da mediana; o inferior, só 2.080 abaixo. Isso não é defeito do modelo: é a cauda longa do engajamento aparecendo no intervalo. Ao comunicar, prefira frases proporcionais ("entre metade e o dobro do previsto") a "mais ou menos X curtidas".
+
+---
+
+## Calibração e cobertura: o intervalo cumpre o que promete?
+
+Um intervalo de 80% faz uma promessa verificável: no conjunto de teste temporal, cerca de 80% dos resultados reais devem cair dentro dele. A **cobertura empírica** é só a fração que caiu:
+
+$$
+\widehat{\text{cobertura}} = \frac{1}{n}\sum_{i=1}^{n} \mathbb{1}\big[\ell_i \le y_i \le u_i\big]
+$$
+
+Um intervalo é **calibrado** quando a cobertura empírica bate com a nominal. Se der 60%, o modelo é **confiante demais**: os intervalos são estreitos e vão enganar o marketing. Se der 97%, ele é **medroso**: os intervalos são largos demais para ajudar. O critério que a literatura de previsão probabilística usa é *maximizar a nitidez (intervalos estreitos) sujeito à calibração* (Gneiting e colegas, nas referências). Por isso, toda tabela de avaliação desta etapa tem duas colunas lado a lado: **cobertura** e **largura média**.
+
+Dois cuidados que separam uma avaliação honesta de uma bonita:
+
+1. **A cobertura medida também tem incerteza.** Com $$n$$ casos de teste, o erro-padrão da cobertura é $$\sqrt{0{,}8 \times 0{,}2 / n}$$. Com 200 Shorts no teste, isso dá cerca de 2,8 pontos percentuais: 77% é perfeitamente compatível com 80%; 65% não é.
+2. **Cobertura média não é cobertura em todo lugar.** Um intervalo pode cobrir 80% no total e só 55% no setor automotivo, compensado por 90% em beleza. Meça a cobertura por setor e por faixa de tamanho de canal. Você vai ver isso acontecer de verdade na aula de [predição conformal](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal).
+
+---
+
+## O que a Galaxies faz com o intervalo: decidir entre A e B
+
+A pergunta da marca não é "quantas curtidas B vai ter?", e sim "**devo escolher B em vez de A?**". Olhar se os intervalos se sobrepõem é um critério ruim, e conservador demais: dois intervalos de 80% podem se sobrepor mesmo quando uma diferença é muito provável. O que responde à pergunta é $$P(B > A)$$.
+
+Se você supõe que o erro em log de cada criativo é aproximadamente normal (uma aproximação razoável quando o intervalo é simétrico em log), dá para recuperar a média e o desvio de cada um a partir dos quantis, porque o quantil 0,9 fica $$z_{0,9} = 1{,}2816$$ desvios acima da mediana:
+
+$$
+\mu = q_{0,5}, \qquad \sigma \approx \frac{q_{0,9} - q_{0,1}}{2 \times 1{,}2816}
+$$
+
+A diferença $$y_B - y_A$$ também é normal, e
+
+$$
+P(B > A) = \Phi\!\left(\frac{\mu_B - \mu_A}{\sqrt{\sigma_A^2 + \sigma_B^2 - 2\rho\,\sigma_A\sigma_B}}\right)
+$$
+
+em que $$\Phi$$ é a função de distribuição da normal padrão e $$\rho$$ é a correlação entre os erros dos dois criativos.
+
+```python
+import numpy as np
+from scipy.stats import norm
+
+Z90 = norm.ppf(0.9)  # 1,2816: distância do quantil 0,9 à mediana, em desvios-padrão
+
+
+def para_log(q10, q50, q90):
+    """Converte (q10, q50, q90) em curtidas para média e desvio em log1p."""
+    lo, mid, hi = np.log1p([q10, q50, q90])
+    return mid, (hi - lo) / (2 * Z90)
+
+
+def prob_b_maior(a, b, rho=0.0, n=200_000, seed=0):
+    """P(curtidas_B > curtidas_A) supondo normal em log1p e correlação rho."""
+    (mu_a, sd_a), (mu_b, sd_b) = para_log(*a), para_log(*b)
+    cov = [[sd_a**2, rho * sd_a * sd_b], [rho * sd_a * sd_b, sd_b**2]]
+    amostras = np.random.default_rng(seed).multivariate_normal([mu_a, mu_b], cov, size=n)
+    analitico = norm.cdf((mu_b - mu_a) / np.sqrt(sd_a**2 + sd_b**2 - 2 * rho * sd_a * sd_b))
+    return np.mean(amostras[:, 1] > amostras[:, 0]), analitico
+
+
+A = (780, 1_480, 2_800)     # q10, q50, q90 do Short A (curtidas)
+B = (2_300, 4_380, 8_300)   # q10, q50, q90 do Short B
+
+for nome, q in [("A", A), ("B", B)]:
+    mu, sd = para_log(*q)
+    print(f"{nome}: mediana={q[1]:,}  sigma_log={sd:.3f}  "
+          f"distância até q10={q[1]-q[0]:,}  até q90={q[2]-q[1]:,}")
+
+for rho in [0.0, 0.5]:
+    mc, exato = prob_b_maior(A, B, rho=rho)
+    print(f"rho={rho}:  P(B > A) Monte Carlo={mc:.3f}  analítico={exato:.3f}")
+```
+
+```text
+A: mediana=1,480  sigma_log=0.498  distância até q10=700  até q90=1,320
+B: mediana=4,380  sigma_log=0.501  distância até q10=2,080  até q90=3,920
+rho=0.0:  P(B > A) Monte Carlo=0.938  analítico=0.938
+rho=0.5:  P(B > A) Monte Carlo=0.985  analítico=0.985
+```
+
+Três leituras importantes:
+
+- **Sobreposição não é empate.** Os intervalos se tocam entre 2.300 e 2.800, e ainda assim $$P(B > A) \approx 0{,}94$$ supondo erros independentes.
+- **A correlação importa, e aqui ela ajuda.** A e B são do mesmo canal e sairiam na mesma semana: se o canal estiver num mês ruim, os dois sofrem juntos. Erros positivamente correlacionados diminuem a variância da **diferença**, e $$P(B > A)$$ sobe para cerca de 0,985 com $$\rho = 0{,}5$$. O valor de $$\rho$$ não é conhecido; tratar $$\rho = 0$$ é a escolha conservadora.
+- **A suposição de normalidade em log é uma aproximação.** Se os seus quantis forem bem assimétricos em log, prefira amostrar diretamente das distribuições ou reportar a probabilidade como aproximada.
+
+A decisão final também depende do apetite a risco da marca. Uma marca avessa a risco pode comparar os **pisos** ($$q_{0,1}$$): o pior cenário razoável de B (2.300) já supera a mediana de A (1.480). Essa é uma frase que o marketing entende.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Com os números canônicos do caso (ilustrativos, gerados pelo simulador da trilha), a saída da tool de predição para os dois Shorts fica assim:
+
+| Campo | Short A | Short B |
+| :--- | ---: | ---: |
+| `predicted_metric` (mediana, curtidas em 30 dias) | 1.480 | 4.380 |
+| `interval_low` / `interval_high` (80%) | 780 / 2.800 | 2.300 / 8.300 |
+| `relative_to_channel` (vs. 2.300 do Short típico) | 0,64 | 1,90 |
+
+- **O que muda na análise:** em vez de "B rende três vezes mais", a resposta vira "B deve render cerca de 1,9 vez o Short típico do canal; o intervalo de 80% vai de 2.300 a 8.300; a chance de B superar A é de cerca de 94%".
+- **Onde cada número nasce:** `predicted_metric` e o intervalo vêm da tool de predição (aulas 5.2 e 5.3); $$P(B > A)$$ vem da tool de ordenação, que recebe os quantis dos dois criativos; a ressalva de confiança vem da aula 5.4.
+- **O que ainda falta:** dizer **por que** B está acima. Essa é a segunda metade do módulo, com Shapley e SHAP.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Chamar de "intervalo" o erro-padrão da média.** Isso é intervalo de confiança; ele encolhe com $$n$$ e não cobre posts novos.
+2. **Converter a média do log com `exp`.** A mediana atravessa a transformação; a média, não. Use o quantil 0,5 e `np.expm1`.
+3. **Declarar 80% sem medir.** Todo intervalo publicado precisa de uma linha com cobertura empírica e largura média no teste temporal.
+4. **Decidir por sobreposição de intervalos.** Calcule $$P(B > A)$$ e diga qual suposição de correlação você usou.
+5. **Comunicar o intervalo em unidades simétricas.** "4.380 ± 3.000" está errado dos dois lados. Diga "entre 2.300 e 8.300" ou "entre metade e quase o dobro".
+6. **Achar que o intervalo resolve a incerteza epistêmica.** Um canal com 3 posts pode receber um intervalo estreito e errado. Isso é trabalho do `confidence_flag`.
+:::
+
+<Quiz
+  id="m5-a1"
+  perguntas={[
+    {
+      pergunta: 'Você tem 5.000 Shorts de um canal e calcula `media ± 1,28 * desvio / sqrt(n)` em log. O intervalo fica estreitíssimo. O que ele descreve?',
+      opcoes: [
+        {texto: 'A faixa onde o próximo Short do canal deve cair com 80% de probabilidade.', explicacao: 'Não. Essa fórmula é de intervalo de confiança da média; ela não inclui o ruído de um post individual.'},
+        {texto: 'A incerteza sobre a média de log-curtidas do canal, que encolhe com mais dados.', correta: true, explicacao: 'Exato. É um intervalo de confiança para um parâmetro. Para um post novo, falta o termo do ruído, o 1 dentro da raiz.'},
+        {texto: 'Um intervalo de predição calibrado, já que usou muitos dados.', explicacao: 'Quantidade de dados não transforma IC em IP. Com n grande, o IC tende a um ponto e cobre quase nenhum post novo.'},
+      ],
+    },
+    {
+      pergunta: 'O modelo prevê, em log1p, mediana 8,0 e intervalo de 80% de 7,4 a 8,6. Qual é o intervalo correto em curtidas?',
+      opcoes: [
+        {texto: '`expm1` aplicado a cada limite: cerca de 1.635 a 5.430, com mediana cerca de 2.980.', correta: true, explicacao: 'Quantis atravessam funções crescentes, então basta converter cada quantil. O resultado é assimétrico em curtidas, como esperado.'},
+        {texto: '2.980 ± 1.900, simétrico em torno da mediana.', explicacao: 'Um intervalo simétrico em log vira um intervalo simétrico em proporção, não em unidades. A cauda de cima fica mais longa.'},
+        {texto: 'Não dá para converter: seria preciso treinar outro modelo em curtidas.', explicacao: 'Dá, e exatamente, porque log1p é estritamente crescente e quantis são preservados.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas situações aumenta principalmente a incerteza **epistêmica** da previsão?',
+      opcoes: [
+        {texto: 'Um Short de beleza de um canal com 150 posts, publicado num dia de muita concorrência.', explicacao: 'Concorrência no dia é ruído do mundo, incerteza aleatória. O modelo conhece bem esse tipo de caso.'},
+        {texto: 'Um Short de um canal de caminhões antigos com 4 posts anteriores, num setor quase ausente da base.', correta: true, explicacao: 'Poucos dados parecidos: o modelo está extrapolando. Mais dados desse tipo reduziriam essa incerteza.'},
+        {texto: 'Um Short cujo resultado depende de o algoritmo empurrá-lo nas primeiras horas.', explicacao: 'Isso é aleatório do ponto de vista do que se sabe antes da publicação; mais dados não o eliminam.'},
+      ],
+    },
+    {
+      pergunta: 'Os intervalos de 80% de A e B se sobrepõem. O que a Galaxies deve concluir?',
+      opcoes: [
+        {texto: 'Que A e B estão empatados e a escolha é indiferente.', explicacao: 'Sobreposição de intervalos é um critério conservador demais. A diferença pode ser muito provável mesmo com sobreposição.'},
+        {texto: 'Que é preciso calcular P(B > A), declarando a suposição sobre a correlação dos erros.', correta: true, explicacao: 'É a quantidade que responde à pergunta de decisão. No caso Lumina ela fica em torno de 0,94 com erros independentes.'},
+        {texto: 'Que o modelo está errado, porque intervalos de criativos diferentes não deveriam se tocar.', explicacao: 'Com ruído real de engajamento, intervalos de criativos do mesmo canal quase sempre se tocam. Isso é informação, não defeito.'},
+      ],
+    },
+    {
+      pergunta: 'No teste temporal com 150 Shorts, seu intervalo de 80% cobriu 76%. Qual é a leitura mais honesta?',
+      opcoes: [
+        {texto: 'O intervalo está descalibrado e precisa ser refeito.', explicacao: 'Com 150 casos o erro-padrão da cobertura é cerca de 3,3 pontos; 76% está dentro do esperado para 80%.'},
+        {texto: 'Compatível com 80% dado o tamanho do teste; agora vale olhar a cobertura por setor e por tamanho de canal.', correta: true, explicacao: 'Exato. A cobertura total pode esconder grupos mal cobertos, e 150 casos não permitem afirmar descalibração.'},
+        {texto: 'Ótimo: qualquer valor entre 50% e 100% é aceitável.', explicacao: 'Não. Uma cobertura de 60% seria um modelo confiante demais, e 97% um intervalo largo demais para ajudar.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: a tabela de incerteza do seu modelo]
+Com o modelo que você treinou no módulo 3 e o seu split temporal:
+
+1. Escolha 3 criativos do seu teste: um de canal grande, um de canal com menos de 10 posts anteriores e um de um setor pouco representado.
+2. Para cada um, escreva qual incerteza deve dominar (aleatória ou epistêmica) e por quê.
+3. Adapte `prob_b_maior` para receber os quantis de dois criativos **do mesmo canal** no seu teste e compare a probabilidade prevista com o que aconteceu de verdade.
+4. Escreva, em uma frase para o marketing, a recomendação para esse par, incluindo o intervalo.
+
+Você ainda não tem quantis treinados; use por enquanto um intervalo de largura fixa em log igual a $$\pm 1{,}28 \times$$ o desvio-padrão dos resíduos no conjunto de validação.
+:::
+
+<details>
+<summary>Ver uma resposta de referência</summary>
+
+- **Canal grande (beleza, 142 posts):** domina a aleatória. O modelo conhece o canal; o que sobra é o ruído do dia e do algoritmo.
+- **Canal com 6 posts:** domina a epistêmica. A *feature* "mediana do canal" foi calculada com 6 valores e é, ela mesma, uma estimativa ruidosa.
+- **Setor raro:** epistêmica. Poucos exemplos parecidos no treino.
+
+Um exemplo de frase: *"Recomendamos B: a previsão é de 4.380 curtidas (entre 2.300 e 8.300 em 80% dos cenários) e a chance de superar A é de cerca de 94%. Mesmo no cenário ruim, B fica próximo do Short típico do canal."*
+
+Se, no seu teste, pares com $$P(B > A) \approx 0{,}9$$ acertaram bem menos que 90% das vezes, seus intervalos provavelmente estão estreitos demais: guarde essa observação para a aula de predição conformal.
+
+</details>
+
+---
+
+## Resumo
+
+- A previsão pontual é um resumo de uma **distribuição preditiva**; o contrato da tool pede a mediana e dois quantis, $$q_{0,1}$$ e $$q_{0,9}$$, que formam um **intervalo de predição de 80%**.
+- **Intervalo de confiança** fala de um parâmetro e encolhe com $$n$$; **intervalo de predição** fala de um resultado novo e tem uma largura mínima dada pelo ruído.
+- **Incerteza aleatória** é ruído irredutível; **incerteza epistêmica** é falta de dados parecidos. Intervalos cuidam da primeira; o `confidence_flag` sinaliza a segunda.
+- Quantis atravessam `expm1`: intervalos simétricos em log ficam **assimétricos em curtidas**, e a mediana é o `predicted_metric` correto.
+- Um intervalo só vale com **cobertura** medida no teste temporal, por grupo. Para decidir entre A e B, use $$P(B > A)$$, não a sobreposição.
+
+## Referências
+
+- Hyndman e Athanasopoulos. [*Forecasting: Principles and Practice* (3ª ed.), seção "Prediction intervals"](https://otexts.com/fpp3/prediction-intervals.html). OTexts, 2021.
+- Hüllermeier e Waegeman. [*Aleatoric and epistemic uncertainty in machine learning: an introduction to concepts and methods*](https://arxiv.org/abs/1910.09457). Machine Learning 110, 2021.
+- Kendall e Gal. [*What Uncertainties Do We Need in Bayesian Deep Learning for Computer Vision?*](https://arxiv.org/abs/1703.04977). NeurIPS, 2017.
+- Gneiting, Balabdaoui e Raftery. [*Probabilistic forecasts, calibration and sharpness*](https://doi.org/10.1111/j.1467-9868.2007.00587.x). Journal of the Royal Statistical Society B, 2007.
+- Angelopoulos e Bates. [*A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification*](https://arxiv.org/abs/2107.07511). arXiv, 2021.
+
+**Próxima aula:** [Regressão quantílica e pinball loss](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica): como treinar o LightGBM e o CatBoost para prever quantis em vez de médias, e como avaliar se os intervalos estão certos.

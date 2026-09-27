@@ -1,0 +1,390 @@
+---
+sidebar_position: 4
+sidebar_label: 'Sinal de baixa confiança'
+title: 'Sinal de baixa confiança'
+description: 'Como construir o confidence_flag do contrato com regras explícitas (intervalo largo, canal novo, setor desconhecido, OOD por kNN, falha multimodal, data fora do período), validar que ele separa os erros e comunicar os motivos.'
+tags: [ml-preditivo, galaxies, incerteza, ood]
+---
+
+# Sinal de Baixa Confiança: Quando o Modelo Deve Dizer "Não Sei"
+
+<LessonMeta
+  tempo="40 min"
+  semana={3}
+  etapa="incerteza"
+  objetivos={[
+    'Explicar por que intervalos calibrados na média não protegem contra casos fora da distribuição',
+    'Implementar o confidence_flag com seis regras, cada uma com um código e um motivo legível',
+    'Detectar criativos fora da distribuição pela distância ao k-ésimo vizinho no espaço de features',
+    'Validar o flag comparando o erro dos casos sinalizados com o dos não sinalizados',
+    'Comunicar baixa confiança em uma frase que o marketing entende',
+  ]}
+  prerequisitos={[
+    {label: 'Predição conformal', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal'},
+    {label: 'Embeddings visuais: CLIP e SigLIP 2', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais'},
+    {label: 'Features do canal e do tempo', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/features-do-canal-e-do-tempo'},
+  ]}
+/>
+
+Uma marca de ração para cachorros descobre a demo da Galaxies e manda um Short. O canal dela tem 4 posts, o setor "pets" nunca apareceu na sua base, e o download do vídeo falhou, então o VLM não extraiu nada. O seu agente responde, com a mesma formatação impecável de sempre: *"previsão de 1.900 curtidas, intervalo de 80% entre 1.100 e 3.300"*.
+
+Cada número dessa frase é uma invenção educada. O modelo de árvores não sabe o que é "pets" e trata a categoria como algo que ele já viu; a mediana do canal foi calculada com 4 valores; as colunas do vídeo chegaram vazias. O intervalo parece calibrado porque a calibração conformal vale **na média**, e a média é feita de criativos de canais grandes de beleza, moda e automotivo. Para esse caso específico, ninguém mediu nada.
+
+O pior não é o erro: é o tom. O subagente explicador vai transformar isso num parágrafo convincente. O campo `confidence_flag` do contrato existe para interromper essa cadeia e fazer o agente dizer, logo de cara: **"baixa confiança, e aqui está o porquê"**.
+
+:::info[A ideia central]
+O `confidence_flag` é um conjunto de **regras explícitas** que detectam situações em que o modelo está extrapolando ou recebeu dados ruins. Cada regra que dispara gera um **motivo** com código e frase. O flag só vale se passar num teste simples: no conjunto de teste temporal, o **erro médio dos casos sinalizados precisa ser maior** que o dos não sinalizados.
+:::
+
+---
+
+## Por que o intervalo não resolve sozinho
+
+As três aulas anteriores cuidaram da incerteza **aleatória** (o ruído) e da calibração média. A **epistêmica**, a ignorância do modelo, escapa por três frestas:
+
+1. **Árvores extrapolam de forma plana.** Fora da região dos dados de treino, um GBM devolve o valor da última folha, com a mesma segurança de sempre. Nada no modelo "percebe" que está longe de casa.
+2. **Os quantis aprendem o ruído onde há dados.** Se quase não existem canais de pets no treino, não existe informação para o modelo de 0,9 aprender que eles são imprevisíveis.
+3. **A garantia conformal é marginal.** Na aula 5.2, canais com menos de 10 posts ficaram com cobertura de 64% enquanto o total estava em 76%. Casos raros somem na média.
+
+A resposta não é um método sofisticado, e sim uma lista curta de **perguntas verificáveis**, cada uma ligada a uma falha concreta do pipeline.
+
+<Sketch name="m5/confidence-flag" alt="Seis regras à esquerda: intervalo largo (largura em log acima do percentil 80), canal novo (menos de 10 posts anteriores), setor ou canal fora do treino, criativo estranho (distância kNN acima do percentil 99), extração falhou (vídeo ou VLM) e data fora do período dos dados. Todas apontam para um losango: alguma regra disparou? Se sim, baixa_confianca é true e motivos é uma lista de código e texto, por exemplo: baixa confiança porque o canal tem só 4 posts anteriores. Se não, baixa_confianca é false e motivos é vazio. Nota: o erro médio dos casos sinalizados precisa ser maior que o dos não sinalizados; se não for, o flag é só ruído." caption="Regras simples, motivos legíveis e um teste que o flag precisa passar." />
+
+---
+
+## As seis regras
+
+### 1. Intervalo largo
+
+Se a largura do intervalo em log, $$\log(1+\text{hi}) - \log(1+\text{lo})$$, passa do **percentil 80** das larguras num conjunto de referência, o próprio modelo está dizendo que o caso é ruidoso. A largura em log é o logaritmo da razão entre os limites: 1,28 significa que o limite de cima é $$e^{1{,}28} \approx 3{,}6$$ vezes o de baixo.
+
+Para o relatório do projeto, o percentil 80 das larguras do teste é uma referência razoável. Para a tool em produção, **fixe o limiar** calculado na calibração e versione junto com o modelo; recalculá-lo a cada chamada faria o flag depender dos outros criativos do dia.
+
+### 2. Canal com poucos posts anteriores (menos de 10)
+
+As *features* de canal (mediana de curtidas, frequência, tendência) são **estimativas**, e com poucos posts elas são ruidosas. Para ter ideia do tamanho do problema, simule a mediana de $$n$$ posts com desvio de 0,8 em log:
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+for n in [4, 10, 30]:
+    medianas = np.median(rng.normal(0, 0.8, (20_000, n)), axis=1)   # 20 mil canais
+    print(f"{n:>2} posts: erro-padrão da mediana = {medianas.std():.3f} em log "
+          f"(fator x{np.exp(medianas.std()):.2f})")
+```
+
+```text
+ 4 posts: erro-padrão da mediana = 0.438 em log (fator x1.55)
+10 posts: erro-padrão da mediana = 0.298 em log (fator x1.35)
+30 posts: erro-padrão da mediana = 0.178 em log (fator x1.19)
+```
+
+Com 4 posts, a *feature* mais importante do modelo erra, por si só, por um fator típico de 1,55. O limiar de 10 posts é uma convenção da trilha, não uma lei; ajuste-o olhando o erro do seu modelo por faixa de posts anteriores.
+
+### 3. Setor ou canal fora do treino
+
+Um setor que não existe no treino ("pets") recebe do modelo o tratamento de categoria desconhecida, que é um chute estruturado. Compare contra o conjunto de setores vistos no treino. Um **canal** nunca visto não é problema por si só se o modelo usa estatísticas do canal, e não o ID dele; o risco real, nesse caso, é o histórico curto, que a regra 2 já cobre.
+
+### 4. Criativo fora da distribuição: distância ao k-ésimo vizinho
+
+Esta é a regra mais geral. A ideia vem da detecção de *out-of-distribution* (OOD) por vizinhos mais próximos (Sun e colegas, 2022): se um criativo novo está longe de todos os exemplos de treino no espaço de features, o modelo está extrapolando. Defina
+
+$$
+d_k(x) = \big\lVert z(x) - z\big(x_{(k)}\big) \big\rVert
+$$
+
+em que $$z(\cdot)$$ padroniza as features e $$x_{(k)}$$ é o $$k$$-ésimo vizinho mais próximo de $$x$$ no treino. O limiar é o **percentil 99** de $$d_k$$ calculado em exemplos **que não estão no treino** (a calibração). Calcular no próprio treino subestima as distâncias, porque cada ponto é vizinho de si mesmo.
+
+Três cuidados práticos:
+
+- **Espaço certo:** use os componentes <Termo id="pca">PCA</Termo> do <Termo id="embedding">embedding</Termo> visual (8 a 32 dimensões), não o vetor bruto de 768 dimensões, em que as distâncias ficam todas parecidas.
+- **Padronize** cada coluna, ou a distância será dominada pela coluna de maior escala.
+- **Escala:** com dezenas de milhares de criativos, o `NearestNeighbors` do scikit-learn ainda é rápido; acima disso, use um índice como o FAISS.
+
+### 5. Falha na extração multimodal
+
+Se o vídeo não foi baixado, o VLM devolveu JSON inválido ou o Whisper estourou o limite, as colunas multimodais chegam vazias. O LightGBM aceita `NaN`, mas ele aprendeu o comportamento de "vazio" com os poucos casos vazios do treino. A previsão vira "canal e texto apenas". Isso precisa ser dito, e é a regra mais fácil de implementar: a tool de extração já sabe se falhou.
+
+### 6. Data de publicação fora do período
+
+Um criativo agendado para daqui a 8 meses está num mundo que o modelo nunca viu (lembre do <Termo id="drift">drift</Termo> da aula anterior). Na trilha, a regra dispara se a publicação estiver mais de 180 dias depois do último dado usado, ou mais de um ano antes dele. Ajuste os números ao ritmo de retreino do seu projeto.
+
+---
+
+## Na prática: a função e o teste que ela precisa passar
+
+Os quatro blocos a seguir formam um único script. Os dados são **sintéticos** e foram construídos para ter os problemas desta aula: 100 criativos de teste com um "estilo visual novo" (embedding deslocado), 5% de falhas de extração, canais com poucos posts e um ruído maior para criativos de estilo incomum.
+
+```python
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(3)
+EMB = [f"emb_{i}" for i in range(8)]            # PCA do embedding visual
+FEATURES = ["nivel_canal", "posts_anteriores", "gancho"] + EMB
+
+def gerar(n, dia_min, dia_max, estilo_novo=0.0):
+    df = pd.DataFrame(rng.normal(0, 1, (n, 8)), columns=EMB)
+    df[EMB] += estilo_novo                       # desloca o "estilo visual"
+    df["dia"] = rng.integers(dia_min, dia_max, n)
+    df["nivel_canal"] = rng.normal(6.5, 1.2, n)
+    df["posts_anteriores"] = rng.integers(0, 120, n)
+    df["gancho"] = rng.integers(0, 11, n).astype(float)
+    df["setor"] = rng.choice(["moda", "beleza", "automotivo"], n)
+    df["extracao_ok"] = True
+    ruido = 0.42 + 0.6 * np.exp(-df.posts_anteriores / 15) + 0.4 * (np.abs(df[EMB]).mean(axis=1) > 1.2)
+    df["y"] = (df.nivel_canal + 0.09 * (df.gancho - 5) + 0.15 * df.emb_0
+               + 0.2 * np.tanh(df.emb_1 * df.emb_2) + rng.normal(0, 1, n) * ruido)
+    return df
+
+treino = gerar(4_000, 0, 600)
+calib = gerar(1_000, 600, 750)
+teste = pd.concat([gerar(900, 750, 900),
+                   gerar(100, 750, 900, estilo_novo=2.5)], ignore_index=True)  # 100 fora da distribuição
+falhou = rng.random(len(teste)) < 0.05          # 5% sem vídeo/VLM: features visuais nulas
+teste.loc[falhou, EMB] = np.nan
+teste.loc[falhou, "extracao_ok"] = False
+
+quantis = {a: lgb.LGBMRegressor(objective="quantile", alpha=a, n_estimators=300,
+                                learning_rate=0.03, num_leaves=15, min_child_samples=40,
+                                verbose=-1).fit(treino[FEATURES], treino.y)
+           for a in (0.1, 0.5, 0.9)}
+```
+
+Os limiares são calculados **uma vez**, fora do teste, e versionados com o modelo:
+
+```python
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+
+K = 10
+escala = StandardScaler().fit(treino[EMB])
+knn = NearestNeighbors(n_neighbors=K).fit(escala.transform(treino[EMB]))
+
+def dist_k(df):
+    """Distância ao k-ésimo vizinho do treino (NaN se a extração falhou)."""
+    d = np.full(len(df), np.nan)
+    ok = df[EMB].notna().all(axis=1).to_numpy()
+    d[ok] = knn.kneighbors(escala.transform(df.loc[ok, EMB]))[0][:, -1]
+    return d
+
+def largura(df):
+    return quantis[0.9].predict(df[FEATURES]) - quantis[0.1].predict(df[FEATURES])
+
+LIMIARES = {                          # calculados UMA vez, fora do teste, e versionados
+    "largura_log": np.percentile(largura(calib), 80),
+    "dist_knn": np.nanpercentile(dist_k(calib), 99),
+    "min_posts": 10,
+    "setores": set(treino.setor),
+    "ultimo_dia_visto": int(calib.dia.max()),
+    "max_dias": 180,
+    "max_dias_passado": 365,
+}
+```
+
+A função devolve o flag e a lista de motivos. Cada motivo tem um **código** estável (para métricas, testes e para o subagente explicador) e um **texto** em português de marketing:
+
+```python
+def _br(x):
+    return f"{x:.1f}".replace(".", ",")
+
+def confidence_flag(largura_log, posts_anteriores, setor, dist_knn,
+                    extracao_ok, dia_publicacao, limiares):
+    """Retorna (baixa_confianca, motivos); cada motivo tem um código e uma frase."""
+    L, motivos = limiares, []
+
+    def motivo(codigo, texto):
+        motivos.append({"codigo": codigo, "texto": texto})
+
+    if largura_log > L["largura_log"]:
+        motivo("intervalo_largo", f"o limite de cima é {_br(np.exp(largura_log))} vezes o de baixo "
+                                  f"(em 80% dos casos, fica abaixo de {_br(np.exp(L['largura_log']))})")
+    if posts_anteriores < L["min_posts"]:
+        motivo("canal_novo", f"o canal tem só {posts_anteriores} posts anteriores")
+    if setor not in L["setores"]:
+        motivo("setor_desconhecido", f"o setor '{setor}' não aparece nos dados de treino")
+    if not extracao_ok:
+        motivo("extracao_falhou", "o vídeo não foi analisado; a previsão usa só canal e texto")
+    elif dist_knn > L["dist_knn"]:
+        motivo("fora_da_distribuicao", "o criativo é diferente de tudo que o modelo viu")
+    dias = dia_publicacao - L["ultimo_dia_visto"]
+    if dias > L["max_dias"] or dias < -L["max_dias_passado"]:
+        motivo("data_fora_do_periodo", f"a publicação está a {abs(dias)} dias do fim dos dados")
+    return len(motivos) > 0, motivos
+```
+
+Agora o teste que decide se o flag presta: o erro dos sinalizados contra o dos não sinalizados, no teste temporal, e o mesmo por motivo.
+
+```python
+teste = teste.assign(largura=largura(teste), dist=dist_k(teste),
+                     pred=quantis[0.5].predict(teste[FEATURES]))
+saida = [confidence_flag(r.largura, r.posts_anteriores, r.setor, r.dist,
+                         r.extracao_ok, r.dia, LIMIARES) for r in teste.itertuples()]
+teste["baixa"] = [f for f, _ in saida]
+teste["erro_abs"] = (teste.y - teste.pred).abs()
+lo, hi = quantis[0.1].predict(teste[FEATURES]), quantis[0.9].predict(teste[FEATURES])
+teste["coberto"] = (teste.y >= lo) & (teste.y <= hi)
+
+print(f"sinalizados: {teste.baixa.mean():.0%}")
+print(teste.groupby("baixa").agg(n=("y", "size"), mae_log=("erro_abs", "mean"),
+                                 cobertura=("coberto", "mean")).round(3))
+for codigo in ["intervalo_largo", "canal_novo", "fora_da_distribuicao", "extracao_falhou"]:
+    tem = np.array([any(m["codigo"] == codigo for m in ms) for _, ms in saida])
+    print(f"{codigo:<22} n={tem.sum():>3}  mae_log={teste.erro_abs[tem].mean():.3f}")
+
+largura_b = np.log1p(8_300) - np.log1p(2_300)            # Lumina B: 2.300 a 8.300
+print(confidence_flag(largura_b, 142, "beleza", 1.9, True, 760, LIMIARES))
+largura_pets = np.log1p(3_300) - np.log1p(1_100)        # o intervalo "parece normal"
+print(confidence_flag(largura_pets, 4, "pets", np.nan, False, 760, LIMIARES))
+```
+
+```text
+sinalizados: 36%
+         n  mae_log  cobertura
+baixa                         
+False  637    0.371      0.752
+True   363    0.622      0.705
+intervalo_largo        n=259  mae_log=0.602
+canal_novo             n= 91  mae_log=0.736
+fora_da_distribuicao   n=105  mae_log=0.762
+extracao_falhou        n= 39  mae_log=0.542
+(False, [])
+(True, [{'codigo': 'canal_novo', 'texto': 'o canal tem só 4 posts anteriores'}, {'codigo': 'setor_desconhecido', 'texto': "o setor 'pets' não aparece nos dados de treino"}, {'codigo': 'extracao_falhou', 'texto': 'o vídeo não foi analisado; a previsão usa só canal e texto'}])
+```
+
+---
+
+## Como ler a avaliação do flag
+
+O flag passou no teste principal: o erro médio (MAE em log) dos sinalizados é **0,622**, contra **0,371** dos não sinalizados, cerca de 1,7 vez maior. A cobertura também é pior entre os sinalizados (70,5% contra 75,2%). Cada motivo, sozinho, também separa: os casos fora da distribuição (0,762) e de canal novo (0,736) são os piores.
+
+Repare também na última linha: o criativo de pets do começo da aula tem um intervalo que **parece normal** (razão 3,0 entre os limites, abaixo do limiar de 3,9), e mesmo assim é sinalizado por três outros motivos. É exatamente o caso em que o intervalo sozinho enganaria.
+
+Três leituras que valem para a sua base:
+
+- **O teste é o que dá sentido ao flag.** Os dados desta aula foram construídos para que as regras funcionem. Na sua base, alguma regra pode não separar nada; se o MAE dos casos com um motivo não for maior que o dos sem flag, **remova ou ajuste essa regra**. Uma regra que não separa erro só gera alarme falso.
+- **A taxa de sinalização é uma decisão de produto.** Aqui, 36% dos criativos foram sinalizados, e a regra de largura aparece em 259 dos 1.000 casos: por construção, ela marca cerca de 20% da calibração, e o teste é um pouco mais difícil. Se mais da metade das respostas vier com "baixa confiança", o usuário aprende a ignorar o aviso. Suba o percentil da regra de largura se for o caso, e reporte o trade-off.
+- **O ganho aparece em quem não foi sinalizado.** O MAE geral do teste é cerca de 0,46; entre os não sinalizados, 0,37. Essa é a lógica da *predição seletiva* (Geifman e El-Yaniv, 2017): você troca abrangência por confiabilidade e diz, explicitamente, onde está a troca.
+
+Uma forma mais completa de avaliar é ordenar os criativos por "quantidade de motivos" (ou por distância kNN) e traçar o erro acumulado conforme você descarta os mais suspeitos, a curva risco-abrangência. Para o projeto, a tabela acima já basta.
+
+---
+
+## Como comunicar: "baixa confiança porque..."
+
+O flag só cumpre o papel se chegar ao usuário do jeito certo. Quatro regras de comunicação:
+
+1. **Não esconda o número.** Mostre a previsão e o intervalo, mas **antes** deles diga que a confiança é baixa. Esconder faria a persona da Galaxies ou o usuário buscar o número em outro lugar.
+2. **Dê o motivo concreto.** "Baixa confiança porque o canal tem só 4 posts anteriores e o vídeo não pôde ser analisado" é acionável; "incerteza elevada" não é.
+3. **Diga o que resolveria**, quando existir: "com mais 10 posts publicados, a estimativa do canal melhora"; "reenvie o vídeo para análise visual".
+4. **Passe os códigos adiante.** O subagente explicador da [aula 5.7](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa) recebe os motivos no JSON e é obrigado a abrir as ressalvas com "Baixa confiança:". A tool de ordenação também deve marcar pares em que um dos lados está sinalizado.
+
+Um exemplo de saída completa para o criativo de pets: *"Baixa confiança: o canal tem só 4 posts anteriores, o setor 'pets' não aparece nos dados de treino e o vídeo não foi analisado. A previsão (1.900 curtidas, entre 1.100 e 3.300) usa apenas o canal e o texto e deve ser tratada como uma ordem de grandeza."*
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+- **Short B** (números ilustrativos do caso canônico): `confidence_flag = {"baixa_confianca": false, "motivos": []}`. O canal tem 142 posts anteriores, beleza é bem representada, a extração funcionou, o criativo está perto de muitos exemplos de treino e o intervalo (2.300 a 8.300, razão 3,6) está abaixo do limiar de largura deste exemplo (3,9). É o que a última linha "False" do código mostra.
+- **Short A:** o mesmo, pelos mesmos motivos. A comparação A vs. B acontece num território que o modelo conhece.
+- **Onde o flag apareceria:** se a Lumina lançasse uma submarca num canal novo, com 4 posts, qualquer previsão viria com `canal_novo`. E se a análise de vídeo do Short B falhasse na véspera, a previsão seguiria existindo, com `extracao_falhou`, e o $$P(B > A) \approx 0{,}94$$ deveria ser apresentado como menos confiável.
+- **No contrato:** `confidence_flag` é um objeto com `baixa_confianca` (booleano) e `motivos` (lista de `{codigo, texto}`). Os códigos são os mesmos em todo o agente.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Flag sem avaliação.** Se você não mostrou que o erro dos sinalizados é maior, o flag é decoração.
+2. **Limiar calculado na hora.** Percentis recalculados a cada chamada tornam o flag instável. Calcule na calibração e versione.
+3. **kNN no próprio treino.** Cada ponto é seu próprio vizinho; o p99 fica baixo demais e tudo vira "fora da distribuição".
+4. **Distância em 768 dimensões sem padronizar.** Use PCA e padronização, ou a regra vira ruído.
+5. **Sinalizar tudo.** Um flag em 70% das respostas ensina o usuário a ignorá-lo. Ajuste e reporte a taxa.
+6. **Esconder a previsão quando o flag dispara.** Mostre o número com o aviso na frente e o motivo concreto.
+7. **Motivos só em texto livre.** Sem código estável, você não consegue medir, testar nem instruir o explicador.
+:::
+
+<Quiz
+  id="m5-a4"
+  perguntas={[
+    {
+      pergunta: 'Seu intervalo conformal cobre 80% no teste. Por que ainda assim vale a pena ter um confidence_flag?',
+      opcoes: [
+        {texto: 'Não vale: com cobertura de 80%, todos os casos estão bem cobertos.', explicacao: 'A cobertura conformal é marginal. Grupos raros, como canais novos, podem ter cobertura bem menor e sumir na média.'},
+        {texto: 'Porque a garantia é marginal e os modelos de árvore extrapolam sem perceber; casos raros ou fora da distribuição precisam de sinalização explícita.', correta: true, explicacao: 'Exato. O flag cuida da incerteza epistêmica, que o intervalo calibrado na média não enxerga.'},
+        {texto: 'Porque o flag substitui o intervalo quando o modelo está bom.', explicacao: 'O flag complementa o intervalo; os dois vão na resposta.'},
+      ],
+    },
+    {
+      pergunta: 'Você calculou o limiar de distância kNN como o percentil 99 das distâncias dos próprios pontos de treino ao seu k-ésimo vizinho. O que vai acontecer?',
+      opcoes: [
+        {texto: 'Nada de errado: o treino é a referência natural.', explicacao: 'Cada ponto de treino tem a si mesmo como vizinho, então as distâncias ficam menores que as de pontos novos.'},
+        {texto: 'O limiar fica baixo demais e muitos criativos normais serão marcados como fora da distribuição.', correta: true, explicacao: 'Exato. Calcule o percentil em exemplos que não estão no treino, como a calibração.'},
+        {texto: 'O limiar fica alto demais e nada será sinalizado.', explicacao: 'É o contrário: distâncias do treino a si mesmo são otimistas, o que baixa o limiar.'},
+      ],
+    },
+    {
+      pergunta: 'No teste temporal, o MAE dos casos com o motivo "extracao_falhou" é igual ao dos casos sem flag. O que fazer?',
+      opcoes: [
+        {texto: 'Manter a regra, porque falha de extração é sempre grave.', explicacao: 'Se o erro não piora, a regra não está separando nada na sua base; ela só gera alarme.'},
+        {texto: 'Investigar e, se confirmado, rebaixar a regra para um aviso informativo, sem disparar o flag.', correta: true, explicacao: 'Isso pode significar que as features visuais somam pouco no seu modelo, o que é coerente com a literatura (+0,02 a +0,04 de Spearman). Informe a falha, mas sem chamar de baixa confiança.'},
+        {texto: 'Apagar as features visuais do modelo.', explicacao: 'É uma decisão de ablação, que precisa de outro experimento. O resultado do flag sozinho não a justifica.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas é a melhor forma de comunicar baixa confiança ao time de marketing?',
+      opcoes: [
+        {texto: 'Omitir a previsão e responder que não há dados suficientes.', explicacao: 'Esconder o número tira informação útil e leva o usuário a buscar a estimativa em outro lugar.'},
+        {texto: '"Incerteza elevada (score 0,73)."', explicacao: 'Não é acionável: não diz por que, nem o que fazer.'},
+        {texto: '"Baixa confiança: o canal tem só 4 posts anteriores. Previsão de 1.900 curtidas (entre 1.100 e 3.300), a ser lida como ordem de grandeza."', correta: true, explicacao: 'Aviso na frente, motivo concreto, número e intervalo mantidos, com a leitura adequada.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: o flag da sua tool]
+1. Implemente `confidence_flag` com as seis regras. Calcule os limiares na calibração e salve-os num JSON versionado ao lado do modelo.
+2. Rode no seu teste temporal e monte a tabela: taxa de sinalização, MAE e cobertura dos sinalizados e dos não sinalizados, e MAE por código de motivo.
+3. Remova ou ajuste qualquer regra que não separe erro.
+4. Escolha 3 criativos sinalizados e escreva, para cada um, a frase "Baixa confiança: ..." que o agente deveria dizer.
+:::
+
+<details>
+<summary>Ver dicas</summary>
+
+- Para salvar os limiares, converta o `set` de setores em lista: `json.dump({**LIMIARES, "setores": sorted(LIMIARES["setores"])}, f)`.
+- Se não houver falhas de extração na sua base, simule: apague as colunas visuais de 5% do teste e confira se o erro sobe. Isso também é uma pequena <Termo id="ablacao">ablação</Termo>.
+- Para o kNN, use exatamente o mesmo espaço (mesmas colunas PCA, mesma padronização) que a tool de comparáveis do módulo 6 vai usar. Assim, "fora da distribuição" e "sem comparáveis próximos" contam a mesma história.
+- Uma taxa de sinalização entre 15% e 35% costuma ser um bom ponto de partida para um produto; acima disso, revise a regra de largura primeiro.
+
+</details>
+
+---
+
+## Resumo
+
+- Intervalos calibrados **na média** não protegem contra **incerteza epistêmica**: árvores extrapolam sem perceber e casos raros somem na cobertura marginal.
+- O `confidence_flag` combina seis regras: **intervalo largo**, **canal novo**, **setor desconhecido**, **distância kNN** acima do p99, **falha de extração** e **data fora do período**.
+- Limiares são calculados **fora do teste** (calibração) e versionados com o modelo.
+- O flag precisa passar num teste: **MAE dos sinalizados maior** que o dos não sinalizados, também por motivo. No exemplo, 0,62 contra 0,37.
+- Comunique com **aviso na frente, motivo concreto e número mantido**; passe os **códigos** para o explicador e para a ordenação.
+
+## Referências
+
+- Sun, Ming, Zhu e Li. [*Out-of-Distribution Detection with Deep Nearest Neighbors*](https://arxiv.org/abs/2204.06507). ICML, 2022.
+- Geifman e El-Yaniv. [*Selective Classification for Deep Neural Networks*](https://arxiv.org/abs/1705.08500). NeurIPS, 2017.
+- Ovadia et al. [*Can You Trust Your Model's Uncertainty? Evaluating Predictive Uncertainty Under Dataset Shift*](https://arxiv.org/abs/1906.02530). NeurIPS, 2019.
+- Hüllermeier e Waegeman. [*Aleatoric and epistemic uncertainty in machine learning*](https://arxiv.org/abs/1910.09457). Machine Learning 110, 2021.
+- scikit-learn: [`NearestNeighbors`](https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.NearestNeighbors.html).
+
+**Próxima aula:** [Shapley values: a intuição](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shapley-values): a teoria dos jogos por trás do SHAP, calculada à mão para três features.

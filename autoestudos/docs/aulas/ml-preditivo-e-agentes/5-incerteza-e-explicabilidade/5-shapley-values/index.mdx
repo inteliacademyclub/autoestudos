@@ -1,0 +1,372 @@
+---
+sidebar_position: 5
+sidebar_label: 'Shapley values: a intuição'
+title: 'Shapley values: a intuição'
+description: 'A teoria dos jogos cooperativos por trás do SHAP: contribuição marginal, média sobre ordens, os quatro axiomas, um exemplo com 3 features calculado à mão e o que significa "remover" uma feature.'
+tags: [ml-preditivo, galaxies, explicabilidade, shap]
+---
+
+import ShapleyGame from '@site/src/components/interativos/ShapleyGame';
+
+# Shapley Values: Dividindo a Previsão de Forma Justa
+
+<LessonMeta
+  tempo="40 min"
+  semana={3}
+  etapa="explicacao"
+  objetivos={[
+    'Traduzir a explicação de uma previsão para a linguagem de jogos cooperativos (jogadores, coalizões, pagamento)',
+    'Calcular valores de Shapley à mão para 3 features, pela média sobre ordens e pela fórmula de coalizões',
+    'Enunciar os quatro axiomas (eficiência, simetria, jogador nulo, aditividade) e o que cada um garante',
+    'Explicar o que significa "remover" uma feature e a diferença entre as versões intervencional e observacional',
+    'Implementar Shapley exato por força bruta e conferir contra o SHAP',
+  ]}
+  prerequisitos={[
+    {label: 'Por que um número só não basta', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/por-que-um-numero-so-nao-basta'},
+    {label: 'Gradient boosting passo a passo', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo'},
+  ]}
+/>
+
+O modelo previu 4.380 curtidas para o Short B da Lumina, contra 2.300 de um Short típico do canal. A Galaxies pediu explicitamente uma camada de raciocínio: *"acho que vai viralizar por conta disso, disso e disso"*. Então alguém precisa responder: **quanto** dessa diferença é do gancho forte? Quanto é do texto na tela? Quanto é do horário das 19h?
+
+Parece fácil até você tentar. Se você desliga só o gancho e mede a queda, obtém um número. Se desliga primeiro o texto e depois o gancho, obtém outro, porque gancho e texto **interagem**: um gancho forte rende mais quando a mensagem aparece escrita na tela. A ordem em que você "remove" as coisas muda o crédito de cada uma.
+
+Esse problema tem 70 anos e uma resposta com prova matemática. Em 1953, Lloyd Shapley perguntou como dividir o pagamento de um jogo cooperativo entre jogadores que contribuem de formas diferentes e interagem entre si, e mostrou que só existe **uma** divisão que satisfaz quatro exigências razoáveis de justiça. O <Termo id="shap">SHAP</Termo>, que você vai usar na próxima aula, é essa resposta aplicada às features de um modelo.
+
+:::info[A ideia central]
+Trate cada feature como um **jogador** e a previsão como o **pagamento** do time. O valor de Shapley de uma feature é a sua **contribuição marginal média**: quanto a previsão muda quando ela "entra" no time, calculado em todas as ordens possíveis de entrada e depois tirando a média. Os valores somam exatamente a diferença entre a previsão e a previsão de referência.
+:::
+
+---
+
+## A explicação como um jogo cooperativo
+
+Um **jogo cooperativo** tem dois ingredientes:
+
+- um conjunto de **jogadores** $$N = \{1, \dots, p\}$$;
+- uma **função característica** $$v$$, que diz quanto cada **coalizão** $$S \subseteq N$$ (subconjunto de jogadores) consegue sozinha. Por convenção, $$v(\varnothing)$$ é o ponto de partida.
+
+Na explicação de uma previsão $$f(x)$$:
+
+| Jogo | Explicação de uma previsão |
+| :--- | :--- |
+| jogadores | as <Termo id="feature">features</Termo> do criativo |
+| coalizão $$S$$ | as features cujo valor "conhecemos" (fixadas no valor de $$x$$) |
+| $$v(S)$$ | a previsão esperada quando só as features de $$S$$ estão fixadas |
+| $$v(\varnothing)$$ | a previsão média, sem saber nada do criativo: o **valor base** |
+| $$v(N) - v(\varnothing)$$ | o "pagamento" a dividir: $$f(x)$$ menos o valor base |
+
+O valor de Shapley $$\phi_j$$ de cada feature é a fatia do pagamento que cabe a ela. Como veremos, as fatias somam exatamente o total:
+
+$$
+f(x) = v(\varnothing) + \sum_{j=1}^{p} \phi_j
+$$
+
+Guarde essa equação: é ela que permite escrever "o Short típico faria 2.300; o gancho soma tanto, o texto soma tanto, e o resultado é 4.380".
+
+---
+
+## Contribuição marginal e a média sobre as ordens
+
+A **contribuição marginal** da feature $$j$$ a uma coalizão $$S$$ (que não contém $$j$$) é o ganho de acrescentá-la:
+
+$$
+\Delta_j(S) = v(S \cup \{j\}) - v(S)
+$$
+
+O problema da interação aparece aqui: $$\Delta_j(S)$$ depende de quem já está em $$S$$. A solução de Shapley é imaginar os jogadores entrando na sala **um de cada vez, em ordem aleatória**, e pagar a cada um a contribuição marginal no momento em que ele entra. Como toda ordem é igualmente provável, o valor de Shapley é a média sobre as $$p!$$ ordens:
+
+$$
+\phi_j = \frac{1}{p!} \sum_{\pi} \Big[ v\big(P_j^{\pi} \cup \{j\}\big) - v\big(P_j^{\pi}\big) \Big]
+$$
+
+em que $$P_j^{\pi}$$ é o conjunto de jogadores que entraram antes de $$j$$ na ordem $$\pi$$. Muitas ordens levam à mesma coalizão "antes de $$j$$", então dá para agrupar. A coalizão $$S$$ aparece antes de $$j$$ em $$|S|!\,(p - |S| - 1)!$$ ordens (os de $$S$$ em qualquer ordem, depois $$j$$, depois o resto em qualquer ordem). Daí vem a forma mais conhecida:
+
+$$
+\phi_j = \sum_{S \subseteq N \setminus \{j\}} \frac{|S|!\,(p - |S| - 1)!}{p!} \Big[ v(S \cup \{j\}) - v(S) \Big]
+$$
+
+---
+
+## Um exemplo com três features, à mão
+
+Para o Short B, fique com três jogadores: **G** (gancho forte, nota 8), **T** (texto na tela) e **H** (horário nobre, 19h). A tabela abaixo dá $$v(S)$$ em escala log, já descontado o valor base: quanto a previsão sobe, em relação ao Short típico do canal, quando só as features de $$S$$ assumem os valores de B. Os números são ilustrativos, escolhidos para bater com o caso canônico da trilha.
+
+| Coalizão $$S$$ | $$\varnothing$$ | $$\{G\}$$ | $$\{T\}$$ | $$\{H\}$$ | $$\{G,T\}$$ | $$\{G,H\}$$ | $$\{T,H\}$$ | $$\{G,T,H\}$$ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| $$v(S)$$ | 0,00 | 0,24 | 0,04 | 0,05 | 0,36 | 0,29 | 0,09 | 0,41 |
+
+Repare em duas coisas antes de calcular. H é **aditivo**: acrescentá-lo sempre soma 0,05, com quem quer que esteja na sala. G e T **interagem**: juntos valem 0,36, mais que a soma separada (0,24 + 0,04 = 0,28). Essa **sinergia** de 0,08 é o "gancho forte rende mais com a mensagem escrita".
+
+Agora, as $$3! = 6$$ ordens de entrada e o que cada jogador acrescenta ao entrar:
+
+| Ordem | G acrescenta | T acrescenta | H acrescenta | Soma |
+| :--- | ---: | ---: | ---: | ---: |
+| G, T, H | 0,24 | 0,36 − 0,24 = 0,12 | 0,41 − 0,36 = 0,05 | 0,41 |
+| G, H, T | 0,24 | 0,41 − 0,29 = 0,12 | 0,29 − 0,24 = 0,05 | 0,41 |
+| T, G, H | 0,36 − 0,04 = 0,32 | 0,04 | 0,05 | 0,41 |
+| T, H, G | 0,41 − 0,09 = 0,32 | 0,04 | 0,09 − 0,04 = 0,05 | 0,41 |
+| H, G, T | 0,29 − 0,05 = 0,24 | 0,12 | 0,05 | 0,41 |
+| H, T, G | 0,32 | 0,09 − 0,05 = 0,04 | 0,05 | 0,41 |
+| **Média** | **0,28** | **0,08** | **0,05** | **0,41** |
+
+O gancho recebe 0,28; o texto, 0,08; o horário, 0,05. A sinergia de 0,08 foi **dividida ao meio** entre G e T (cada um leva 0,04 além do seu efeito isolado), e H, que não interage com ninguém, recebe exatamente o seu efeito isolado. Em curtidas, $$e^{0{,}28} \approx 1{,}32$$, ou seja, o gancho empurra a previsão em cerca de 32%. O caso canônico mostra ×1,33 porque lá o multiplicador é calculado antes de arredondar a contribuição; com duas casas, as duas contas dão a mesma história.
+
+O mesmo número sai da fórmula por coalizões. Para G, com $$p = 3$$, os pesos são $$\frac{0!\,2!}{3!} = \frac{2}{6}$$ para $$S = \varnothing$$, $$\frac{1!\,1!}{3!} = \frac{1}{6}$$ para $$S$$ com um jogador e $$\frac{2!\,0!}{3!} = \frac{2}{6}$$ para $$S = \{T, H\}$$:
+
+$$
+\phi_G = \tfrac{2}{6}(0{,}24) + \tfrac{1}{6}(0{,}36 - 0{,}04) + \tfrac{1}{6}(0{,}29 - 0{,}05) + \tfrac{2}{6}(0{,}41 - 0{,}09) = 0{,}28
+$$
+
+<Sketch name="m5/coalizoes-shapley" alt="Reticulado das 8 coalizões de G, T e H, do conjunto vazio no topo ao conjunto completo embaixo, com o valor v de cada uma. As 4 coalizões que contêm G estão em amarelo e indicam quanto G somou ao entrar: mais 0,24 no conjunto só com G, mais 0,32 em G e T, mais 0,24 em G e H, mais 0,32 no conjunto completo. As setas amarelas grossas marcam as entradas de G; as demais arestas são tracejadas. Nota à direita: Shapley de G é a média ponderada das 4 contribuições, 0,24 vezes 2/6 mais 0,32 vezes 1/6 mais 0,24 vezes 1/6 mais 0,32 vezes 2/6, igual a 0,28; o peso é a fração das 6 ordens em que G encontra aquela coalizão." caption="As quatro portas por onde o gancho pode entrar, e o peso de cada uma." />
+
+No componente abaixo (números **simulados**), você monta as coalizões de 3 features e acompanha o cálculo exato. Antes de mexer, preveja: se a interação entre duas features sumisse, quanto cada uma receberia? Depois confira.
+
+<ShapleyGame />
+
+---
+
+## Os quatro axiomas
+
+Por que essa média, e não outra regra de divisão? Shapley provou que ela é a **única** que satisfaz quatro propriedades ao mesmo tempo. Cada uma tem uma consequência prática para o SHAP:
+
+| Axioma | Enunciado | O que garante no projeto |
+| :--- | :--- | :--- |
+| **Eficiência** | $$\sum_j \phi_j = v(N) - v(\varnothing)$$ | a explicação **fecha a conta**: valor base + contribuições = previsão, sem resto |
+| **Simetria** | se $$v(S \cup \{i\}) = v(S \cup \{j\})$$ para todo $$S$$, então $$\phi_i = \phi_j$$ | duas features intercambiáveis recebem o mesmo crédito, e por isso **features duplicadas dividem o crédito** |
+| **Jogador nulo** (*dummy*) | se $$v(S \cup \{j\}) = v(S)$$ para todo $$S$$, então $$\phi_j = 0$$ | uma feature que o modelo não usa recebe exatamente zero |
+| **Aditividade** | para $$v = v_1 + v_2$$, $$\phi_j(v) = \phi_j(v_1) + \phi_j(v_2)$$ | num ensemble que **soma** árvores, o SHAP do modelo é a soma do SHAP de cada árvore |
+
+O último axioma é o que torna o SHAP viável em gradient boosting: dá para explicar árvore por árvore e somar. A consequência do segundo é uma armadilha que você vai encontrar na prática: se `texto_na_tela` e "quantidade de caracteres lidos por OCR" medem quase a mesma coisa, o crédito do "texto" fica **repartido** entre as duas colunas, e cada uma parece menos importante do que o fenômeno é.
+
+---
+
+## O que é "remover" uma feature
+
+Até aqui, $$v(S)$$ veio de uma tabela. Num modelo real, surge uma dificuldade: um GBM não sabe prever sem uma das colunas. Como calcular "a previsão sabendo só o gancho e o texto"?
+
+A resposta padrão é substituir as features ausentes por valores de uma **distribuição de referência**, o *background*, e tirar a média:
+
+$$
+v(S) = \mathbb{E}\big[f(x_S, X_{\bar{S}})\big] \approx \frac{1}{|B|} \sum_{b \in B} f(x_S, b_{\bar{S}})
+$$
+
+As features de $$S$$ ficam com os valores do Short B; as de fora ($$\bar{S}$$) vêm de cada linha $$b$$ do background $$B$$. Com $$S = \varnothing$$, isso é a previsão média no background, o valor base.
+
+Existem duas versões, e a diferença importa quando as features são correlacionadas:
+
+- **Intervencional** (ou marginal): as features de fora vêm do background **independentemente** das de dentro, como no somatório acima. É "fiel ao modelo": mede o que o modelo faz quando você mexe numa coluna. É o padrão do `TreeExplainer` quando você passa um background.
+- **Observacional** (ou condicional): as de fora vêm da distribuição **condicional** a $$X_S = x_S$$. É "fiel aos dados": respeita as correlações, mas pode dar crédito a uma feature que o modelo nem usa, só porque ela é correlacionada com outra que ele usa.
+
+Chen, Janizek, Lundberg e Lee (2020) resumem a escolha no título do artigo: *True to the Model or True to the Data?*. Para explicar **por que o modelo previu** 4.380, que é o que a Galaxies pede, a versão intervencional é a mais defensável (Janzing e colegas, 2020, argumentam nessa direção).
+
+E o **background importa**. Com um background de Shorts de todos os canais, o valor base é o "Short médio da base" e a maior contribuição de B será "é um canal com 180 mil inscritos". Com um background de posts recentes **do próprio canal**, o valor base vira o "Short típico da Lumina" (as 2.300 curtidas), e as contribuições passam a responder à pergunta do marketing: o que **este criativo** tem de diferente dos outros do canal. A próxima aula mostra as duas versões lado a lado.
+
+---
+
+## Na prática: Shapley exato por força bruta
+
+Dois trechos independentes. O primeiro reproduz a tabela de ordens:
+
+```python
+from itertools import permutations
+
+# v(S): quanto a previsão (em log) sobe, em relação ao Short típico do canal,
+# quando só as features de S assumem os valores do Short B
+v = {
+    frozenset(): 0.00,
+    frozenset("G"): 0.24, frozenset("T"): 0.04, frozenset("H"): 0.05,
+    frozenset("GT"): 0.36, frozenset("GH"): 0.29, frozenset("TH"): 0.09,
+    frozenset("GTH"): 0.41,
+}
+jogadores = "GTH"   # G = gancho forte, T = texto na tela, H = horário nobre
+
+phi = {j: 0.0 for j in jogadores}
+ordens = list(permutations(jogadores))
+for ordem in ordens:
+    presentes = frozenset()
+    for j in ordem:                       # contribuição marginal de j nesta ordem
+        phi[j] += v[presentes | {j}] - v[presentes]
+        presentes = presentes | {j}
+phi = {j: round(s / len(ordens), 4) for j, s in phi.items()}
+
+print(len(ordens), "ordens")
+print(phi)
+print("soma:", round(sum(phi.values()), 4), "= v(todos) - v(vazio):", v[frozenset("GTH")])
+```
+
+```text
+6 ordens
+{'G': 0.28, 'T': 0.08, 'H': 0.05}
+soma: 0.41 = v(todos) - v(vazio): 0.41
+```
+
+O segundo faz o que o SHAP faz, só que da forma mais lenta possível: treina um LightGBM pequeno com três features (e uma interação gancho × texto), define $$v(S)$$ pela média sobre um background de 100 posts e aplica a fórmula de coalizões. Depois compara com o `TreeExplainer` intervencional usando **o mesmo** background.
+
+```python
+from itertools import combinations
+from math import factorial
+
+import lightgbm as lgb
+import numpy as np
+import shap
+
+rng = np.random.default_rng(0)
+n = 3_000
+X = np.column_stack([rng.integers(0, 11, n),          # gancho (0-10)
+                     rng.integers(0, 2, n),           # texto na tela (0/1)
+                     rng.integers(0, 2, n)]).astype(float)   # horário nobre (0/1)
+y = (7.7 + 0.09 * (X[:, 0] - 5) + 0.08 * X[:, 1] + 0.05 * X[:, 2]
+     + 0.03 * (X[:, 0] > 6) * X[:, 1]                 # interação gancho x texto
+     + rng.normal(0, 0.4, n))
+modelo = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=8,
+                           verbose=-1).fit(X, y)
+fundo = X[rng.choice(n, 100, replace=False)]          # background: 100 posts
+
+def v(S, x):
+    """Valor da coalizão S: fixa as features de S em x, as outras vêm do fundo."""
+    Z = fundo.copy()
+    Z[:, list(S)] = x[list(S)]
+    return modelo.predict(Z).mean()
+
+def shapley_exato(x):
+    p = len(x)
+    phi = np.zeros(p)
+    for j in range(p):
+        outros = [k for k in range(p) if k != j]
+        for tam in range(p):
+            for S in combinations(outros, tam):
+                peso = factorial(len(S)) * factorial(p - len(S) - 1) / factorial(p)
+                phi[j] += peso * (v(S + (j,), x) - v(S, x))
+    return phi
+
+x_b = np.array([8.0, 1.0, 1.0])                        # gancho 8, texto sim, 19h
+phi = shapley_exato(x_b)
+print("força bruta :", phi.round(4), " base:", round(v((), x_b), 4))
+exp = shap.TreeExplainer(modelo, data=fundo, feature_perturbation="interventional")
+print("TreeExplainer:", exp.shap_values(x_b[None, :])[0].round(4),
+      " base:", round(float(exp.expected_value), 4))
+print("aditividade:", round(v((), x_b) + phi.sum(), 4), "=", modelo.predict(x_b[None, :]).round(4))
+```
+
+```text
+força bruta : [0.2802 0.0517 0.0328]  base: 7.8471
+TreeExplainer: [0.2802 0.0517 0.0328]  base: 7.8471
+aditividade: 8.2117 = [8.2117]
+```
+
+Os valores batem até a quarta casa: o SHAP intervencional **é** o valor de Shapley com esse $$v(S)$$. A última linha é o axioma da eficiência na prática. Um detalhe importante: o SHAP 0.52 usa no máximo 100 linhas de background por padrão e sorteia uma amostra se você passar mais (ele avisa com uma mensagem). Com 200 linhas, a força bruta e o `TreeExplainer` usariam backgrounds diferentes e não bateriam.
+
+A força bruta avalia $$2^p$$ coalizões. Com 3 features, são 8; com 40 features, mais de 1 trilhão. Por isso existem os algoritmos especializados: o KernelSHAP aproxima por amostragem, para qualquer modelo; o TreeSHAP calcula o valor **exato** em árvores, em tempo polinomial, explorando a estrutura delas. É ele que você usa na próxima aula.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+- **Como ler o "+0,28" do gancho de B:** "comparado com o Short típico da Lumina, e fazendo a média sobre todas as ordens em que as features poderiam ser consideradas, ter um gancho de nota 8 empurra a previsão em cerca de ×1,33". Não é "sem o gancho, B teria 1/1,33 das curtidas"; é uma média de contribuições marginais.
+- **A decomposição fecha a conta:** 2.300 (Short típico) × efeitos de gancho, energia da música, rosto, texto e horário ≈ 4.380. Isso só é possível por causa da eficiência.
+- **A vs. B:** com o **mesmo background** (posts recentes da Lumina), as contribuições de A e de B podem ser subtraídas feature a feature. A diferença mostra de onde vem a vantagem de B, e é o material bruto para o explicador da aula 5.7.
+- **Cuidado ao comunicar a sinergia:** metade do crédito da interação gancho × texto foi para cada um. Se o marketing trocar só o texto, o efeito real pode ser diferente de 0,08.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Explicar sem dizer a referência.** Um valor de Shapley só tem sentido relativo a um valor base. Diga sempre "em relação a quê" (a média da base? o Short típico do canal?).
+2. **Ler Shapley como "o que acontece se eu remover a feature".** É uma média sobre ordens, não o efeito de uma única remoção.
+3. **Esquecer as interações.** O crédito da sinergia é dividido igualmente; mudar uma feature sozinha pode render diferente do $$\phi$$ dela.
+4. **Tratar crédito de feature correlacionada como fraqueza.** Duas colunas que medem a mesma coisa dividem o crédito (simetria). Agrupe-as antes de concluir.
+5. **Comparar SHAP calculado com backgrounds diferentes.** A e B só são comparáveis feature a feature se tiverem o mesmo background.
+6. **Passar mais de 100 linhas de background sem notar a subamostragem** do SHAP 0.52.
+:::
+
+<Quiz
+  id="m5-a5"
+  perguntas={[
+    {
+      pergunta: 'Num jogo com features G e T, v(vazio) = 0, v(G) = 0,30, v(T) = 0,10 e v(G,T) = 0,50. Quais são os valores de Shapley?',
+      opcoes: [
+        {texto: 'G = 0,30 e T = 0,10, os efeitos isolados.', explicacao: 'Assim a soma seria 0,40 e sobrariam 0,10 sem dono: viola a eficiência.'},
+        {texto: 'G = 0,35 e T = 0,15.', correta: true, explicacao: 'A sinergia é 0,50 − 0,30 − 0,10 = 0,10, dividida ao meio. Pelas ordens: G recebe (0,30 + 0,40)/2 e T recebe (0,20 + 0,10)/2.'},
+        {texto: 'G = 0,40 e T = 0,10, porque G entra primeiro.', explicacao: 'Não há "primeiro": Shapley faz a média sobre as duas ordens possíveis.'},
+      ],
+    },
+    {
+      pergunta: 'Seu modelo tem as colunas `texto_na_tela` e `chars_ocr`, quase idênticas. No SHAP, cada uma aparece com metade da importância que `texto_na_tela` tinha sozinha. Qual axioma explica isso?',
+      opcoes: [
+        {texto: 'Eficiência.', explicacao: 'Eficiência garante que a soma fecha, não como o crédito se distribui entre colunas parecidas.'},
+        {texto: 'Simetria.', correta: true, explicacao: 'Jogadores que contribuem igual em todas as coalizões recebem o mesmo crédito. O fenômeno "texto" continua com o mesmo peso, só que repartido.'},
+        {texto: 'Jogador nulo.', explicacao: 'Esse axioma dá zero para features que nunca mudam a previsão; não é o caso aqui.'},
+      ],
+    },
+    {
+      pergunta: 'Qual propriedade permite que o TreeSHAP explique um gradient boosting árvore por árvore e some os resultados?',
+      opcoes: [
+        {texto: 'Aditividade.', correta: true, explicacao: 'Se o modelo é uma soma de árvores, o valor de Shapley do modelo é a soma dos valores de cada árvore.'},
+        {texto: 'Simetria.', explicacao: 'Simetria trata de jogadores equivalentes, não de somar modelos.'},
+        {texto: 'O fato de árvores serem lineares.', explicacao: 'Árvores não são lineares. O que importa é que o ensemble é uma soma, e o valor de Shapley é linear no jogo.'},
+      ],
+    },
+    {
+      pergunta: 'Você explica o Short B duas vezes: com background de toda a base e com background de posts recentes da Lumina. O que muda?',
+      opcoes: [
+        {texto: 'Nada: SHAP não depende do background.', explicacao: 'Depende: o valor base e as contribuições são definidos em relação ao background.'},
+        {texto: 'O valor base e as contribuições. Com o background da Lumina, a base vira o Short típico do canal e as contribuições falam do que o criativo tem de diferente.', correta: true, explicacao: 'Exato. Com a base inteira, a maior contribuição tende a ser o próprio canal; com o canal como referência, sobra o efeito do conteúdo.'},
+        {texto: 'Só o valor base; as contribuições são as mesmas.', explicacao: 'As contribuições também mudam, porque v(S) é uma média sobre o background.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: Shapley do Short A, à mão]
+Para o Short A (gancho fraco, sem texto, terça às 14h), a tabela de coalizões, em log e em relação ao Short típico do canal, é:
+
+| $$S$$ | $$\varnothing$$ | $$\{G\}$$ | $$\{T\}$$ | $$\{H\}$$ | $$\{G,T\}$$ | $$\{G,H\}$$ | $$\{T,H\}$$ | $$\{G,T,H\}$$ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| $$v(S)$$ | 0,00 | −0,19 | −0,09 | −0,07 | −0,24 | −0,26 | −0,16 | −0,31 |
+
+1. Identifique quais pares de jogadores interagem e o tamanho da interação.
+2. Calcule $$\phi_G$$, $$\phi_T$$ e $$\phi_H$$ pela tabela de 6 ordens.
+3. Confira o resultado mudando a tabela `v` do primeiro trecho de código.
+4. Converta cada valor em multiplicador e escreva uma frase para o marketing sobre o gancho de A.
+:::
+
+<details>
+<summary>Ver a solução</summary>
+
+1. H é aditivo (sempre −0,07). G e T interagem: $$v(G,T) - v(G) - v(T) = -0{,}24 + 0{,}19 + 0{,}09 = +0{,}04$$. Os dois efeitos negativos se sobrepõem um pouco, então juntos custam menos que a soma.
+2. $$\phi_G = -0{,}19 + 0{,}02 = -0{,}17$$; $$\phi_T = -0{,}09 + 0{,}02 = -0{,}07$$; $$\phi_H = -0{,}07$$. A soma é $$-0{,}31 = v(N)$$.
+3. O código imprime `{'G': -0.17, 'T': -0.07, 'H': -0.07}`.
+4. $$e^{-0{,}17} \approx 0{,}84$$ e $$e^{-0{,}07} \approx 0{,}93$$ (o caso canônico mostra ×0,85 e ×0,93/×0,94 porque calcula o multiplicador antes de arredondar). Frase: *"O gancho de A, que abre com o logo da marca, puxa a previsão para baixo em cerca de 15% em relação a um Short típico do canal."*
+
+</details>
+
+---
+
+## Resumo
+
+- Explicar uma previsão é um **jogo cooperativo**: features são jogadores, $$v(S)$$ é a previsão esperada com as features de $$S$$ conhecidas, e o pagamento é $$f(x) - v(\varnothing)$$.
+- O **valor de Shapley** é a **contribuição marginal média** sobre todas as $$p!$$ ordens de entrada, ou, de forma equivalente, uma média ponderada sobre as $$2^{p-1}$$ coalizões sem a feature.
+- **Eficiência, simetria, jogador nulo e aditividade** determinam essa divisão de forma única. Na prática: a conta fecha, features duplicadas dividem crédito, features ignoradas recebem zero e ensembles se explicam árvore por árvore.
+- "Remover" uma feature é trocá-la por valores de um **background**. A versão **intervencional** é fiel ao modelo; o background define a pergunta que a explicação responde.
+- Shapley exato por força bruta custa $$2^p$$ avaliações; o **TreeSHAP** faz o mesmo cálculo de forma exata e rápida em árvores.
+
+## Referências
+
+- Shapley. [*A Value for n-Person Games*](https://doi.org/10.1515/9781400881970-018). Em Kuhn e Tucker (orgs.), *Contributions to the Theory of Games II*, Annals of Mathematics Studies 28, Princeton University Press, 1953.
+- Lundberg e Lee. [*A Unified Approach to Interpreting Model Predictions*](https://arxiv.org/abs/1705.07874). NeurIPS, 2017.
+- Štrumbelj e Kononenko. [*Explaining prediction models and individual predictions with feature contributions*](https://doi.org/10.1007/s10115-013-0679-x). Knowledge and Information Systems 41, 2014.
+- Chen, Janizek, Lundberg e Lee. [*True to the Model or True to the Data?*](https://arxiv.org/abs/2006.16234). arXiv, 2020.
+- Janzing, Minorics e Blöbaum. [*Feature relevance quantification in explainable AI: A causal problem*](https://arxiv.org/abs/1910.13413). AISTATS, 2020.
+- Molnar. [*Interpretable Machine Learning*, capítulo "Shapley Values"](https://christophm.github.io/interpretable-ml-book/shapley.html).
+
+**Próxima aula:** [SHAP na prática](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica): TreeExplainer no LightGBM e no CatBoost, de log para multiplicador, gráficos, blocos de embeddings e a função `top_drivers` do contrato.

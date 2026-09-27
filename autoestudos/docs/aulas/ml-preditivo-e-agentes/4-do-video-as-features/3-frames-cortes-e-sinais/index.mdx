@@ -1,0 +1,554 @@
+---
+sidebar_position: 3
+sidebar_label: 'Frames, cortes e sinais de baixo nível'
+title: 'Frames, cortes e sinais de baixo nível'
+description: 'Amostragem estratégica de frames (gancho + uniformes), detecção de cortes com PySceneDetect 0.7 e sinais de brilho, contraste, cor e movimento com OpenCV, testados num vídeo sintético com gabarito.'
+tags: [ml-preditivo, multimodal, opencv, video]
+---
+
+# Frames, Cortes e Sinais: Medindo Ritmo e Luz de um Short com OpenCV
+
+<LessonMeta
+  tempo="50 min"
+  semana={2}
+  etapa="multimodal"
+  objetivos={[
+    'Escolher poucos frames que representam um Short, com atenção especial ao gancho',
+    'Extrair frames por tempo com OpenCV e conhecer as alternativas (ffmpeg, PyAV, torchcodec)',
+    'Detectar cortes com PySceneDetect 0.7 e transformá-los em features de ritmo',
+    'Calcular brilho, contraste, saturação, colorfulness, cor dominante e movimento (optical flow)',
+    'Validar todo o código num vídeo sintético cujo gabarito você conhece',
+  ]}
+  prerequisitos={[
+    {label: 'Anatomia de um Short e o pipeline multimodal', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short'},
+    {label: 'Obtendo a mídia', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia'},
+  ]}
+/>
+
+Quando se fala em "features de vídeo", a imaginação vai direto para redes neurais. Mas repare no que o *Understanding Virality* encontrou ao explicar, com SHAP, um XGBoost treinado em cerca de 11 mil Shorts: entre as features mais importantes estavam o **movimento** (cerca de 10,7% da importância) e os **cortes** (cerca de 7,6%). Nenhuma das duas precisa de rede neural. Ambas saem de algumas linhas de OpenCV.
+
+Isso faz sentido para o formato. Um Short vive de ritmo: planos curtos, câmera que se move, um corte seco no segundo 2 que troca o "antes" pelo "depois". Também vive de aparência: um frame escuro e dessaturado no gancho comunica algo muito diferente de um frame claro e colorido. São sinais de **baixo nível**, que descrevem *como* o vídeo é filmado e editado, e não *o que* aparece nele (isso fica para a aula 4.4).
+
+Esta aula tem uma regra extra: **nenhum número sem gabarito**. Você vai gerar um vídeo sintético em que sabe exatamente onde estão os cortes e quão rápido as coisas se movem, e vai conferir se o código acerta.
+
+:::info[A ideia central]
+Você não precisa olhar os 660 frames de um Short. Poucos frames **bem escolhidos** (mais densos no gancho) e algumas estatísticas baratas (cortes, luz, cor, movimento) viram colunas que capturam o **ritmo** e a **aparência** do vídeo, a uma fração do custo de qualquer modelo.
+:::
+
+---
+
+## Um vídeo com gabarito
+
+Antes de medir vídeos reais, construa um em que você controla tudo. O gerador abaixo grava um MP4 9:16 em 360 × 640, a 30 fps, com cenas de cor, duração, texto e velocidade conhecidas. Cada cena tem um fundo com textura (o optical flow precisa dela) e um quadrado texturizado que anda para a direita.
+
+```python
+import cv2
+import numpy as np
+
+LARG, ALT, FPS = 360, 640, 30  # 9:16, a resolução que você vai baixar (360p)
+
+
+def gerar_short(caminho: str, cenas: list[dict], seed: int = 0) -> list[float]:
+    """Grava um MP4 sintético. Cada cena: dur (s), cor (BGR), vel (px/frame), texto.
+
+    Devolve os instantes (s) dos cortes, que é o gabarito do teste.
+    """
+    rng = np.random.default_rng(seed)
+    out = cv2.VideoWriter(caminho, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (LARG, ALT))
+    cortes, t = [], 0.0
+    for i, cena in enumerate(cenas):
+        if i > 0:
+            cortes.append(round(t, 2))
+        fundo = np.clip(np.array(cena["cor"]) + rng.normal(0, 12, (ALT, LARG, 3)), 0, 255)
+        fundo = fundo.astype(np.uint8)  # textura estática: o optical flow precisa dela
+        mancha = rng.integers(0, 256, (120, 120, 3), dtype=np.uint8)  # objeto texturizado
+        for f in range(round(cena["dur"] * FPS)):
+            quadro = fundo.copy()
+            x = int(40 + f * cena["vel"]) % (LARG - 120)  # objeto andando para a direita
+            quadro[260:380, x:x + 120] = mancha
+            if cena.get("texto"):
+                cv2.putText(quadro, cena["texto"], (20, 140), cv2.FONT_HERSHEY_DUPLEX,
+                            2.0, (255, 255, 255), 4, cv2.LINE_AA)
+            out.write(quadro)
+        t += cena["dur"]
+    out.release()
+    return cortes
+
+
+# "A": abre com logo parado por 2 s, depois um plano longo e calmo
+cortes_a = gerar_short("sintetico_a.mp4", [
+    {"dur": 2.0, "cor": (40, 20, 20), "vel": 0, "texto": "LUMINA"},
+    {"dur": 6.0, "cor": (150, 170, 200), "vel": 1},
+    {"dur": 6.0, "cor": (120, 140, 190), "vel": 1},
+])
+# "B": troca de plano a cada 1,2–1,6 s, cores saturadas, movimento e texto grande
+cenas_b = [{"dur": d, "cor": c, "vel": v, "texto": tx} for d, c, v, tx in [
+    (1.2, (60, 90, 200), 6, ""), (1.2, (200, 60, 200), 6, "ANTES"),
+    (1.6, (40, 200, 240), 8, "DEPOIS"), (1.6, (200, 180, 30), 6, ""),
+    (1.6, (30, 30, 220), 8, "20s"), (1.6, (220, 120, 40), 6, ""),
+    (1.6, (60, 220, 60), 8, ""), (1.6, (180, 40, 120), 6, "LINK"),
+]]
+cortes_b = gerar_short("sintetico_b.mp4", cenas_b, seed=1)
+print("cortes reais A:", cortes_a)
+print("cortes reais B:", cortes_b)
+```
+
+```text
+cortes reais A: [2.0, 8.0]
+cortes reais B: [1.2, 2.4, 4.0, 5.6, 7.2, 8.8, 10.4]
+```
+
+Os dois vídeos imitam, de forma caricata, os Shorts da Lumina: o "A" abre com um logo parado e segue em planos longos; o "B" corta a cada segundo e meio, com cores saturadas e texto grande. São **sintéticos**: servem para testar o código, não para tirar conclusões sobre curtidas.
+
+---
+
+## Amostragem estratégica: 8 frames, não 660
+
+Processar todos os frames é caro e redundante: frames vizinhos são quase iguais. A estratégia da trilha usa três fontes:
+
+- **2 ou 3 frames no gancho** (0–3 s), porque é ali que o usuário decide ficar ou deslizar. Com 3 frames, eles caem em 0,5 s, 1,5 s e 2,5 s.
+- **3 a 5 frames uniformes** no resto do vídeo, no centro de cada fatia, para descrever o vídeo "em média".
+- **A thumbnail**, tratada à parte ([aula 4.2](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia)), porque é o que aparece no feed antes do play.
+
+<Sketch name="m4/a3-amostragem" alt="Linha do tempo de um Short de 22 segundos. A zona do gancho, de 0 a 3 segundos, tem três frames amostrados em 0,5, 1,5 e 2,5 segundos. O resto do vídeo tem cinco frames uniformes, no centro de cada fatia. A thumbnail aparece separada, vinda da API. Abaixo da linha do tempo, traços vermelhos marcam os cortes detectados pelo PySceneDetect. Uma nota diz que, em cada instante, o frame seguinte também é lido para calcular o optical flow. Duas caixas resumem as colunas do gancho (brilho, cor e movimento do primeiro frame, cortes no gancho, segundos até o primeiro corte, embedding do gancho) e as colunas do vídeo todo (médias de aparência, cortes por segundo, duração média do plano, movimento médio, variância entre frames)." caption="Poucos frames, bem escolhidos, e colunas separadas para o gancho e para o vídeo todo." />
+
+Para extrair um frame num instante, o OpenCV aceita um *seek* por tempo com `CAP_PROP_POS_MSEC`. Por baixo, ele decodifica a partir do keyframe anterior, por isso ler 8 frames espalhados custa bem menos que ler 660 em sequência.
+
+```python
+import cv2
+import numpy as np
+
+
+def instantes_amostragem(duracao: float, n_gancho: int = 3, n_resto: int = 5,
+                         gancho_s: float = 3.0) -> list[tuple[str, float]]:
+    """Instantes (s) a amostrar: n_gancho dentro do gancho + n_resto uniformes depois."""
+    fim_gancho = min(gancho_s, duracao)
+    passo_g = fim_gancho / n_gancho
+    ts = [(f"gancho_{i}", round(passo_g * (i + 0.5), 2)) for i in range(n_gancho)]
+    if duracao > gancho_s:
+        passo_r = (duracao - gancho_s) / n_resto  # centro de cada fatia do resto
+        ts += [(f"uniforme_{i}", round(gancho_s + passo_r * (i + 0.5), 2)) for i in range(n_resto)]
+    return ts
+
+
+def extrair_frames(caminho: str, instantes: list[tuple[str, float]],
+                   largura: int = 360) -> dict[str, np.ndarray]:
+    """Lê um frame por instante com seek por tempo. Devolve RGB redimensionado."""
+    cap = cv2.VideoCapture(caminho)
+    if not cap.isOpened():
+        raise IOError(f"não abriu: {caminho}")
+    frames = {}
+    for rotulo, t in instantes:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ok, bgr = cap.read()
+        if not ok:  # seek além do fim ou arquivo truncado: pule, não quebre
+            continue
+        h, w = bgr.shape[:2]
+        bgr = cv2.resize(bgr, (largura, round(h * largura / w)), interpolation=cv2.INTER_AREA)
+        frames[rotulo] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)  # OpenCV lê em BGR!
+    cap.release()
+    return frames
+
+
+def duracao_s(caminho: str) -> float:
+    cap = cv2.VideoCapture(caminho)
+    n, fps = cap.get(cv2.CAP_PROP_FRAME_COUNT), cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return n / fps
+
+
+dur = duracao_s("sintetico_b.mp4")
+inst = instantes_amostragem(dur)
+frames = extrair_frames("sintetico_b.mp4", inst)
+print(f"duração: {dur:.1f} s")
+print(inst)
+print({k: v.shape for k, v in list(frames.items())[:2]}, "...", len(frames), "frames")
+```
+
+```text
+duração: 12.0 s
+[('gancho_0', 0.5), ('gancho_1', 1.5), ('gancho_2', 2.5), ('uniforme_0', 3.9), ('uniforme_1', 5.7), ('uniforme_2', 7.5), ('uniforme_3', 9.3), ('uniforme_4', 11.1)]
+{'gancho_0': (640, 360, 3), 'gancho_1': (640, 360, 3)} ... 8 frames
+```
+
+Conferimos o seek contra uma leitura sequencial de todos os 360 frames: em todos os instantes testados, o frame devolvido era exatamente o esperado (por exemplo, índice 75 para 2,5 s). Em arquivos com **fps variável**, comuns em vídeos de celular, o seek pode errar por alguns frames. Para features amostradas a cada meio segundo, isso não muda nada; para medir movimento entre frames consecutivos, a leitura sequencial logo após o seek (feita mais abaixo) resolve.
+
+Três detalhes que custam horas quando esquecidos:
+
+- O OpenCV devolve **BGR**, não RGB. Todo modelo da aula 4.4 espera RGB.
+- `CAP_PROP_FRAME_COUNT` é uma estimativa lida do container. Para a duração oficial, prefira o `ffprobe` da [aula 4.1](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short).
+- Redimensione para uma **largura fixa** antes de qualquer cálculo, para que um vídeo 1080p da marca e um 360p da base produzam colunas comparáveis.
+
+Alternativas ao OpenCV: o próprio ffmpeg extrai um frame com seek rápido (`-ss` antes do `-i`); o **PyAV** dá acesso direto ao decodificador do ffmpeg em Python; e o **torchcodec**, da equipe do PyTorch, decodifica direto para tensores. O `decord`, que aparece em muitos tutoriais antigos, está abandonado desde 2021 e não deve ser usado.
+
+```bash
+ffmpeg -v error -ss 2.5 -i sintetico_b.mp4 -frames:v 1 gancho_2.png
+```
+
+---
+
+## Cortes: o ritmo da edição
+
+Um **corte** é a troca seca de um plano para outro. O [PySceneDetect](https://www.scenedetect.com/) compara frames consecutivos e marca um corte quando a diferença passa de um limiar. Os dois detectores mais úteis:
+
+- **`ContentDetector`**: mede a diferença de cor (matiz, saturação e luminância, em HSV) entre frames vizinhos e corta quando ela passa de um limiar fixo (27, por padrão).
+- **`AdaptiveDetector`**: compara essa diferença com a média móvel dos frames ao redor. É mais robusto quando a câmera se move muito e, como você vai ver, pega cortes sutis que o limiar fixo deixa passar.
+
+A versão 0.7 mudou a API de tempo: os instantes vêm como `FrameTimecode`, e a forma recomendada de ler segundos é a propriedade **`.seconds`**. Os métodos antigos `get_seconds()` e `get_frames()` estão marcados como descontinuados (use `.seconds` e `.frame_num`), e `framerate` virou `frame_rate`, agora uma `Fraction` exata. Para vídeos com fps variável, `pts` e `time_base` dão o tempo preciso.
+
+```python
+from scenedetect import AdaptiveDetector, ContentDetector, detect
+
+
+def features_de_corte(caminho: str, gancho_s: float = 3.0, detector=None) -> dict:
+    """Detecta cortes secos e resume o ritmo de edição do vídeo."""
+    detector = detector or AdaptiveDetector()
+    cenas = detect(caminho, detector, start_in_scene=True)  # lista de (início, fim)
+    # PySceneDetect 0.7: use .seconds (get_seconds() está depreciado)
+    cortes = [inicio.seconds for inicio, _ in cenas[1:]]
+    duracao = cenas[-1][1].seconds
+    planos = [fim.seconds - inicio.seconds for inicio, fim in cenas]
+    return {
+        "cortes": [round(c, 2) for c in cortes],  # útil para depurar; não vira coluna
+        "n_cortes": len(cortes),
+        "cortes_por_s": round(len(cortes) / duracao, 3),
+        "duracao_media_plano_s": round(sum(planos) / len(planos), 2),
+        "cortes_no_gancho": sum(c < gancho_s for c in cortes),
+        "s_ate_primeiro_corte": round(cortes[0], 2) if cortes else round(duracao, 2),
+    }
+
+
+for nome in ("sintetico_a.mp4", "sintetico_b.mp4"):
+    print(nome, "adaptive:", features_de_corte(nome))
+print("B content :", features_de_corte("sintetico_b.mp4", detector=ContentDetector(threshold=27)))
+```
+
+```text
+sintetico_a.mp4 adaptive: {'cortes': [2.0, 8.0], 'n_cortes': 2, 'cortes_por_s': 0.143, 'duracao_media_plano_s': 4.67, 'cortes_no_gancho': 1, 's_ate_primeiro_corte': 2.0}
+sintetico_b.mp4 adaptive: {'cortes': [1.2, 2.4, 4.0, 5.6, 7.2, 8.8, 10.4], 'n_cortes': 7, 'cortes_por_s': 0.583, 'duracao_media_plano_s': 1.5, 'cortes_no_gancho': 2, 's_ate_primeiro_corte': 1.2}
+B content : {'cortes': [1.2, 2.4, 4.0, 5.6, 7.2, 8.8, 10.4], 'n_cortes': 7, 'cortes_por_s': 0.583, 'duracao_media_plano_s': 1.5, 'cortes_no_gancho': 2, 's_ate_primeiro_corte': 1.2}
+```
+
+Os cortes detectados batem exatamente com o gabarito. O `start_in_scene=True` garante que um vídeo **sem nenhum corte** devolva uma cena única, e não uma lista vazia, que quebraria as divisões.
+
+Há, porém, uma surpresa. Rodando o `ContentDetector(threshold=27)` no vídeo A, ele encontra só o corte de 2,0 s e **perde o de 8,0 s**, porque as duas últimas cenas têm tons de bege parecidos. O `AdaptiveDetector` pega os dois. Em vídeos reais de beleza, com cortes entre closes parecidos do mesmo rosto, esse tipo de corte sutil é comum. Por isso o exercício desta aula pede para calibrar o detector com vídeos seus.
+
+As colunas que saem daqui descrevem o ritmo:
+
+- `cortes_por_s` e `duracao_media_plano_s` medem a velocidade da edição;
+- `cortes_no_gancho` e `s_ate_primeiro_corte` medem o que acontece nos primeiros segundos.
+
+Repare que o A também tem `cortes_no_gancho = 1`: o corte de 2,0 s é a **saída do logo**. Uma coluna isolada pode enganar; é a combinação com movimento, aparência e conteúdo que conta a história.
+
+---
+
+## Aparência: luz, contraste e cor
+
+Quatro estatísticas por frame descrevem a aparência, todas calculadas depois de converter o frame para outros espaços de cor:
+
+- **Brilho**: média do canal V (*value*) do HSV, de 0 a 1.
+- **Contraste**: desvio padrão do canal L (luminosidade) do Lab. Imagem chapada tem contraste perto de zero.
+- **Saturação**: média do canal S do HSV. Tons pastel ficam baixos; cores vivas, altos.
+- **Colorfulness**, de Hasler e Süsstrunk (2003): uma métrica simples que concorda bem com o julgamento humano de "quão colorida é a imagem". Com $$rg = R - G$$ e $$yb = \tfrac{1}{2}(R + G) - B$$:
+
+$$
+C = \sqrt{\sigma_{rg}^2 + \sigma_{yb}^2} + 0{,}3\,\sqrt{\mu_{rg}^2 + \mu_{yb}^2}
+$$
+
+Some a isso a **cor dominante**, calculada com k-means sobre os pixels de uma versão reduzida do frame: a cor do maior grupo e a fração da imagem que ele ocupa.
+
+```python
+import cv2
+import numpy as np
+
+
+def colorfulness(rgb: np.ndarray) -> float:
+    """Hasler & Süsstrunk (2003): ~0 = cinza; >100 = muito colorido."""
+    r, g, b = (rgb[..., i].astype(np.float64) for i in range(3))
+    rg, yb = r - g, 0.5 * (r + g) - b
+    return float(np.hypot(rg.std(), yb.std()) + 0.3 * np.hypot(rg.mean(), yb.mean()))
+
+
+def cor_dominante(rgb: np.ndarray, k: int = 3) -> tuple[str, float]:
+    """k-means nos pixels (imagem reduzida). Devolve a cor do maior grupo e sua fração."""
+    px = cv2.resize(rgb, (48, 85), interpolation=cv2.INTER_AREA).reshape(-1, 3).astype(np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    cv2.setRNGSeed(0)  # k-means tem inicialização aleatória: fixe para reprodutibilidade
+    _, rotulos, centros = cv2.kmeans(px, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    contagem = np.bincount(rotulos.ravel(), minlength=k)
+    r, g, b = centros[contagem.argmax()].astype(int)
+    return f"#{r:02x}{g:02x}{b:02x}", round(float(contagem.max() / contagem.sum()), 2)
+
+
+def aparencia(rgb: np.ndarray) -> dict:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    cor, fracao = cor_dominante(rgb)
+    return {
+        "brilho": round(float(hsv[..., 2].mean() / 255), 3),      # média de V
+        "contraste": round(float(lab[..., 0].std() / 255), 3),    # desvio de L
+        "saturacao": round(float(hsv[..., 1].mean() / 255), 3),   # média de S
+        "colorfulness": round(colorfulness(rgb), 1),
+        "cor_dominante": cor, "fracao_cor_dominante": fracao,
+    }
+
+
+# teste rápido com imagens de propriedades conhecidas
+cinza = np.full((640, 360, 3), 128, np.uint8)
+vermelho = np.zeros((640, 360, 3), np.uint8); vermelho[..., 0] = 220
+xadrez = (np.indices((640, 360)).sum(0) // 40 % 2 * 255).astype(np.uint8)
+xadrez = np.stack([xadrez] * 3, -1)
+for nome, img in [("cinza", cinza), ("vermelho", vermelho), ("xadrez", xadrez)]:
+    print(f"{nome:9s}", aparencia(img))
+```
+
+```text
+cinza     {'brilho': 0.502, 'contraste': 0.0, 'saturacao': 0.0, 'colorfulness': 0.0, 'cor_dominante': '#808080', 'fracao_cor_dominante': 1.0}
+vermelho  {'brilho': 0.863, 'contraste': 0.0, 'saturacao': 1.0, 'colorfulness': 73.8, 'cor_dominante': '#dc0000', 'fracao_cor_dominante': 1.0}
+xadrez    {'brilho': 0.5, 'contraste': 0.5, 'saturacao': 0.0, 'colorfulness': 0.0, 'cor_dominante': '#060606', 'fracao_cor_dominante': 0.45}
+```
+
+Confira o gabarito à mão: o cinza não tem contraste, saturação nem cor; o vermelho puro tem saturação 1 e colorfulness $$0{,}3 \times \sqrt{220^2 + 110^2} \approx 73{,}8$$; o xadrez preto e branco tem contraste máximo e colorfulness zero. A cor dominante do xadrez sai quase preta, com só 45% dos pixels, porque a redução para 48 × 85 borra as bordas das casas e cria um grupo intermediário. É um lembrete de que o k-means depende da resolução.
+
+---
+
+## Movimento: optical flow
+
+O **optical flow** estima, para cada pixel, para onde ele foi entre dois frames: um vetor $$(dx, dy)$$. O método de Farnebäck (2003) aproxima a vizinhança de cada pixel por um polinômio de segundo grau e estima o deslocamento que leva um polinômio no outro, produzindo um fluxo **denso**, com um vetor por pixel. A média da magnitude desses vetores responde "quanto a imagem se mexe".
+
+Três cuidados tornam a coluna comparável entre vídeos:
+
+1. **Frames consecutivos.** Calcule o fluxo entre o frame em $$t$$ e o imediatamente seguinte (~33 ms depois, a 30 fps). Entre frames distantes, o fluxo perde o sentido.
+2. **Nunca através de um corte.** Um par que atravessa um corte produz vetores absurdos. Se a diferença média entre os dois frames for enorme, descarte o par.
+3. **Unidade independente de resolução e fps.** Pixels por frame dependem das duas coisas. Converta para **larguras de tela por segundo**: multiplique pelo fps e divida pela largura.
+
+A **variância entre frames** completa o quadro: o desvio padrão de cada pixel ao longo dos frames amostrados. Ela mede a diversidade visual do vídeo como um todo (muitas cenas diferentes ou sempre a mesma), algo que o fluxo entre frames vizinhos não vê.
+
+```python
+def _cinza(bgr: np.ndarray, largura: int) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    pequeno = cv2.resize(bgr, (largura, round(h * largura / w)), interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(pequeno, cv2.COLOR_BGR2GRAY)
+
+
+def movimento(caminho: str, instantes, largura: int = 180) -> dict:
+    """Optical flow de Farnebäck entre o frame em t e o seguinte.
+
+    Resultado em "larguras de tela por segundo": não depende da resolução nem do fps.
+    """
+    cap = cv2.VideoCapture(caminho)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    por_rotulo = {}
+    for rotulo, t in instantes:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ok1, f1 = cap.read()
+        ok2, f2 = cap.read()  # frame imediatamente seguinte: ~33 ms depois a 30 fps
+        if not (ok1 and ok2):
+            continue
+        g1, g2 = _cinza(f1, largura), _cinza(f2, largura)
+        if np.abs(g1.astype(int) - g2).mean() > 40:  # par atravessou um corte: descarte
+            continue
+        fluxo = cv2.calcOpticalFlowFarneback(g1, g2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        vel = np.linalg.norm(fluxo, axis=2) * fps / largura  # px/frame -> larguras/s
+        por_rotulo[rotulo] = (float(vel.mean()), float((vel > 0.15).mean()))
+    cap.release()
+    medias = [m for m, _ in por_rotulo.values()]
+    gancho = [m for r, (m, _) in por_rotulo.items() if r.startswith("gancho")]
+    return {
+        "movimento_medio": round(float(np.mean(medias)), 4),
+        "movimento_max": round(float(np.max(medias)), 4),
+        "movimento_gancho": round(float(np.mean(gancho)), 4) if gancho else None,
+        "fracao_px_em_movimento": round(float(np.mean([f for _, f in por_rotulo.values()])), 3),
+    }
+
+
+def variancia_entre_frames(frames: dict[str, np.ndarray]) -> float:
+    """Desvio padrão de cada pixel (RGB) entre os frames amostrados: diversidade visual."""
+    pilha = np.stack([cv2.resize(f, (90, 160)) for f in frames.values()]).astype(np.float32) / 255
+    return round(float(pilha.std(axis=0).mean()), 3)
+
+
+for nome in ("sintetico_a.mp4", "sintetico_b.mp4"):
+    inst = instantes_amostragem(duracao_s(nome))
+    print(nome, movimento(nome, inst),
+          "var_entre_frames:", variancia_entre_frames(extrair_frames(nome, inst)))
+```
+
+```text
+sintetico_a.mp4 {'movimento_medio': 0.0065, 'movimento_max': 0.009, 'movimento_gancho': 0.003, 'fracao_px_em_movimento': 0.0} var_entre_frames: 0.222
+sintetico_b.mp4 {'movimento_medio': 0.0601, 'movimento_max': 0.072, 'movimento_gancho': 0.0558, 'fracao_px_em_movimento': 0.107} var_entre_frames: 0.283
+```
+
+Hora de conferir o gabarito. No vídeo B, o quadrado anda 6 a 8 px por frame numa tela de 360 px, a 30 fps: entre $$6 \times 30 / 360 = 0{,}50$$ e $$8 \times 30 / 360 = 0{,}67$$ larguras por segundo. O fluxo médio (0,0601) é a média sobre **todos** os pixels, e só cerca de 10,7% deles se movem. Dividindo, os pixels em movimento andam em média $$0{,}0601 / 0{,}107 \approx 0{,}56$$ larguras por segundo, dentro da faixa esperada. No A, com 1 px por frame e um logo parado no gancho, o movimento é quase nulo, como deveria.
+
+---
+
+## Tudo junto, com cache
+
+A etapa final junta as peças numa função cacheada por `video_id`, com o decorador da aula 4.1. As colunas de aparência saem em duas versões: a **média** dos 8 frames e o **primeiro frame do gancho**, que é literalmente a primeira coisa que o usuário vê.
+
+```python
+import time
+
+import numpy as np
+
+# cache_por_video vem da aula 4.1; as demais funções, dos blocos anteriores
+
+
+@cache_por_video("sinais_baixo_nivel", versao=1)
+def sinais_baixo_nivel(video_id: str, caminho: str) -> dict:
+    inst = instantes_amostragem(duracao_s(caminho))
+    frames = extrair_frames(caminho, inst)
+    por_frame = {r: aparencia(f) for r, f in frames.items()}
+    feats = {}
+    for col in ("brilho", "contraste", "saturacao", "colorfulness"):
+        feats[f"{col}_medio"] = round(float(np.mean([a[col] for a in por_frame.values()])), 3)
+        feats[f"{col}_gancho"] = por_frame["gancho_0"][col]  # o primeiro frame que o usuário vê
+    feats["cor_dominante_gancho"] = por_frame["gancho_0"]["cor_dominante"]
+    cortes = features_de_corte(caminho)
+    cortes.pop("cortes")  # a lista em si não é coluna
+    return {**feats, **cortes, **movimento(caminho, inst),
+            "var_entre_frames": variancia_entre_frames(frames)}
+
+
+for vid, arq in [("sint_A", "sintetico_a.mp4"), ("sint_B", "sintetico_b.mp4")]:
+    t0 = time.perf_counter()
+    f = sinais_baixo_nivel(vid, arq)
+    print(f"{vid} ({time.perf_counter() - t0:.2f} s):", f)
+```
+
+```text
+sint_A (0.25 s): {'brilho_medio': 0.604, 'brilho_gancho': 0.193, 'contraste_medio': 0.096, 'contraste_gancho': 0.186, 'saturacao_medio': 0.384, 'saturacao_gancho': 0.573, 'colorfulness_medio': 35.088, 'colorfulness_gancho': 24.6, 'cor_dominante_gancho': '#111324', 'n_cortes': 2, 'cortes_por_s': 0.143, 'duracao_media_plano_s': 4.67, 'cortes_no_gancho': 1, 's_ate_primeiro_corte': 2.0, 'movimento_medio': 0.0065, 'movimento_max': 0.009, 'movimento_gancho': 0.003, 'fracao_px_em_movimento': 0.0, 'var_entre_frames': 0.222}
+sint_B (0.22 s): {'brilho_medio': 0.818, 'brilho_gancho': 0.759, 'contraste_medio': 0.081, 'contraste_gancho': 0.057, 'saturacao_medio': 0.763, 'saturacao_gancho': 0.695, 'colorfulness_medio': 94.3, 'colorfulness_gancho': 77.0, 'cor_dominante_gancho': '#c45838', 'n_cortes': 7, 'cortes_por_s': 0.583, 'duracao_media_plano_s': 1.5, 'cortes_no_gancho': 2, 's_ate_primeiro_corte': 1.2, 'movimento_medio': 0.0601, 'movimento_max': 0.072, 'movimento_gancho': 0.0558, 'fracao_px_em_movimento': 0.107, 'var_entre_frames': 0.283}
+```
+
+Nesta execução, cerca de 0,2 s por vídeo sintético de 12 s em 360p, em CPU; em outras, com a máquina de teste ocupada por outros processos, chegou a 1,8 s. Vídeos reais, mais longos e com mais textura, custam mais, mas continuam na casa dos segundos. Na segunda execução, os dois vêm do cache em milissegundos. A `cor_dominante_gancho` é uma string: antes do GBM, converta-a (por exemplo, para matiz e luminosidade) ou deixe-a como categórica no CatBoost.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Os vídeos sintéticos desta aula são caricaturas de A e B, mas mostram como as colunas separam os dois estilos (valores do bloco anterior; **dados sintéticos, não da Lumina**):
+
+| Coluna | "A" (logo, planos longos) | "B" (antes/depois, cortes rápidos) |
+| :--- | ---: | ---: |
+| `brilho_gancho` | 0,193 | 0,759 |
+| `colorfulness_gancho` | 24,6 | 77,0 |
+| `cortes_por_s` | 0,143 | 0,583 |
+| `s_ate_primeiro_corte` | 2,0 | 1,2 |
+| `movimento_gancho` | 0,003 | 0,0558 |
+
+Com os vídeos reais, espere diferenças na mesma direção: o gancho de A é um logo **parado e escuro**, sem movimento; o de B tem um rosto, texto grande e um corte por volta de 2 s. O que essas colunas **não** dizem é se isso rende mais curtidas. Quem responde é o GBM treinado na sua base, com validação temporal. E, como o A também tem um corte "no gancho" (a saída do logo), o modelo precisa das outras colunas para não confundir "sair do logo" com "gancho dinâmico".
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Esquecer que o OpenCV lê em BGR.** O vermelho vira azul, a cor dominante sai errada e o SigLIP da próxima aula vê outra imagem.
+2. **Calcular features com resoluções ou fps diferentes entre treino e previsão.** Redimensione para largura fixa e expresse movimento em larguras por segundo.
+3. **Optical flow atravessando um corte.** Gera picos absurdos de "movimento". Use frames consecutivos e descarte pares com diferença enorme.
+4. **Confiar no limiar padrão do detector de cortes.** Cortes entre planos parecidos passam despercebidos pelo `ContentDetector(27)`. Calibre com uma amostra rotulada à mão.
+5. **Usar APIs antigas do PySceneDetect.** Em 0.7, `get_seconds()`, `get_frames()` e `framerate` estão descontinuados: use `.seconds`, `.frame_num` e `.frame_rate`.
+6. **Processar frames com faixas pretas.** Recorte o pillarbox (aula 4.2) antes; senão, "brilho" e "cor dominante" medem as faixas.
+:::
+
+<Quiz
+  id="m4-a3"
+  perguntas={[
+    {
+      pergunta: 'Por que amostrar 3 frames nos primeiros 3 s e só 5 no resto de um Short de 22 s?',
+      opcoes: [
+        {texto: 'Porque os primeiros segundos têm resolução maior.', explicacao: 'A resolução é a mesma em todo o vídeo.'},
+        {texto: 'Porque o gancho decide se o usuário fica ou desliza, e merece colunas próprias com mais detalhe.', correta: true, explicacao: 'Isso. O gancho é desproporcionalmente importante em Shorts, por isso ganha amostragem mais densa e colunas separadas.'},
+        {texto: 'Porque o OpenCV só consegue fazer seek nos primeiros segundos.', explicacao: 'O seek funciona em qualquer ponto do vídeo.'},
+      ],
+    },
+    {
+      pergunta: 'Você calculou o movimento em px/frame. Na base, os vídeos são 360p a 30 fps; o MP4 da marca é 1080p a 60 fps. O que acontece?',
+      opcoes: [
+        {texto: 'Nada: optical flow é invariante a resolução e fps.', explicacao: 'Não é: em 1080p os deslocamentos em pixels triplicam, e a 60 fps cada par de frames tem metade do tempo entre si.'},
+        {texto: 'A coluna muda de escala entre treino e previsão, e o modelo lê um movimento errado.', correta: true, explicacao: 'Exato. Redimensione para largura fixa e converta para larguras de tela por segundo (× fps ÷ largura).'},
+        {texto: 'O detector de cortes para de funcionar.', explicacao: 'O problema está na unidade da coluna de movimento, não no detector.'},
+      ],
+    },
+    {
+      pergunta: 'No vídeo sintético A, o `ContentDetector(threshold=27)` achou 1 corte e o `AdaptiveDetector` achou 2. O que isso ensina?',
+      opcoes: [
+        {texto: 'Que o AdaptiveDetector sempre acha mais cortes, inclusive falsos.', explicacao: 'Aqui ele acertou o gabarito (2 cortes). A lição é sobre cortes sutis, não sobre ele ser "mais sensível" em geral.'},
+        {texto: 'Que cortes entre planos de cores parecidas podem escapar de um limiar fixo, e o detector deve ser calibrado com vídeos rotulados.', correta: true, explicacao: 'Isso. Em beleza, closes parecidos do mesmo rosto são comuns; calibre com uma amostra contada à mão.'},
+        {texto: 'Que o vídeo A tem um erro de codificação.', explicacao: 'O vídeo foi gerado com cortes conhecidos; o detector é que perdeu um.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas colunas mede a diversidade visual do vídeo inteiro, e não o movimento entre frames vizinhos?',
+      opcoes: [
+        {texto: '`movimento_medio`', explicacao: 'Mede o deslocamento entre frames consecutivos (~33 ms).'},
+        {texto: '`var_entre_frames`', correta: true, explicacao: 'O desvio de cada pixel ao longo dos frames amostrados capta se o vídeo passa por cenas muito diferentes.'},
+        {texto: '`s_ate_primeiro_corte`', explicacao: 'É uma medida do gancho, não da diversidade visual.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: calibre o detector de cortes]
+1. Escolha 10 Shorts da sua base, de estilos diferentes, e **conte os cortes à mão** (assista em velocidade reduzida).
+2. Rode três configurações: `AdaptiveDetector()`, `ContentDetector(threshold=27)` e uma terceira à sua escolha.
+3. Compare o erro médio na contagem de cortes e escolha a configuração da sua base. Registre a escolha no README e na versão da etapa (`sinais_baixo_nivel_v2`, se mudar).
+:::
+
+<details>
+<summary>Ver uma solução (rodada nos vídeos sintéticos)</summary>
+
+```python
+from scenedetect import AdaptiveDetector, ContentDetector, detect
+
+gabarito = {"sintetico_a.mp4": 2, "sintetico_b.mp4": 7}  # cortes contados à mão
+configs = {  # fábricas: cada vídeo precisa de um detector novo (eles guardam estado)
+    "adaptive_3.0": lambda: AdaptiveDetector(adaptive_threshold=3.0),
+    "content_27": lambda: ContentDetector(threshold=27),
+    "content_60": lambda: ContentDetector(threshold=60),
+}
+for nome, fabrica in configs.items():
+    erros = [abs(len(detect(v, fabrica(), start_in_scene=True)) - 1 - n) for v, n in gabarito.items()]
+    print(f"{nome:13s} erro médio na contagem de cortes: {sum(erros) / len(erros):.1f}")
+```
+
+```text
+adaptive_3.0  erro médio na contagem de cortes: 0.0
+content_27    erro médio na contagem de cortes: 0.5
+content_60    erro médio na contagem de cortes: 3.5
+```
+
+Dois cuidados: crie **um detector novo por vídeo** (daí as fábricas com `lambda`), porque os detectores guardam estado entre frames; e lembre que `len(cenas) - 1` é o número de cortes quando `start_in_scene=True`. Com vídeos reais, verifique também **transições suaves** (fade, dissolve): nenhum desses detectores foi feito para elas, e o `ThresholdDetector` do PySceneDetect cobre fades para preto.
+
+</details>
+
+---
+
+## Resumo
+
+- **Amostragem estratégica**: 2–3 frames no **gancho**, 3–5 **uniformes** no resto e a **thumbnail** à parte. Extraia por tempo com `CAP_PROP_POS_MSEC`, converta **BGR → RGB** e redimensione para largura fixa.
+- **Cortes** com PySceneDetect 0.7 (`detect`, `AdaptiveDetector`, `.seconds`) viram `cortes_por_s`, `duracao_media_plano_s`, `cortes_no_gancho` e `s_ate_primeiro_corte`. Calibre o detector com vídeos rotulados.
+- **Aparência**: brilho (V do HSV), contraste (desvio de L), saturação (S), **colorfulness** de Hasler e Süsstrunk e cor dominante por k-means.
+- **Movimento**: optical flow de **Farnebäck** entre frames consecutivos, sem atravessar cortes, em **larguras de tela por segundo**; e variância entre frames para a diversidade visual.
+- Todo o código foi validado num **vídeo sintético com gabarito**: cortes exatos e velocidade recuperada dentro da faixa esperada.
+
+## Referências
+
+- Hasler, D. e Süsstrunk, S. [*Measuring colourfulness in natural images*](https://doi.org/10.1117/12.477378). Proc. SPIE 5007, Human Vision and Electronic Imaging VIII, 2003.
+- Farnebäck, G. [*Two-Frame Motion Estimation Based on Polynomial Expansion*](https://doi.org/10.1007/3-540-45103-X_50). SCIA, LNCS 2749, 2003.
+- [PySceneDetect: documentação](https://www.scenedetect.com/docs/) e [repositório](https://github.com/Breakthrough/PySceneDetect).
+- [OpenCV: tutorial de optical flow](https://docs.opencv.org/4.x/d4/dee/tutorial_optical_flow.html).
+- [torchcodec](https://github.com/pytorch/torchcodec) e [PyAV](https://github.com/PyAV-Org/PyAV).
+- Gupta et al. [*Understanding Virality: A Rubric based Vision-Language Model Framework for Short-Form Edutainment Evaluation*](https://arxiv.org/abs/2512.21402). arXiv:2512.21402, 2025.
+
+**Próxima aula:** [Embeddings visuais: CLIP e SigLIP 2](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais): do "como o vídeo é editado" para o "o que aparece nele", com encoders congelados e sondas de texto.

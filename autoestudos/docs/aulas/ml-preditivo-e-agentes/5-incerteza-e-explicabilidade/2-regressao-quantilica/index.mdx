@@ -1,0 +1,390 @@
+---
+sidebar_position: 2
+sidebar_label: 'Regressão quantílica e pinball loss'
+title: 'Regressão quantílica e pinball loss'
+description: 'Como a pinball loss faz um gradient boosting prever quantis, como treinar intervalos com LightGBM e CatBoost, corrigir quantis cruzados e avaliar cobertura, largura e pinball loss no teste.'
+tags: [ml-preditivo, galaxies, incerteza, quantis]
+---
+
+import IntervalExplorer from '@site/src/components/interativos/IntervalExplorer';
+
+# Regressão Quantílica: Ensinando o Modelo a Prever a Própria Margem de Erro
+
+<LessonMeta
+  tempo="45 min"
+  semana={3}
+  etapa="incerteza"
+  objetivos={[
+    'Escrever a pinball loss e explicar por que minimizá-la produz um quantil',
+    'Treinar intervalos de 80% com LightGBM (um modelo por quantil) e CatBoost MultiQuantile (um modelo só)',
+    'Detectar e corrigir quantis cruzados (quantile crossing) por ordenação',
+    'Avaliar intervalos com cobertura empírica, largura média e pinball loss no teste temporal',
+  ]}
+  prerequisitos={[
+    {label: 'Por que um número só não basta', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/por-que-um-numero-so-nao-basta'},
+    {label: 'Gradient boosting passo a passo', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo'},
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+  ]}
+/>
+
+Na aula anterior, o intervalo do exercício foi construído do jeito mais simples possível: previsão $$\pm 1{,}28$$ vezes o desvio dos resíduos. Esse intervalo tem o mesmo tamanho para todo mundo. Para a Lumina, com 142 posts de histórico, e para um canal que acabou de estrear, com 3 posts, ele diz a mesma coisa.
+
+Isso está errado pelos dois lados. Para o canal estreante, o intervalo é estreito demais e vai errar muito mais que 20% das vezes. Para a Lumina, ele é largo demais e não ajuda a decidir entre A e B. O ruído do engajamento é **heterocedástico**: a dispersão muda com o caso. Canais novos, setores mais voláteis e formatos pouco testados espalham mais.
+
+O que você quer é um modelo que aprenda, para cada criativo, **onde fica o limite de baixo e o de cima**. Não é preciso nenhuma arquitetura nova: o mesmo gradient boosting do módulo 3 faz isso se você trocar a função de perda. Essa perda tem nome de fliperama.
+
+:::info[A ideia central]
+A **pinball loss** pune erros de forma assimétrica: com $$\alpha = 0{,}9$$, errar para baixo custa 9 vezes mais que errar para cima. O valor que minimiza essa perda em média é exatamente o **quantil** $$q_\alpha$$. Treine um modelo com $$\alpha = 0{,}1$$, outro com $$0{,}5$$ e outro com $$0{,}9$$, e você tem `interval_low`, `predicted_metric` e `interval_high`, com largura que muda de caso a caso.
+:::
+
+---
+
+## A pinball loss
+
+Seja $$r = y - q$$ o resíduo de uma previsão $$q$$ para o resultado $$y$$. A **pinball loss** de nível $$\alpha \in (0, 1)$$ é
+
+$$
+\rho_\alpha(r) =
+\begin{cases}
+\alpha \, r & \text{se } r \ge 0 \quad \text{(previu baixo)} \\
+(\alpha - 1)\, r & \text{se } r < 0 \quad \text{(previu alto)}
+\end{cases}
+\;=\; \max\big(\alpha r,\ (\alpha - 1) r\big)
+$$
+
+O gráfico tem a forma de um "V" torto, e a inclinação de cada braço é o que decide o quantil:
+
+<Sketch name="m5/pinball-loss" alt="Três gráficos da pinball loss em função do resíduo r = y menos q. Com alfa 0,1, o braço da esquerda (previu alto) tem peso 0,9 e o da direita (previu baixo) peso 0,1. Com alfa 0,5, os dois braços têm peso 0,5, o que equivale a metade do erro absoluto. Com alfa 0,9, previu alto tem peso 0,1 e previu baixo tem peso 0,9. Nota: com alfa 0,9, errar por baixo custa 9 vezes mais que errar por cima, e o ponto que minimiza a perda média é o quantil 0,9." caption="O nome vem do formato: parece a trajetória de uma bola de pinball batendo num canto." />
+
+A intuição é de negociação. Com $$\alpha = 0{,}9$$, cada vez que o resultado real passa **acima** da sua previsão, você paga 0,9 por unidade; quando fica **abaixo**, paga só 0,1. Para minimizar a conta, você empurra a previsão para cima até que só cerca de 10% dos resultados a ultrapassem. Nesse ponto, o custo marginal de subir mais um pouco (pagar 0,1 nos 90% que ficam abaixo) empata com o ganho (economizar 0,9 nos 10% que ficam acima): $$0{,}1 \times 0{,}9 = 0{,}9 \times 0{,}1$$.
+
+Com $$\alpha = 0{,}5$$, os dois lados pesam igual e $$\rho_{0,5}(r) = 0{,}5\,|r|$$: é metade do erro absoluto, e o minimizador é a mediana. A <Termo id="pinball">pinball loss</Termo> generaliza o <Termo id="mae">MAE</Termo> para qualquer quantil.
+
+---
+
+## Por que o mínimo é o quantil
+
+A intuição acima tem uma demonstração curta, e vale a pena vê-la uma vez, porque ela é a garantia de que o método faz o que promete. Seja $$Y$$ uma variável com função de distribuição $$F$$. A perda esperada de prever a constante $$q$$ é
+
+$$
+L(q) = \mathbb{E}\big[\rho_\alpha(Y - q)\big] = \alpha \int_{y > q} (y - q)\, dF(y) \;+\; (1 - \alpha) \int_{y \le q} (q - y)\, dF(y)
+$$
+
+Derivando em relação a $$q$$ (cada integral contribui com a probabilidade da sua região):
+
+$$
+L'(q) = -\alpha\,\big(1 - F(q)\big) + (1 - \alpha)\, F(q) = F(q) - \alpha
+$$
+
+A derivada zera quando $$F(q) = \alpha$$, ou seja, quando $$q$$ é o quantil $$\alpha$$. Como $$L''(q) = f(q) \ge 0$$, é um mínimo. Com *features*, o mesmo argumento vale ponto a ponto: a função que minimiza $$\mathbb{E}[\rho_\alpha(Y - f(X))]$$ é $$f(x) = q_\alpha(x)$$, o quantil condicional. Essa é a base da regressão quantílica de Koenker e Bassett (1978).
+
+Não precisa acreditar só na álgebra. O trecho abaixo gera 5 mil "curtidas" com cauda longa, testa 6 mil constantes e compara a que minimiza a pinball loss com o quantil empírico:
+
+```python
+import numpy as np
+
+def pinball(y, q, alpha):
+    """Pinball loss média: pesa alpha quando erra por baixo e (1 - alpha) por cima."""
+    r = y - q
+    return np.mean(np.maximum(alpha * r, (alpha - 1) * r))
+
+rng = np.random.default_rng(0)
+y = rng.lognormal(mean=7.7, sigma=0.8, size=5_000)   # curtidas: cauda longa
+
+candidatos = np.linspace(0, 12_000, 6_001)            # constantes c testadas
+for alpha in [0.1, 0.5, 0.9]:
+    perdas = [pinball(y, c, alpha) for c in candidatos]
+    melhor = candidatos[np.argmin(perdas)]
+    print(f"alpha={alpha}: c que minimiza a pinball={melhor:>8,.0f}   "
+          f"quantil empírico={np.quantile(y, alpha):>8,.0f}")
+print(f"média de y (minimiza o erro quadrático) = {y.mean():,.0f}")
+```
+
+```text
+alpha=0.1: c que minimiza a pinball=     808   quantil empírico=     808
+alpha=0.5: c que minimiza a pinball=   2,160   quantil empírico=   2,160
+alpha=0.9: c que minimiza a pinball=   6,218   quantil empírico=   6,217
+média de y (minimiza o erro quadrático) = 3,018
+```
+
+Repare na última linha: com cauda longa, a média (3.018) fica bem acima da mediana (2.160). Um modelo treinado com erro quadrático em curtidas cruas estaria prevendo algo que quase nunca acontece com o criativo típico.
+
+---
+
+## Como o boosting aprende um quantil
+
+No [gradient boosting](/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo), cada árvore nova ajusta o gradiente negativo da perda. Para a pinball loss, esse gradiente é quase trivial:
+
+$$
+-\frac{\partial \rho_\alpha(y - F)}{\partial F} =
+\begin{cases}
+\alpha & \text{se } y > F \\
+\alpha - 1 & \text{se } y \le F
+\end{cases}
+$$
+
+Cada árvore aprende, então, **em que regiões do espaço de features a previsão atual está baixa demais para o quantil pedido**. Como o gradiente só tem dois valores, ele não diz quanto subir, e por isso o LightGBM recalcula o valor de cada folha diretamente a partir dos resíduos dos exemplos que caíram nela (o mesmo mecanismo que ele usa para a perda L1).
+
+Dois efeitos práticos:
+
+- **Quantis extremos precisam de folhas maiores.** Estimar o quantil 0,9 de uma folha com 8 exemplos é estimar "o maior ou o segundo maior" deles: é ruidoso. No LightGBM, aumente `min_child_samples` para os modelos de 0,1 e 0,9; no CatBoost, que usa árvores simétricas por padrão, o controle equivalente é reduzir `depth` ou aumentar `l2_leaf_reg`.
+- **Faça o early stopping com a métrica certa.** No LightGBM, `metric="quantile"` avalia a pinball loss no mesmo $$\alpha$$ do objetivo. Parar pelo MSE seria otimizar outra coisa.
+
+---
+
+## Na prática: LightGBM, um modelo por quantil
+
+Os três blocos a seguir formam um único script: rode na ordem. Primeiro, dados sintéticos com ruído heterocedástico conhecido, com canais com poucos posts anteriores e o setor automotivo mais imprevisíveis, e um corte **temporal** entre treino e teste.
+
+```python
+import numpy as np
+import pandas as pd
+
+def gerar_base(n=6_000, seed=7):
+    """Shorts sintéticos com ruído heterocedástico: canais com poucos posts
+    anteriores e o setor automotivo são mais imprevisíveis."""
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "dia": np.sort(rng.integers(0, 900, n)),                 # dias desde 01/01/2024
+        "nivel_canal": rng.normal(6.5, 1.2, n),                  # log da mediana do canal
+        "posts_anteriores": rng.integers(0, 120, n),
+        "gancho": rng.integers(0, 11, n),                        # nota 0-10
+        "automotivo": rng.random(n) < 0.3,
+    })
+    ruido = 0.25 + 0.55 * np.exp(-df.posts_anteriores / 15) + 0.25 * df.automotivo
+    df["y"] = (df.nivel_canal + 0.09 * (df.gancho - 5)
+               + rng.normal(0, 1, n) * ruido)                    # log1p(curtidas)
+    return df
+
+FEATURES = ["nivel_canal", "posts_anteriores", "gancho", "automotivo"]
+df = gerar_base()
+treino, teste = df[df.dia < 700], df[df.dia >= 700]             # corte temporal
+X_tr, y_tr = treino[FEATURES].astype(float), treino.y
+X_te, y_te = teste[FEATURES].astype(float), teste.y
+```
+
+O LightGBM otimiza uma pinball loss por vez, então são três modelos, um por $$\alpha$$:
+
+```python
+import lightgbm as lgb
+from sklearn.metrics import mean_pinball_loss
+
+ALPHAS = [0.1, 0.5, 0.9]
+modelos = {}
+for a in ALPHAS:                                   # um modelo por quantil
+    modelos[a] = lgb.LGBMRegressor(
+        objective="quantile", alpha=a,
+        n_estimators=400, learning_rate=0.03, num_leaves=15,
+        min_child_samples=40, verbose=-1,
+    ).fit(X_tr, y_tr)
+
+pred = np.column_stack([modelos[a].predict(X_te) for a in ALPHAS])
+cruzados = np.mean((pred[:, 0] > pred[:, 1]) | (pred[:, 1] > pred[:, 2]))
+pred = np.sort(pred, axis=1)                      # corrige quantile crossing
+
+lo, mid, hi = pred.T
+for i, a in enumerate(ALPHAS):
+    print(f"q{a}: pinball no teste={mean_pinball_loss(y_te, pred[:, i], alpha=a):.4f}  "
+          f"fração abaixo do quantil={np.mean(y_te <= pred[:, i]):.1%}")
+print(f"linhas com quantis cruzados antes da ordenação: {cruzados:.1%}")
+print(f"cobertura do intervalo 80%: {np.mean((y_te >= lo) & (y_te <= hi)):.1%}")
+print(f"largura média (log): {np.mean(hi - lo):.3f}")
+```
+
+```text
+q0.1: pinball no teste=0.0720  fração abaixo do quantil=11.3%
+q0.5: pinball no teste=0.1601  fração abaixo do quantil=48.0%
+q0.9: pinball no teste=0.0755  fração abaixo do quantil=87.7%
+linhas com quantis cruzados antes da ordenação: 0.0%
+cobertura do intervalo 80%: 76.4%
+largura média (log): 0.943
+```
+
+A coluna "fração abaixo do quantil" é a checagem mais direta de cada modelo: o de 0,1 deveria deixar 10% abaixo e deixou 11,3%; o de 0,9 deveria deixar 90% e deixou 87,7%. Os dois erram um pouco "para dentro", e a cobertura do intervalo ficou em 76,4%, abaixo dos 80% prometidos. Esse leve **excesso de confiança fora da amostra** é típico da regressão quantílica: os quantis são aprendidos nos mesmos dados que o modelo já ajustou. A [próxima aula](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal) corrige exatamente isso.
+
+---
+
+## CatBoost: três quantis num modelo só
+
+O CatBoost tem uma perda que otimiza vários quantis ao mesmo tempo, `MultiQuantile`. As árvores são compartilhadas e cada folha guarda um valor por $$\alpha$$. Isso economiza treino e tende a produzir quantis mais coerentes entre si.
+
+```python
+from catboost import CatBoostRegressor
+
+cb = CatBoostRegressor(
+    loss_function="MultiQuantile:alpha=0.1,0.5,0.9",   # um modelo, três saídas
+    iterations=600, learning_rate=0.05, depth=4, verbose=0, random_seed=0,
+).fit(X_tr, y_tr)
+
+pred = cb.predict(X_te)                  # shape (n, 3): uma coluna por alpha
+print(pred.shape)
+print(f"cruzados antes: {np.mean((pred[:, 0] > pred[:, 1]) | (pred[:, 1] > pred[:, 2])):.1%}")
+lo, mid, hi = np.sort(pred, axis=1).T
+print(f"cobertura 80%: {np.mean((y_te >= lo) & (y_te <= hi)):.1%}  largura média: {np.mean(hi - lo):.3f}")
+for i, a in enumerate([0.1, 0.5, 0.9]):
+    print(f"q{a}: pinball={mean_pinball_loss(y_te, pred[:, i], alpha=a):.4f}")
+
+# a largura acompanha a incerteza de cada grupo?
+novo = X_te.posts_anteriores < 10
+for nome, m in [("canal com < 10 posts", novo), ("canal com >= 10 posts", ~novo),
+                ("automotivo", X_te.automotivo == 1), ("moda/beleza", X_te.automotivo == 0)]:
+    print(f"{nome:<22} largura média={np.mean((hi - lo)[m]):.3f}  "
+          f"cobertura={np.mean(((y_te >= lo) & (y_te <= hi))[m]):.1%}  n={m.sum()}")
+```
+
+```text
+(1337, 3)
+cruzados antes: 0.0%
+cobertura 80%: 76.3%  largura média: 0.937
+q0.1: pinball=0.0718
+q0.5: pinball=0.1591
+q0.9: pinball=0.0722
+canal com < 10 posts   largura média=1.564  cobertura=64.1%  n=103
+canal com >= 10 posts  largura média=0.885  cobertura=77.3%  n=1234
+automotivo             largura média=1.371  cobertura=75.8%  n=400
+moda/beleza            largura média=0.751  cobertura=76.5%  n=937
+```
+
+As quatro últimas linhas são o motivo desta aula existir. A largura **se adaptou**: quase dobrou para canais com poucos posts (1,56 contra 0,89 em log) e para o setor automotivo (1,37 contra 0,75). Um intervalo de largura fixa não faria isso. Mas a cobertura dos canais novos ficou em 64%, bem abaixo do resto. O modelo percebeu que eles são mais ruidosos, mas não o quanto: com só 103 exemplos, esse é o grupo em que ele menos sabe. Guarde esse número para a [aula 5.4](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca).
+
+LightGBM e CatBoost empataram aqui (cobertura de 76% e pinball parecida). Na sua base, compare os dois com as mesmas métricas antes de escolher.
+
+---
+
+## Quantis cruzados e como consertar
+
+Nada na formulação obriga $$\hat{q}_{0,1}(x) \le \hat{q}_{0,5}(x) \le \hat{q}_{0,9}(x)$$. Com três modelos independentes, cada um otimizado sozinho, é possível que, para algum criativo, o "limite de baixo" fique acima do de cima. Isso é o **quantile crossing**. No exemplo acima não aconteceu (0,0%), mas não conte com isso: rodando o mesmo script com `num_leaves=63` e `min_child_samples=5`, 0,7% das linhas cruzaram, e a cobertura caiu para 67%, sinal de <Termo id="overfitting">overfitting</Termo> dos quantis.
+
+A correção padrão é simples: **ordenar** os quantis previstos em cada linha (`np.sort(pred, axis=1)`, como nos blocos acima). Isso tem nome, *rearrangement*, e respaldo teórico: Chernozhukov, Fernández-Val e Galichon (2010) mostram que a curva ordenada nunca fica mais longe da curva verdadeira do que a original. Três regras práticas:
+
+1. **Sempre ordene** antes de publicar a saída da tool. Um intervalo com `interval_low > interval_high` quebra qualquer consumidor.
+2. **Conte os cruzamentos** e registre o número no MLflow. Mais de 1% ou 2% indica modelos de quantis extremos subregularizados.
+3. **Se cruzar muito, prefira o MultiQuantile** do CatBoost, que compartilha as árvores, ou aumente o tamanho mínimo das folhas.
+
+---
+
+## Como avaliar um modelo de quantis
+
+Um modelo de quantis tem três perguntas de avaliação, e nenhuma métrica sozinha responde todas:
+
+| Pergunta | Métrica | O que é bom |
+| :--- | :--- | :--- |
+| Cada quantil está no lugar? | fração de $$y \le \hat{q}_\alpha$$ no teste | perto de $$\alpha$$ |
+| O intervalo cumpre a promessa? | cobertura empírica de $$[\hat{q}_{0,1}, \hat{q}_{0,9}]$$ | perto de 80%, também por grupo |
+| Ele é útil? | largura média, em log | a menor possível **com** cobertura certa |
+| Qual modelo é melhor no geral? | pinball loss média no teste, por $$\alpha$$ | menor |
+
+A pinball loss é o placar para comparar modelos: ela é uma *regra de pontuação consistente* para quantis, ou seja, em média ninguém ganha dela prevendo outra coisa que não o quantil verdadeiro (Gneiting, 2011). Cobertura e largura são o que você mostra à Galaxies, porque qualquer pessoa entende "80% dos casos caíram dentro, e o intervalo típico vai de metade ao dobro do previsto".
+
+Um cuidado de leitura: a cobertura sozinha pode ser trapaceada. Um intervalo absurdamente largo cobre 100%. E um intervalo "certo em média" pode ser inútil, cobrindo 100% dos casos fáceis e 60% dos difíceis. Por isso a tabela por grupo, com largura **e** cobertura, é obrigatória.
+
+O componente abaixo usa o simulador da trilha (dados **sintéticos**, com efeitos conhecidos) para você explorar bandas quantílicas, pinball loss e cobertura sem escrever código. Procure os casos em que a banda se abre e compare com a cobertura:
+
+<IntervalExplorer />
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+- **O que muda na tool de predição:** em vez de um modelo, você versiona **três** quantis (ou um MultiQuantile). A saída passa a ser `interval_low = expm1(q0,1)`, `predicted_metric = expm1(q0,5)`, `interval_high = expm1(q0,9)`, sempre depois de ordenar.
+- **Lumina A vs. B:** os dois intervalos canônicos do caso (ilustrativos, do simulador da trilha) têm a mesma largura relativa, cerca de 3,6 vezes entre o limite de baixo e o de cima (780 a 2.800 e 2.300 a 8.300). Isso faz sentido: mesmo canal, histórico longo (142 posts), setor bem representado. O que os separa é a **posição** do intervalo, não a largura.
+- **Contraste útil para o README:** mostre um criativo de canal com 5 posts ao lado. A largura relativa dele vai ser bem maior, e é isso que a regressão quantílica compra para você.
+- **Antes de expor:** rode a tabela de cobertura por grupo. Se a cobertura total ficar abaixo de 80%, como aqui (76%), a próxima aula resolve com conformal.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Treinar em curtidas cruas.** Quantis são invariantes à transformação, mas o treino não: em log1p as árvores dividem melhor e os quantis ficam estáveis. Treine em log e converta com `expm1`.
+2. **Usar o mesmo `min_child_samples` para 0,5 e para 0,9.** Quantis extremos precisam de folhas maiores.
+3. **Early stopping pelo MSE.** Use `metric="quantile"` no LightGBM, com o mesmo `alpha` do objetivo.
+4. **Publicar sem ordenar.** Mesmo com 0% de cruzamento no teste, um criativo estranho em produção pode cruzar.
+5. **Olhar só a cobertura total.** Sempre reporte por grupo (setor, tamanho do canal), com a largura ao lado.
+6. **Achar que 76% "está bom o bastante" sem dizer.** Declare o número. Subcobertura sistemática é resolvida na calibração, não escondida.
+:::
+
+<Quiz
+  id="m5-a2"
+  perguntas={[
+    {
+      pergunta: 'Você treina um LightGBM com `objective="quantile", alpha=0.9`. No teste, 97% dos valores reais ficaram abaixo da previsão. O que está acontecendo?',
+      opcoes: [
+        {texto: 'O modelo está correto: quanto mais valores abaixo, melhor.', explicacao: 'Não. Um quantil 0,9 bem calibrado deixa cerca de 90% abaixo. 97% indica previsões altas demais, e intervalos largos demais.'},
+        {texto: 'O quantil está alto demais: o modelo superestima o limite de cima.', correta: true, explicacao: 'Exato. A fração abaixo deveria ficar perto de 90%. Vale checar se houve drift (teste mais calmo que o treino) ou regularização excessiva.'},
+        {texto: 'O modelo aprendeu a média em vez do quantil.', explicacao: 'A média deixaria cerca de metade abaixo (um pouco mais com cauda longa), não 97%.'},
+      ],
+    },
+    {
+      pergunta: 'Por que minimizar a pinball loss com alpha = 0,9 leva ao quantil 0,9?',
+      opcoes: [
+        {texto: 'Porque a derivada da perda esperada é F(q) − 0,9, que zera quando F(q) = 0,9.', correta: true, explicacao: 'Esse é o argumento de primeira ordem: o custo de subir (0,1 por caso abaixo) empata com o ganho (0,9 por caso acima) quando 90% estão abaixo.'},
+        {texto: 'Porque a pinball loss é o erro quadrático multiplicado por 0,9.', explicacao: 'A pinball é linear por partes, não quadrática. Multiplicar o MSE por uma constante não muda o minimizador, que continua sendo a média.'},
+        {texto: 'Porque o LightGBM ordena os dados e pega o elemento na posição 90%.', explicacao: 'O resultado é equivalente em uma folha, mas o motivo geral é a forma assimétrica da perda, que vale para qualquer modelo.'},
+      ],
+    },
+    {
+      pergunta: 'Para um criativo, os três modelos LightGBM devolveram q0,1 = 7,9, q0,5 = 7,7 e q0,9 = 8,4 (em log). O que fazer?',
+      opcoes: [
+        {texto: 'Descartar a previsão desse criativo.', explicacao: 'Não precisa. Cruzamento pontual é esperado com modelos independentes e tem correção simples.'},
+        {texto: 'Ordenar os três valores e publicar 7,7 / 7,9 / 8,4, registrando que houve cruzamento.', correta: true, explicacao: 'O rearranjo (ordenação) é a correção padrão e não piora a estimativa. Contar os cruzamentos ajuda a detectar modelos subregularizados.'},
+        {texto: 'Trocar o q0,1 pela média de q0,5 e q0,9.', explicacao: 'Isso não tem justificativa e ainda deixa o limite de baixo acima da mediana em alguns casos.'},
+      ],
+    },
+    {
+      pergunta: 'Seu intervalo de 80% cobre 79% no teste total. Por grupo: 83% em moda/beleza e 66% no automotivo. Qual conclusão é correta?',
+      opcoes: [
+        {texto: 'O intervalo está calibrado, porque a cobertura total bate.', explicacao: 'A cobertura total esconde que um setor inteiro está subcoberto. Para um cliente automotivo, o intervalo promete 80% e entrega 66%.'},
+        {texto: 'A cobertura é marginal, não condicional: é preciso tratar o automotivo (mais dados, features de setor, calibração por grupo ou sinal de baixa confiança).', correta: true, explicacao: 'Exato. Esse é o problema de cobertura condicional que aparece de novo na aula de conformal.'},
+        {texto: 'Basta aumentar o alpha do modelo superior para 0,99.', explicacao: 'Isso alargaria todos os intervalos, inclusive os de moda/beleza, que já cobrem mais que 80%.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: quantis na sua base]
+1. Treine os três quantis (LightGBM ou CatBoost) no seu alvo em log, com o seu split temporal.
+2. Monte a tabela de avaliação: fração abaixo de cada quantil, cobertura, largura média e pinball loss no teste.
+3. Repita a tabela por setor e por faixa de posts anteriores do canal (menos de 10, 10 a 50, mais de 50).
+4. Conte os cruzamentos antes da ordenação.
+5. Escreva, em duas frases, qual grupo tem o intervalo menos confiável e por quê.
+:::
+
+<details>
+<summary>Ver dicas e o que esperar</summary>
+
+- Para agrupar, `pd.cut(df.posts_anteriores, [-1, 9, 50, np.inf])` resolve as faixas.
+- É comum a cobertura total ficar entre 70% e 78% fora da amostra. Se ficar acima de 85%, o período de teste pode estar mais "calmo" que o de treino, ou os quantis extremos estão regularizados demais (folhas grandes demais, poucas árvores).
+- Os grupos com menos dados costumam ter a pior cobertura **e** a maior largura. Isso não se resolve só com o intervalo: é o gatilho natural do `confidence_flag`.
+- Se o LightGBM cruzar mais que 1%, experimente `min_child_samples` entre 50 e 100 para os quantis 0,1 e 0,9 antes de trocar de biblioteca.
+
+</details>
+
+---
+
+## Resumo
+
+- A **pinball loss** $$\rho_\alpha(r) = \max(\alpha r, (\alpha - 1) r)$$ é assimétrica; minimizá-la em média produz o **quantil** $$q_\alpha$$ (derivada $$F(q) - \alpha$$).
+- **LightGBM**: um modelo por quantil (`objective="quantile", alpha=...`). **CatBoost**: um modelo com `MultiQuantile:alpha=0.1,0.5,0.9`.
+- A regressão quantílica dá **largura adaptativa**: intervalos mais largos onde o ruído é maior. Mas ela costuma **subcobrir** um pouco fora da amostra.
+- **Quantile crossing** existe; corrija com **ordenação** e conte os casos.
+- Avalie com **cobertura**, **largura média** e **pinball loss** no teste temporal, sempre também **por grupo**.
+
+## Referências
+
+- Koenker e Bassett. [*Regression Quantiles*](https://doi.org/10.2307/1913643). Econometrica 46(1), 1978.
+- Gneiting. [*Quantiles as optimal point forecasts*](https://doi.org/10.1016/j.ijforecast.2009.12.015). International Journal of Forecasting 27(2), 2011.
+- Chernozhukov, Fernández-Val e Galichon. [*Quantile and Probability Curves Without Crossing*](https://doi.org/10.3982/ECTA7880). Econometrica 78(3), 2010.
+- Documentação do LightGBM: [parâmetros `objective` e `alpha`](https://lightgbm.readthedocs.io/en/latest/Parameters.html).
+- Documentação do CatBoost: [funções de perda de regressão, incluindo `Quantile` e `MultiQuantile`](https://catboost.ai/docs/en/concepts/loss-functions-regression).
+- scikit-learn: [`mean_pinball_loss`](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.mean_pinball_loss.html).
+
+**Próxima aula:** [Predição conformal](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal): como transformar esses 76% em uma cobertura com garantia matemática, e o que o tempo faz com essa garantia.

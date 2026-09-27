@@ -1,0 +1,546 @@
+---
+sidebar_position: 8
+sidebar_label: 'Fusão e ablação multimodal'
+title: 'Fusão e ablação multimodal'
+description: 'Como juntar os blocos de features numa tabela só (early fusion), tratar mídia ausente e provar, com ablação temporal e bootstrap pareado, quais blocos valem a pena.'
+tags: [ml-preditivo, multimodal, ablacao]
+---
+
+# Fusão e Ablação Multimodal: Provar que a Camada Multimodal Vale a Pena
+
+<LessonMeta
+  tempo="55 min"
+  semana={3}
+  etapa="multimodal"
+  objetivos={[
+    'Juntar os blocos de features por video_id com prefixos, sem perder linhas nem tipos',
+    'Ajustar PCA e clusters de descritores só no treino e tratar vídeos sem mídia',
+    'Montar uma escada de ablação por blocos com validação temporal',
+    'Decidir se um bloco ajuda com bootstrap pareado por canal, e não pelo número pontual',
+  ]}
+  prerequisitos={[
+    {label: 'Análise de erros e ablação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao'},
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+    {label: 'VLM como extrator estruturado', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado'},
+  ]}
+/>
+
+Você passou duas semanas extraindo features: cortes e cores, embeddings do SigLIP 2, transcrição e energia do áudio, rostos e texto na tela, uma rubrica de 18 campos preenchida pelo Gemini. Treina o modelo com tudo e o Spearman sobe de 0,564 para 0,597. Vitória?
+
+Ainda não dá para saber. Com algumas centenas de vídeos no teste, uma diferença de 0,03 pode ser ruído. E, mesmo que seja real, você não sabe **qual** bloco trouxe o ganho. Talvez o visual tenha feito todo o trabalho e o VLM, que consumiu dias de cota, não acrescente nada. Talvez um bloco esteja até atrapalhando.
+
+A Galaxies pediu a camada multimodal, e o briefing dá a expectativa: o conteúdo visual soma algo como **+0,02 a +0,04** de Spearman sobre as features do canal. Esta aula é onde você **prova** quanto o seu pipeline soma, bloco a bloco, com uma <Termo id="ablacao">ablação</Termo> e a mesma honestidade estatística do [módulo 2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao).
+
+:::info[A ideia central]
+Dois passos, com regras simples:
+- **Fusão**: cada etapa do módulo gera um parquet com uma linha por vídeo. A fusão é um `left join` por `video_id`, com um **prefixo por bloco** (`meta_`, `canal_`, `txt_`, `vis_`, `aud_`, `det_`, `vlm_`). Tudo o que "aprende" com os dados (PCA, clusters) é ajustado **só no treino**.
+- **Ablação**: adicione um bloco por vez, com o mesmo split temporal, os mesmos hiperparâmetros e a mesma semente, e compare cada degrau com o anterior por **bootstrap pareado por canal**. Um bloco só "vale" se o intervalo da diferença ficar acima de zero.
+:::
+
+---
+
+## Por que fusão "cedo", em colunas
+
+Há três famílias de fusão multimodal (Baltrušaitis, Ahuja e Morency, *Multimodal Machine Learning: A Survey and Taxonomy*, TPAMI 2019):
+
+- **Early fusion**: concatenar as features de todas as modalidades numa única tabela e treinar um modelo só.
+- **Late fusion**: treinar um modelo por modalidade e combinar as previsões.
+- **Fusão intermediária**: redes que misturam representações internas, treinadas de ponta a ponta.
+
+Para o case, a early fusion em colunas é a escolha natural. O GBM lida bem com colunas heterogêneas (contagens, notas de 0 a 10, componentes de PCA, booleanos) e com valores ausentes, e aprende interações entre blocos sozinho ("gancho forte **e** música alta"). Com alguns milhares de vídeos, treinar um modelo por modalidade e depois um combinador divide dados que já são poucos. E a fusão intermediária exige treinar redes, o que o módulo evita de propósito.
+
+<Sketch name="m4/a8-fusao" alt="Sete blocos de features, cada um num parquet com prefixo próprio: meta_ (duração, hora), canal_ (histórico), txt_ (título e legenda), vis_ (embeddings), aud_ (fala e energia), det_ (rosto e texto) e vlm_ (rubrica). Todos convergem num left join por video_id que também cria a flag midia_ok, só para diagnóstico. Em seguida vem o split temporal, o ajuste só no treino de PCA dos embeddings e KMeans dos descritores, e o LightGBM, que trata NaN como mídia ausente. Uma nota explica que o prefixo permite selecionar blocos na ablação e somar SHAP por bloco, e que IDs e datas ficam sem prefixo." caption="Um parquet por etapa, um prefixo por bloco, um join por video_id." />
+
+O prefixo parece detalhe, mas faz três trabalhos. A ablação vira "selecione as colunas que começam com estes prefixos". O SHAP do [módulo 5](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica) pode ser **somado por bloco** ("o bloco visual respondeu por 30% da explicação"). E colunas que não são features (IDs, datas, controle) ficam sem prefixo e nunca entram no modelo por acidente.
+
+---
+
+## Na prática: uma base sintética com sinal conhecido
+
+Para aprender a ler uma ablação, nada melhor do que dados em que você **sabe a resposta**. O bloco abaixo simula 3.000 Shorts de 60 canais em que o tamanho do canal domina o alvo, e o conteúdo (gancho, energia, rosto, texto, duração, horário) soma efeitos pequenos e conhecidos.
+
+```python
+# Passo 1a: uma base sintética com efeitos CONHECIDOS (o canal domina; o conteúdo soma pouco)
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+N_CANAIS, POR_CANAL = 60, 50
+n = N_CANAIS * POR_CANAL
+canal = np.repeat(np.arange(N_CANAIS), POR_CANAL)
+nivel = rng.normal(7.0, 1.0, N_CANAIS)[canal]            # "tamanho" do canal (log)
+data = pd.to_datetime("2025-01-01") + pd.to_timedelta(rng.integers(0, 540, n), "D")
+hook, energia = rng.uniform(0, 10, n), rng.uniform(0, 10, n)
+rosto, texto = rng.random(n) < 0.6, rng.random(n) < 0.5
+dur, hora = rng.uniform(8, 60, n), rng.integers(8, 23, n)
+y = (nivel + 0.09 * (hook - 5) + 0.04 * (energia - 5) + 0.10 * rosto + 0.08 * texto
+     - 0.005 * (dur - 30) + 0.05 * ((hora >= 18) & (hora <= 21)) + rng.normal(0, 0.8, n))
+vid = [f"v{i:04d}" for i in range(n)]
+falhou = rng.random(n) < 0.06                              # 6% sem mídia (download falhou)
+# a tabela da coleta (módulo 1): id, canal, data e alvo = log1p(curtidas)
+coleta = pd.DataFrame({"video_id": vid, "id_canal": canal, "data_pub": data, "y": y})
+print(coleta.shape, "| vídeos sem mídia:", falhou.sum())
+```
+
+```text
+(3000, 4) | vídeos sem mídia: 184
+```
+
+O segundo passo escreve um parquet por etapa, no formato que o `consolidar` da [aula 4.1](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short) deixa no disco. Cada bloco "vê" as variáveis latentes com ruído, como um extrator real: o texto carrega um pouco do gancho; o embedding visual mistura gancho, rosto, texto e energia em 64 dimensões; o VLM dá notas ruidosas de gancho e energia, uma nota de "potencial viral" **sem sinal nenhum** e descritores livres. Vídeos sem mídia simplesmente não têm linha nos blocos que dependem do arquivo.
+
+```python
+# Passo 1b: um parquet por etapa, como o consolidar() da aula 4.1 deixaria no disco
+from pathlib import Path
+
+ruido = lambda k: rng.normal(0, 1, (n, k))
+FRASES = {  # descritores livres do VLM: 10 conceitos, cada um escrito de 3 jeitos
+    "forte": [["antes e depois lado a lado", "comparação antes/depois", "metade do rosto sem maquiagem"],
+              ["resultado logo no início", "resultado final no primeiro segundo", "mostra o resultado de cara"],
+              ["pergunta direta à câmera", "fala olhando para a câmera", "pergunta ao público na abertura"]],
+    "fraco": [["logo da marca na abertura", "vinheta com logotipo", "abre com a marca"],
+              ["tela parada com título", "imagem estática com texto", "slide com o nome do vídeo"],
+              ["introdução longa", "demora para começar", "apresentação lenta"]],
+    "neutro": [["close do produto", "frasco em primeiro plano", "produto em detalhe"],
+               ["mãos aplicando", "aplicação com os dedos", "mão espalhando a base"],
+               ["fundo neutro", "parede lisa ao fundo", "cenário simples"],
+               ["luz natural", "iluminação de janela", "luz do dia"]],
+}
+def sorteia(grupo, k):
+    return [str(rng.choice(FRASES[grupo][i])) for i in rng.choice(len(FRASES[grupo]), k, replace=False)]
+
+etapas = {
+    "metadados": pd.DataFrame({"duracao_s": dur, "hora": hora}),
+    "canal": pd.DataFrame({"log_mediana_ant": nivel + rng.normal(0, 0.35, n),
+                           "log_inscritos": 0.8 * nivel + rng.normal(3, 0.6, n)}),
+    "texto": pd.DataFrame(np.c_[0.25 * (hook - 5) / 3 + rng.normal(0, 1, n), ruido(7)]).add_prefix("emb_"),
+    # embedding visual "cru" (64 dims) com gancho, rosto, texto e energia misturados
+    "embeddings": pd.DataFrame(np.c_[(hook - 5) / 3, rosto, texto, (energia - 5) / 3]
+                               @ rng.normal(0, 1, (4, 64)) + 1.5 * ruido(64)).add_prefix("emb_"),
+    "audio": pd.DataFrame({"aud_rms_media": 0.02 * energia + rng.normal(0, 0.05, n),   # já vem com
+                           "aud_pulso": np.clip(0.08 * energia + rng.normal(0, 0.25, n), 0, 1),  # prefixo
+                           "aud_fala_no_gancho": rng.random(n) < 0.3 + 0.04 * hook}),         # (aula 4.5)
+    "detectores": pd.DataFrame({"det_max_rostos": rosto * rng.integers(1, 3, n) * (rng.random(n) > 0.1),
+                                "det_area_texto_media": texto * rng.uniform(0.02, 0.2, n)}),
+    "rubrica_vlm": pd.DataFrame({
+        "forca_hook_0a10": np.clip(np.round(hook + rng.normal(0, 1.5, n)), 0, 10),
+        "energia_musica_0a10": np.clip(np.round(energia + rng.normal(0, 2, n)), 0, 10),
+        "potencial_viral_0a10": np.clip(np.round(6 + rng.normal(0, 2, n)), 0, 10),
+        "elementos_video_top5": [sorteia("forte" if h > 6.5 else "fraco" if h < 3.5 else "neutro", 2)
+                                 + sorteia("neutro", 2) for h in hook],
+        "_tokens": rng.integers(2500, 7000, n)}),          # coluna de controle
+}
+Path("cache").mkdir(exist_ok=True)
+coleta.to_parquet("coleta.parquet", index=False)
+for nome, df in etapas.items():
+    df.insert(0, "video_id", vid)
+    if nome in {"embeddings", "audio", "detectores", "rubrica_vlm"}:
+        df = df[~falhou]                                   # sem mídia: sem linha
+    df.to_parquet(f"cache/{nome}_v1.parquet", index=False)
+    print(f"{nome:12s} {df.shape}")
+```
+
+```text
+metadados    (3000, 3)
+canal        (3000, 3)
+texto        (3000, 9)
+embeddings   (2816, 65)
+audio        (2816, 4)
+detectores   (2816, 3)
+rubrica_vlm  (2816, 6)
+```
+
+---
+
+## Passo 2: o join com prefixos
+
+```python
+# Passo 2: early fusion = juntar os blocos por video_id, com um prefixo por bloco
+import pandas as pd
+
+BLOCOS = {  # prefixo -> parquet da etapa
+    "meta_": "cache/metadados_v1.parquet",
+    "canal_": "cache/canal_v1.parquet",
+    "txt_": "cache/texto_v1.parquet",
+    "vis_": "cache/embeddings_v1.parquet",
+    "aud_": "cache/audio_v1.parquet",
+    "det_": "cache/detectores_v1.parquet",
+    "vlm_": "cache/rubrica_vlm_v1.parquet",
+}
+PREFIXOS = tuple(BLOCOS)
+
+
+def com_prefixo(bloco: pd.DataFrame, prefixo: str) -> pd.DataFrame:
+    """Prefixa só o que ainda não tem prefixo; '_' marca coluna de controle."""
+    return bloco.rename(columns={
+        c: c if c == "video_id" or c.startswith(PREFIXOS) or c.startswith("_") else prefixo + c
+        for c in bloco.columns})
+
+
+df = pd.read_parquet("coleta.parquet")                      # video_id, id_canal, data_pub, y
+for prefixo, arquivo in BLOCOS.items():
+    bloco = com_prefixo(pd.read_parquet(arquivo), prefixo)
+    booleanas = bloco.select_dtypes("bool").columns
+    bloco[booleanas] = bloco[booleanas].astype(float)      # senão o left join vira object
+    assert bloco["video_id"].is_unique, f"{arquivo}: video_id duplicado"
+    df = df.merge(bloco, on="video_id", how="left", validate="one_to_one")
+df["midia_ok"] = df["vis_emb_0"].notna()   # diagnóstico: sem prefixo, nunca vira feature
+df = df.sort_values("data_pub").reset_index(drop=True)
+
+print(df.shape, "| sem mídia:", (~df["midia_ok"]).sum())
+print({p: sum(c.startswith(p) for c in df.columns) for p in PREFIXOS})
+print("fora dos blocos:", [c for c in df.columns if not c.startswith(PREFIXOS)])
+```
+
+```text
+(3000, 91) | sem mídia: 184
+{'meta_': 2, 'canal_': 2, 'txt_': 8, 'vis_': 64, 'aud_': 3, 'det_': 2, 'vlm_': 4}
+fora dos blocos: ['video_id', 'id_canal', 'data_pub', 'y', '_tokens', 'midia_ok']
+```
+
+Cada linha desse bloco evita um bug que aparece de verdade:
+
+- **`how="left"` a partir da coleta.** Nenhum vídeo some porque uma etapa falhou; ele fica com `NaN` nas colunas daquele bloco.
+- **`validate="one_to_one"` e o `assert`.** Um `video_id` duplicado num bloco multiplicaria linhas em silêncio.
+- **Booleanos viram float antes do join.** No pandas 3.0.6, uma coluna `bool` que recebe `NaN` no `left join` vira `object`, e o `select_dtypes` do passo 6 a descartaria sem aviso. Na primeira versão deste código, `aud_fala_no_gancho` sumiu da ablação exatamente assim.
+- **O prefixo não é duplicado.** As colunas da aula 4.5 já vêm como `aud_*`; as da 4.3 vêm sem prefixo e o ganham aqui.
+- **`id_canal`, não `canal_id`.** Um ID com o prefixo de um bloco viraria feature sem ninguém perceber.
+
+**E a flag `midia_ok`?** Ela serve para **diagnóstico**: métricas separadas para vídeos com e sem mídia, contagem de falhas por canal. Não a use como feature. Em produção, o criativo sempre existe (a marca entrega o arquivo), então a flag seria sempre verdadeira. E, na base de treino, a falha de download pode estar ligada ao que aconteceu **depois** da publicação (vídeo removido, tornado privado ou restrito), o que é informação do futuro. Os `NaN`, por outro lado, ficam: o LightGBM aprende, a cada divisão, para qual lado mandar os valores ausentes.
+
+A sobreposição texto/fala da [aula 4.5](/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala) é uma **feature entre blocos**: com `det_texto_tela` e a transcrição na mesma linha, aplique `sobreposicao_texto_fala` depois do join.
+
+---
+
+## Passos 3 a 5: tudo que aprende, só no treino
+
+O split é <Termo id="split-temporal">temporal</Termo>, como no [módulo 2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal): treino até fevereiro de 2026, teste a partir de março. A <Termo id="pca">PCA</Termo> dos embeddings é ajustada só no treino; se fosse ajustada na base inteira, as direções principais já teriam "visto" o teste.
+
+```python
+# Passo 3: split temporal e PCA ajustada SÓ no treino
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+
+corte = pd.Timestamp("2026-03-01")
+treino, teste = df[df["data_pub"] < corte].copy(), df[df["data_pub"] >= corte].copy()
+
+
+def pca_no_treino(treino, teste, prefixo, k):
+    cols = [c for c in treino.columns if c.startswith(prefixo)]
+    ok_tr = treino[cols].notna().all(axis=1)                # PCA não aceita NaN
+    pca = PCA(n_components=k, random_state=0).fit(treino.loc[ok_tr, cols])
+    novos = [f"{prefixo}pc{i}" for i in range(k)]
+    for parte in (treino, teste):
+        ok = parte[cols].notna().all(axis=1)
+        parte[novos] = np.nan                               # quem falhou continua NaN
+        parte.loc[ok, novos] = pca.transform(parte.loc[ok, cols])
+        parte.drop(columns=cols, inplace=True)
+    print(f"{prefixo}: {len(cols)} -> {k} dims, variância explicada "
+          f"{pca.explained_variance_ratio_.sum():.0%}")
+    return treino, teste
+
+
+treino, teste = pca_no_treino(treino, teste, "vis_emb_", k=8)
+print("treino", treino.shape, "| teste", teste.shape)
+```
+
+```text
+vis_emb_: 64 -> 8 dims, variância explicada 60%
+treino (2352, 35) | teste (648, 35)
+```
+
+Os descritores livres do VLM (`elementos_video_top5`) seguem a receita do *Understanding Virality*: cada frase vira um embedding de sentença, o K-Means agrupa as frases em **K = 10** clusters por modalidade, e cada vídeo passa a ser representado pela **contagem** de frases em cada cluster. O paper usou o `all-mpnet-base-v2`; aqui, como as frases estão em português, usamos um modelo multilíngue.
+
+O embedding das frases usa um modelo pré-treinado, que não aprende nada com os seus dados, então pode ser calculado para a base inteira. Rode-o num **script separado**, junto com a extração:
+
+```python
+# Passo 4 (script de EXTRAÇÃO, separado do treino): embedding das frases do VLM
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+
+vlm = pd.read_parquet("cache/rubrica_vlm_v1.parquet")
+frases = sorted({f for lista in vlm["elementos_video_top5"] for f in lista})
+modelo = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+emb = modelo.encode(frases, normalize_embeddings=True)  # pré-treinado: não aprende nada aqui
+pd.DataFrame(emb, index=pd.Index(frases, name="frase")).add_prefix("e").to_parquet(
+    "cache/frases_emb.parquet")
+print(len(frases), "frases únicas ->", emb.shape)
+```
+
+```text
+30 frases únicas -> (30, 384)
+```
+
+:::warning[Por que um script separado?]
+No macOS, importar `torch` (via sentence-transformers) **antes** do `lightgbm` e depois treinar o LightGBM derrubou o processo com *segmentation fault* no nosso teste (dois runtimes OpenMP no mesmo processo). Importar o `lightgbm` primeiro funcionou, mas a solução robusta é a arquitetura: extração com redes num processo, treino do GBM em outro, conversando por parquet.
+:::
+
+O K-Means, ao contrário, **aprende** com os dados: é ajustado só nas frases do treino, e as frases do teste são apenas atribuídas ao cluster mais próximo.
+
+```python
+# Passo 5 (de volta ao treino): KMeans K=10 ajustado SÓ nas frases do treino
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+
+emb = pd.read_parquet("cache/frases_emb.parquet")           # índice = frase
+
+
+def clusters_de_descritores(treino, teste, col="vlm_elementos_video_top5", k=10):
+    frases_tr = sorted({f for lista in treino[col].dropna() for f in lista})
+    km = KMeans(n_clusters=k, n_init=10, random_state=0).fit(emb.loc[frases_tr])
+    rotulo = dict(zip(emb.index, km.predict(emb)))        # frases do teste só são ATRIBUÍDAS
+
+    def contar(lista) -> list[float]:
+        if not isinstance(lista, (list, np.ndarray)):       # NaN: vídeo sem mídia
+            return [np.nan] * k
+        cont = [0.0] * k
+        for f in lista:
+            cont[rotulo[f]] += 1
+        return cont
+
+    novos = [f"vlm_cl{i}" for i in range(k)]
+    for parte in (treino, teste):
+        parte[novos] = pd.DataFrame([contar(l) for l in parte[col]], index=parte.index, columns=novos)
+        parte.drop(columns=col, inplace=True)
+    return treino, teste, km, frases_tr
+
+
+treino, teste, km, frases_tr = clusters_de_descritores(treino, teste)
+for c in range(3):                                          # inspecione os clusters!
+    print(c, [f for f, l in zip(frases_tr, km.labels_) if l == c])
+```
+
+```text
+0 ['aplicação com os dedos', 'mão espalhando a base', 'mãos aplicando']
+1 ['comparação antes/depois', 'demora para começar', 'resultado final no primeiro segundo', 'resultado logo no início']
+2 ['fala olhando para a câmera', 'pergunta ao público na abertura', 'pergunta direta à câmera']
+```
+
+Os clusters 0 e 2 recuperaram conceitos inteiros. O cluster 1 misturou "demora para começar" (gancho fraco) com "resultado logo no início" (gancho forte): frases com vocabulário parecido e sentido oposto. É por isso que o comentário diz **inspecione**. Na sua base, leia as frases de cada cluster antes de interpretar o SHAP de `vlm_cl1`.
+
+---
+
+## Passo 6: a escada de ablação
+
+Cada degrau acrescenta um bloco e retreina **com o mesmo split, os mesmos hiperparâmetros e a mesma semente**. Qualquer diferença entre degraus vem das colunas, não de outra fonte de variação.
+
+```python
+# Passo 6: ablação cumulativa por bloco, mesma validação temporal para todos
+import lightgbm as lgb
+from scipy.stats import spearmanr
+
+ESCADA = {
+    "A: meta + canal": ["meta_", "canal_"],
+    "+ texto": ["txt_"],
+    "+ visual": ["vis_"],
+    "+ áudio": ["aud_"],
+    "+ detectores": ["det_"],
+    "+ VLM": ["vlm_"],
+}
+PARAMS = dict(n_estimators=600, learning_rate=0.03, num_leaves=15, min_child_samples=40,
+              subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=0, verbose=-1)
+numericas = treino.select_dtypes(include=["number", "bool"]).columns   # texto livre fica de fora
+
+prefixos, previsoes, linhas = [], {}, []
+for nome, novos in ESCADA.items():
+    prefixos += novos
+    cols = [c for c in numericas if c.startswith(tuple(prefixos))]
+    X_tr, X_te = treino[cols].astype(float), teste[cols].astype(float)  # bool -> 0/1; NaN fica
+    m = lgb.LGBMRegressor(**PARAMS).fit(X_tr, treino["y"])
+    previsoes[nome] = m.predict(X_te)
+    linhas.append((nome, len(cols), spearmanr(teste["y"], previsoes[nome]).statistic))
+
+base = linhas[0][2]
+for nome, k, rho in linhas:
+    print(f"{nome:16s} {k:3d} colunas  Spearman {rho:.3f}  (vs. A: {rho - base:+.3f})")
+```
+
+```text
+A: meta + canal    4 colunas  Spearman 0.564  (vs. A: +0.000)
++ texto           12 colunas  Spearman 0.543  (vs. A: -0.020)
++ visual          20 colunas  Spearman 0.587  (vs. A: +0.024)
++ áudio           23 colunas  Spearman 0.591  (vs. A: +0.028)
++ detectores      25 colunas  Spearman 0.600  (vs. A: +0.036)
++ VLM             38 colunas  Spearman 0.597  (vs. A: +0.033)
+```
+
+Olhando só para essa tabela, a tentação é dizer "os detectores somaram +0,009 e o VLM tirou 0,003". Mas cada um desses números é **um** sorteio de 648 vídeos de teste. Antes de interpretar, meça a incerteza.
+
+---
+
+## Passo 7: bootstrap pareado por canal
+
+O <Termo id="bootstrap">bootstrap</Termo> pareado reamostra o conjunto de teste muitas vezes e, em cada reamostra, calcula a diferença de Spearman entre dois degraus **nos mesmos vídeos**. Aqui a reamostragem é por **canal** (canais inteiros entram ou saem juntos), porque vídeos do mesmo canal não são independentes: reamostrar vídeos soltos daria intervalos otimistas.
+
+```python
+# Passo 7: bootstrap pareado POR CANAL -- a diferença é real ou é ruído?
+import numpy as np
+from scipy.stats import spearmanr
+
+
+def bootstrap_pareado(y, p_novo, p_velho, grupos, n_boot=2000, seed=0):
+    rng = np.random.default_rng(seed)
+    y, p_novo, p_velho = map(np.asarray, (y, p_novo, p_velho))
+    idx_por_canal = [np.flatnonzero(grupos == g) for g in np.unique(grupos)]
+    difs = []
+    for _ in range(n_boot):
+        sorteio = rng.integers(0, len(idx_por_canal), len(idx_por_canal))
+        idx = np.concatenate([idx_por_canal[i] for i in sorteio])   # canais inteiros
+        difs.append(spearmanr(y[idx], p_novo[idx]).statistic
+                    - spearmanr(y[idx], p_velho[idx]).statistic)
+    difs = np.array(difs)
+    return difs.mean(), np.percentile(difs, [2.5, 97.5]), (difs > 0).mean()
+
+
+passos = list(previsoes)                     # ordem da escada
+for velho, novo in zip(passos, passos[1:]):
+    media, (lo, hi), p = bootstrap_pareado(teste["y"], previsoes[novo], previsoes[velho],
+                                           teste["id_canal"].to_numpy())
+    print(f"{novo:14s} Δ {media:+.3f}  IC95% [{lo:+.3f}, {hi:+.3f}]  P(Δ>0) = {p:.2f}")
+```
+
+```text
++ texto        Δ -0.020  IC95% [-0.050, +0.009]  P(Δ>0) = 0.09
++ visual       Δ +0.046  IC95% [+0.008, +0.084]  P(Δ>0) = 0.99
++ áudio        Δ +0.004  IC95% [-0.012, +0.018]  P(Δ>0) = 0.68
++ detectores   Δ +0.009  IC95% [-0.003, +0.021]  P(Δ>0) = 0.94
++ VLM          Δ -0.004  IC95% [-0.018, +0.010]  P(Δ>0) = 0.30
+```
+
+<Sketch name="m4/a8-escada" alt="Gráfico de barras da escada de ablação, com eixo começando em 0,50. A: meta e canal, 0,564. Mais texto, 0,543, delta menos 0,020 com IC de menos 0,050 a mais 0,009. Mais visual, 0,587, delta mais 0,046 com IC de mais 0,008 a mais 0,084, a única barra destacada em verde. Mais áudio, 0,591, delta mais 0,004. Mais detectores, 0,600, delta mais 0,009. Mais VLM, 0,597, delta menos 0,004. Nota: só o bloco visual tem o IC da diferença inteiro acima de zero; os blocos seguintes repetem informação que o visual já trouxe." caption="Resultados da simulação desta aula (dados sintéticos)." />
+
+A leitura, com a resposta conhecida em mãos:
+
+- **Só o bloco visual passou no teste.** Δ de +0,046 sobre o degrau anterior, com o IC 95% inteiro acima de zero. Contra o degrau A, o ganho foi de +0,024: dentro da faixa de +0,02 a +0,04 que o briefing espera do conteúdo visual.
+- **O texto piorou, mas sem significância.** O bloco tinha oito colunas, sete delas puro ruído. Com poucos dados, colunas inúteis custam um pouco; o intervalo inclui zero, então a conclusão honesta é "não ajudou", não "atrapalhou".
+- **Áudio, detectores e VLM chegaram tarde.** Na simulação, eles carregam o mesmo gancho, energia, rosto e texto que o embedding visual já trazia. Numa escada cumulativa, **quem chega primeiro leva o crédito**. Isso não prova que o VLM é inútil; prova que, **depois** do visual, ele não acrescentou informação nova.
+- **O "potencial viral" não salvou o VLM.** Ele era ruído por construção, e a ablação não mostrou ganho: é exatamente o teste que a [aula 4.7](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado) prometeu.
+
+Por causa do efeito de ordem, complemente a escada com a ablação **"todos menos um"**: treine o modelo completo e, em seguida, remova um bloco por vez. Um bloco que não faz falta em nenhuma das duas análises pode sair do pipeline, e o custo de extraí-lo sai junto.
+
+---
+
+## A tabela que vai para o README
+
+Registre cada degrau no MLflow ([aula 2.5](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis)) e leve para o README uma tabela neste formato. Os números abaixo são os da simulação; troque pelos seus.
+
+| Degrau | Colunas | Spearman (teste temporal) | Δ vs. degrau anterior | IC 95% do Δ (bootstrap por canal) | Decisão |
+| :--- | ---: | ---: | ---: | :--- | :--- |
+| A: meta + canal | 4 | 0,564 | — | — | baseline de conteúdo zero |
+| + texto | 12 | 0,543 | −0,020 | [−0,050; +0,009] | revisar o bloco |
+| + visual | 20 | 0,587 | +0,046 | [+0,008; +0,084] | **mantém** |
+| + áudio | 23 | 0,591 | +0,004 | [−0,012; +0,018] | ver "todos menos um" |
+| + detectores | 25 | 0,600 | +0,009 | [−0,003; +0,021] | ver "todos menos um" |
+| + VLM | 38 | 0,597 | −0,004 | [−0,018; +0,010] | ver "todos menos um" |
+
+Acrescente duas linhas que a Galaxies vai procurar: a **acurácia par-a-par intra-canal** do modelo final e do degrau A (a métrica que o briefing usa como prova de conceito, com cerca de 60% como referência) e o Spearman separado para vídeos com e sem mídia (`midia_ok`).
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A ablação decide **quais blocos a tool de predição vai calcular** para os Shorts A e B. Se o seu resultado for parecido com o da simulação, o pipeline de produção precisa do bloco visual; os demais só ficam se a ablação "todos menos um" mostrar que fazem falta ou se servirem à explicação.
+
+Para os dois criativos da Lumina, a fusão é idêntica à do treino: os arquivos passam pelas mesmas etapas (em 360p, como a base), cada etapa gera sua linha, e o join monta um vetor com os mesmos prefixos e as mesmas colunas, na mesma ordem. Nenhum dos dois terá `NaN` de mídia: a marca entregou os arquivos.
+
+No simulador da trilha, o modelo final prevê cerca de **1.480 curtidas** para o A e **4.380** para o B, contra cerca de 2.300 de um Short típico do canal. São números **ilustrativos**. Mas repare na pergunta que a ablação acrescenta: quanto dessa diferença vem dos blocos que **provaram** valor? Se a maior parte da vantagem do B vier de colunas de um bloco que não passou no bootstrap, a explicação que o agente vai dar é frágil, e o [módulo 5](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/por-que-um-numero-so-nao-basta) vai mostrar que os intervalos de A e B se sobrepõem.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Ajustar PCA ou K-Means na base inteira.** As direções e os centróides "veem" o teste. Ajuste só no treino e apenas transforme o teste.
+2. **Comparar degraus com splits, hiperparâmetros ou sementes diferentes.** A diferença deixa de ser atribuível ao bloco.
+3. **Ler a diferença pontual sem intervalo.** Com algumas centenas de vídeos de teste, ±0,02 é ruído comum. Use bootstrap pareado, por canal.
+4. **Perder colunas no join sem perceber.** `bool` com `NaN` vira `object` e some no `select_dtypes`. Confira o número de colunas por prefixo a cada rodada.
+5. **Usar a flag de falha de download como feature.** Em produção ela é sempre verdadeira, e no treino pode carregar informação do futuro.
+6. **Concluir que um bloco é inútil pela escada cumulativa.** Quem entra primeiro leva o crédito. Rode também "todos menos um".
+:::
+
+<Quiz
+  id="m4-a8"
+  perguntas={[
+    {
+      pergunta: 'Um colega ajustou a PCA dos embeddings visuais com todos os 3.000 vídeos e só depois fez o split temporal. Qual o problema?',
+      opcoes: [
+        {texto: 'Nenhum: a PCA não usa o alvo, então não há vazamento.', explicacao: 'Não usar o alvo não basta: as direções principais foram escolhidas olhando para a distribuição dos vídeos do teste, que no momento da previsão ainda não existiam.'},
+        {texto: 'As componentes foram escolhidas com informação do período de teste; o certo é ajustar só no treino e transformar o teste.', correta: true, explicacao: 'Exato. É um vazamento sutil e geralmente pequeno, mas a regra do módulo é: tudo que aprende com dados, só no treino.'},
+        {texto: 'A PCA deveria ter mais componentes.', explicacao: 'O número de componentes é outra decisão; o problema aqui é quando a PCA foi ajustada.'},
+      ],
+    },
+    {
+      pergunta: 'O degrau "+ detectores" subiu o Spearman em +0,009, com IC 95% de [−0,003; +0,021]. O que concluir?',
+      opcoes: [
+        {texto: 'Os detectores melhoram o modelo em 0,009.', explicacao: 'O intervalo inclui zero; não dá para afirmar melhora.'},
+        {texto: 'Não há evidência de ganho depois dos blocos anteriores; vale checar a ablação "todos menos um" antes de decidir.', correta: true, explicacao: 'Isso. Na escada cumulativa, o bloco pode estar repetindo informação que já entrou.'},
+        {texto: 'Os detectores pioram o modelo.', explicacao: 'O intervalo também inclui valores positivos; não há evidência de piora.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o bootstrap desta aula reamostra canais inteiros, e não vídeos soltos?',
+      opcoes: [
+        {texto: 'Porque é mais rápido.', explicacao: 'A velocidade é parecida; o motivo é estatístico.'},
+        {texto: 'Porque vídeos do mesmo canal são correlacionados; tratá-los como independentes produz intervalos estreitos demais.', correta: true, explicacao: 'Exato. A unidade de reamostragem deve refletir a dependência nos dados.'},
+        {texto: 'Porque o Spearman não pode ser calculado em vídeos soltos.', explicacao: 'Pode, mas o intervalo resultante seria otimista.'},
+      ],
+    },
+    {
+      pergunta: 'Quais colunas NÃO devem entrar no modelo? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: '`midia_ok`', correta: true, explicacao: 'É diagnóstico: sempre verdadeira em produção e potencialmente ligada a eventos pós-publicação.'},
+        {texto: '`_tokens`', correta: true, explicacao: 'É controle de custo da extração, não atributo do vídeo.'},
+        {texto: '`vis_emb_pc0`', explicacao: 'É uma feature legítima: componente de PCA ajustada só no treino.'},
+        {texto: '`id_canal`', correta: true, explicacao: 'Um ID como feature decora canais e não generaliza; o histórico do canal entra pelas colunas canal_.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: a escada da sua base]
+1. Monte o dicionário `BLOCOS` com os parquets reais das suas etapas (4.3, 4.4, 4.5, 4.6 e 4.7) e rode os passos 2 a 7.
+2. Preencha a tabela do README com os seus números.
+3. Rode a ablação "todos menos um": modelo completo e seis modelos sem um bloco cada, com o mesmo bootstrap contra o completo.
+4. Troque a ordem da escada (VLM antes do visual) e compare. Algum bloco "muda de lado"?
+5. Escreva, em três frases, qual conjunto de blocos vai para produção e por quê.
+:::
+
+<details>
+<summary>Dicas e o que costuma acontecer</summary>
+
+- Para a ablação "todos menos um", reaproveite o laço do passo 6 com `prefixos = [p for p in PREFIXOS if p != removido]` e compare cada modelo com o completo usando `bootstrap_pareado(y, p_completo, p_sem_bloco, ...)`: um Δ positivo com IC acima de zero indica que o bloco removido fazia falta.
+- É comum que o visual e o VLM "disputem" o mesmo crédito: o que entra primeiro ganha. Se os dois passam no "todos menos um" com Δ perto de zero, eles são substitutos. Fique com o mais barato e mais estável (quase sempre o embedding visual) e mantenha o outro só se ele ajudar a **explicar**.
+- Se nenhum bloco de conteúdo passar no bootstrap, não esconda: relate o ganho pontual, o intervalo e o tamanho do teste. "Não detectamos ganho com N vídeos" é um resultado válido e mais útil para a Galaxies do que um número inflado.
+
+</details>
+
+---
+
+## Resumo
+
+- **Early fusion** em colunas: um parquet por etapa, **prefixo por bloco**, `left join` por `video_id` com validação de unicidade.
+- Tudo que aprende com os dados (**PCA**, **K-Means dos descritores**) é ajustado só no treino. Mídia ausente vira `NaN`, que o GBM trata; a flag de falha é só diagnóstico.
+- A **escada de ablação** acrescenta um bloco por vez com o mesmo split, hiperparâmetros e semente; complemente com "todos menos um".
+- O **bootstrap pareado por canal** separa ganho real de ruído. Na simulação, só o visual passou, com +0,024 sobre o degrau A, dentro da faixa de +0,02 a +0,04 do briefing.
+- A tabela de resultados, com intervalo, é a prova de que a camada multimodal vale o que custa.
+
+## Referências
+
+- Baltrušaitis, Ahuja e Morency. [*Multimodal Machine Learning: A Survey and Taxonomy*](https://arxiv.org/abs/1705.09406). IEEE TPAMI, 2019.
+- Gupta et al. [*Understanding Virality: A Rubric based Vision-Language Model Framework for Short-Form Edutainment Evaluation*](https://arxiv.org/abs/2512.21402). arXiv, 2025. Seção 3.4 (clusters K = 10 por modalidade) e Tabela 4 (ablação).
+- Reimers e Gurevych. [*Making Monolingual Sentence Embeddings Multilingual using Knowledge Distillation*](https://arxiv.org/abs/2004.09813). EMNLP, 2020.
+- Efron, B. e Tibshirani, R. *An Introduction to the Bootstrap*. Chapman & Hall, 1993.
+- LightGBM. [Missing Value Handle](https://lightgbm.readthedocs.io/en/latest/Advanced-Topics.html) (tratamento de valores ausentes).
+- scikit-learn. [PCA](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html) e [KMeans](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html).
+
+**Próxima aula:** [Por que um número só não basta](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/por-que-um-numero-so-nao-basta): o módulo 5 começa pela pergunta que a Lumina vai fazer logo depois de ver as previsões de A e B: "e com que confiança?".
