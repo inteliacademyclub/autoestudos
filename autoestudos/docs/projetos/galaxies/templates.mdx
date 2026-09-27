@@ -1,0 +1,171 @@
+---
+sidebar_position: 6
+sidebar_label: 'Templates de entrega'
+title: 'Templates de entrega'
+description: 'Modelos prontos para copiar: README, data card, model card, relatório de experimento e roteiro de demonstração do case Galaxies.'
+---
+
+# Templates de Entrega
+
+Copie, cole no seu repositório e preencha. Os templates seguem o que o briefing pede nos entregáveis. Apague as instruções entre `<!-- -->` antes de entregar.
+
+---
+
+## README
+
+````markdown
+# Agente Preditivo de Performance — <seu nome>
+
+> Uma frase: o que o agente faz e para quem.
+
+## 1. Problema e recorte
+- **Decisão apoiada:** <!-- quem decide, entre o quê -->
+- **Unidade de previsão e momento:** <!-- um Short, antes da publicação -->
+- **Alvo:** <!-- log1p(curtidas) ou log(curtidas / mediana anterior do canal); por quê -->
+- **Setores:** <!-- pelo menos dois -->
+- **Critério de sucesso:** <!-- ex.: par-a-par intra-canal e Spearman acima do baseline em validação temporal -->
+
+## 2. Base de dados
+Resumo + link para `docs/DATA_CARD.md`.
+- Origem, período dos vídeos, datas de coleta, volume (vídeos/canais/setor)
+- Termos de uso e como foram respeitados
+- **O que a base não representa**
+
+## 3. Arquitetura
+Diagrama + uma frase por componente. Deixe claro que **o número vem do modelo**, não do LLM.
+
+## 4. Instalação e execução
+```bash
+uv sync
+cp .env.example .env         # YOUTUBE_API_KEY, GEMINI_API_KEY...
+uv run python -m galaxies_tool.coletar --canais data/canais.csv
+uv run python -m galaxies_tool.treinar --config configs/lgbm.yaml
+uv run python -m galaxies_tool.servidor_mcp   # servidor MCP (stdio)
+uv run pytest
+```
+
+## 5. Modelos e configurações
+Versões fixadas, hiperparâmetros finais, onde estão os artefatos (MLflow run id).
+
+## 6. Metodologia
+Splits (datas de corte), baselines, features por bloco (sem vazamento: como garantiu), incerteza (quantis + conformal), explicabilidade (SHAP + subagente).
+
+## 7. Resultados
+| Modelo | MAE (log) | Spearman global | Spearman intra-canal | Par-a-par intra-canal | Cobertura 80% |
+|---|---|---|---|---|---|
+| Baseline: mediana do canal | | | | | — |
+| GBM Opção A (meta + texto) | | | | | |
+| + visual | | | | | |
+| + VLM | | | | | |
+
+Intervalos de confiança por bootstrap. Comparação com a literatura (Spearman ~0,55–0,85).
+
+## 8. Limitações
+Onde o modelo erra (análise de erros), vieses da base, riscos de uso.
+
+## 9. Evolução
+O que faria com mais 4 semanas.
+````
+
+---
+
+## Data card
+
+````markdown
+# Data card — <nome da base> v<versão>
+
+| Campo | Valor |
+|---|---|
+| Responsável | |
+| Fonte | YouTube Data API v3 (endpoints: channels.list, playlistItems.list, videos.list) |
+| Período dos vídeos | de AAAA-MM-DD a AAAA-MM-DD |
+| Datas de coleta | AAAA-MM-DD, ... (e recoleta de estatísticas em AAAA-MM-DD) |
+| Volume | N vídeos, M canais |
+| Setores | moda: n1 · beleza: n2 · automotivo: n3 |
+| Heurística de Shorts | duração ≤ 180 s (+ ...) |
+| Filtro de idade | ≥ 30 dias na data da coleta |
+| Alvo | likeCount (nulos: k vídeos, excluídos/tratados como ...) |
+
+## Como os canais foram escolhidos
+Critérios de inclusão/exclusão, mix marca × criador, faixas de inscritos (tabela).
+
+## Esquema
+| coluna | tipo | descrição | disponível antes da publicação? |
+|---|---|---|---|
+| post_id | str | ID do vídeo | sim |
+| channel_id | str | | sim |
+| published_at | datetime (UTC) | | sim |
+| caption | str | título + descrição | sim |
+| media_ref | str | caminho/URL da mídia | sim |
+| metric_target | int | curtidas na data da coleta | **não (alvo)** |
+| channel_stats_at_collection | ... | inscritos no dia da coleta | parcial (snapshot) |
+| sector | str | | sim |
+
+## Termos de uso e ética
+Políticas da API (armazenamento, atualização, métricas derivadas), uso educacional, dados pessoais, o que não foi redistribuído.
+
+## O que esta base NÃO representa
+- ...
+
+## Vieses conhecidos
+- ...
+````
+
+---
+
+## Model card
+
+````markdown
+# Model card — <nome do modelo> (<MLflow run id>)
+
+- **Tarefa:** regressão de <alvo> antes da publicação; ordenação intra-canal
+- **Algoritmo:** LightGBM/CatBoost (+ quantis 0,1/0,9 + calibração conformal)
+- **Dados de treino:** base v<x>, publicados até AAAA-MM-DD; calibração: AAAA-MM-DD a ...; teste: ...
+- **Features:** blocos e quantidade (meta_, canal_, txt_, vis_, aud_, det_, vlm_)
+- **Métricas no teste temporal:** (tabela)
+- **Cobertura do intervalo:** geral e por setor
+- **Uso pretendido:** comparar criativos de um canal com histórico antes de publicar
+- **Uso NÃO pretendido:** canais sem histórico sem o `confidence_flag`, outras plataformas, decisões automáticas sem revisão humana
+- **Limitações e vieses:** ...
+````
+
+---
+
+## Relatório de experimento
+
+````markdown
+# Experimento <n>: <título curto>
+
+**Hipótese:** <!-- ex.: "Atributos de gancho extraídos por VLM melhoram o par-a-par intra-canal em pelo menos 2 p.p. sobre a Opção A." -->
+
+**Setup**
+- Base v<x>; split temporal com corte em AAAA-MM-DD (treino) / AAAA-MM-DD (teste); split por canal: <k> canais fora
+- Modelos comparados e o que muda entre eles (um bloco por vez)
+- Seeds, n de repetições, MLflow experiment
+
+**Resultados**
+| Modelo | Spearman intra | Par-a-par | Δ vs. anterior [IC 95% bootstrap] |
+|---|---|---|---|
+
+**Análise de erros:** piores casos (com links para os vídeos), cortes por setor/tamanho do canal/duração.
+
+**Conclusão:** a hipótese se confirmou? O que muda na próxima iteração?
+````
+
+---
+
+## Roteiro de demonstração (5 a 7 minutos)
+
+| Tempo | O que mostrar | Dica |
+| :--- | :--- | :--- |
+| 0:00 | O problema em uma frase + a pergunta norteadora | Use o caso da marca, não a arquitetura |
+| 0:40 | A base: volume, setores, o que não representa | Mostre o data card rapidamente |
+| 1:20 | Baseline vs. modelo, com métricas de **ordenação** | Uma tabela; destaque o ganho sobre o baseline |
+| 2:10 | Ganho (ou não) da camada multimodal | Com intervalo de confiança |
+| 3:00 | **Ao vivo:** 3 criativos de canais fora do treino | Previsão, intervalo, ranking e explicação vs. o valor real ("de-para") |
+| 4:30 | Chamando pelo MCP (Inspector ou um cliente) | Mostre que é uma tool consumível |
+| 5:30 | Limitações e próximos passos | Honestidade conta pontos |
+
+:::warning[Tenha um plano B]
+Grave um vídeo da demo funcionando. APIs gratuitas podem estourar a cota ou cair no dia. Deixe também as respostas da tool salvas em JSON para mostrar se a chamada ao vivo falhar.
+:::

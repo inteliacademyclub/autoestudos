@@ -1,0 +1,201 @@
+---
+sidebar_position: 5
+sidebar_label: 'Leituras comentadas'
+title: 'Leituras comentadas'
+description: 'Os papers e datasets de referência do case Galaxies: o que cada um faz, os números que importam, o que aproveitar e o que olhar com senso crítico.'
+---
+
+# Leituras Comentadas
+
+Você não precisa ler todos os papers de ponta a ponta. Para cada um, esta página diz **o que ele faz, quais números importam, o que aproveitar no seu projeto e onde desconfiar**. Ler um paper com senso crítico também é um entregável: no README, você vai comparar seus números com a literatura.
+
+:::tip[Como ler um paper de predição de popularidade em 15 minutos]
+1. **Qual é o alvo?** Views, curtidas, uma razão, uma faixa? Normalizado por dias?
+2. **Como foi o split?** Aleatório, temporal, por usuário/canal?
+3. **O que já se sabia antes da publicação** e o que entrou como feature?
+4. **Qual é o baseline** e quanto o método ganhou sobre ele?
+5. **Dá para reproduzir?** Há código e dados públicos?
+:::
+
+---
+
+## Benchmarks e soluções vencedoras
+
+<PaperCard
+  titulo="SMP Challenge (Social Media Prediction)"
+  referencia="Desafio anual; edições 2025 e 2026 com trilhas de imagem e vídeo"
+  link="https://smp-challenge.com/"
+  resumo="Competição de referência em predição de popularidade de posts. A trilha de vídeo (SMP-Video) usa frames, legenda, dados do usuário e horário de publicação para prever um escore de popularidade. A métrica principal é o MAPE; o Spearman (SRC) também é usado no ranking."
+  numeros={['2025 vídeo: MAPE 0,1754 (MVP)', '2026 vídeo: MAPE 0,1529 (1º lugar)', 'SMP-Video: ~6 mil posts, 4,5 mil usuários']}
+  usar={[
+    'A formulação e as métricas: MAPE/MAE sobre um alvo em log e ranking por Spearman.',
+    'O dataset `smpchallenge/SMP-Video` no Hugging Face para experimentar (acesso sob termos, licença comunitária).',
+  ]}
+  criticar={[
+    'O alvo e a plataforma diferem dos seus: a fonte do SMP-Video não é YouTube Shorts.',
+    'Leaderboard mede um número absoluto; a Galaxies quer ordenação entre criativos do mesmo canal.',
+  ]}
+/>
+
+<PaperCard
+  titulo="MVP: Winning Solution to SMP Challenge 2025 Video Track"
+  referencia="Ye et al., arXiv:2507.00950, 2025"
+  link="https://arxiv.org/abs/2507.00950"
+  resumo="A solução vencedora da trilha de vídeo de 2025 é simples no espírito: embeddings de vídeo congelados (X-CLIP, média dos frames + PCA), Word2Vec na legenda, features do usuário (seguidores, média histórica de popularidade), hora e dia da semana, tudo num CatBoost com perda Huber. O alvo é log2(views/dias) + 1."
+  numeros={['MAPE 0,1754', 'CatBoost + Huber', 'X-CLIP + PCA']}
+  usar={[
+    'A receita "encoders congelados → colunas → GBM", exatamente a da trilha.',
+    'Perda Huber (robusta a virais) e PCA nos embeddings.',
+    'Features históricas do usuário/canal como base forte.',
+  ]}
+  criticar={[
+    'Normalizar por dias desde a publicação mistura idade e desempenho; na sua base, use vídeos com ≥ 30 dias.',
+    'Verifique no paper como o histórico do usuário foi calculado: se usa posts futuros, há vazamento.',
+  ]}
+/>
+
+<PaperCard
+  titulo="HyperFusion: Hierarchical Multimodal Ensemble Learning for Social Media Popularity Prediction"
+  referencia="Ye et al., arXiv:2507.00926, 2025"
+  link="https://arxiv.org/abs/2507.00926"
+  resumo="3º lugar na trilha de IMAGEM do SMP 2025 (não na de vídeo, como às vezes é citado). Combina CLIP (imagem e texto), GloVe, features espaço-temporais e de usuário num ensemble de CatBoost, TabNet e MLP, com pseudo-labeling em dois estágios."
+  numeros={['SRC 0,7324', 'MAE 1,2402', 'top features: User ID, Concept, Post Count']}
+  usar={['A evidência de que identidade e histórico do usuário dominam a importância das features.']}
+  criticar={['Ensemble e pseudo-labeling custam tempo e dão ganho marginal: fora do escopo de 4 semanas.']}
+/>
+
+---
+
+## Datasets
+
+<PaperCard
+  titulo="SMTPD: A New Benchmark for Temporal Prediction of Social Media Popularity"
+  referencia="Xu et al., CVPR 2025, arXiv:2503.04446"
+  link="https://arxiv.org/abs/2503.04446"
+  resumo="282 mil vídeos do YouTube (152,7 mil usuários, 90+ idiomas) com popularidade diária nos 30 dias após a publicação, thumbnail, título, descrição, hashtags, categoria e dados do usuário. Principal achado: acertar a popularidade do primeiro dia é a chave, porque os dias seguintes são muito correlacionados."
+  numeros={['282,4 mil vídeos', '30 dias de série', 'duração média ~1.850 s']}
+  usar={[
+    'Aquecimento na semana 1, enquanto sua coleta roda: pandas, alvo em log, baselines.',
+    'Experimento comparativo de early popularity (fora do núcleo do case).',
+    'Código em github.com/zhuwei321/SMTPD (Apache-2.0).',
+  ]}
+  criticar={[
+    'É **majoritariamente long-form** (duração média de ~30 min), não Shorts.',
+    'Os dados são distribuídos por Google Drive/Baidu, sem licença explícita dos dados: documente isso se usar.',
+  ]}
+/>
+
+<PaperCard
+  titulo="MicroLens: A Content-Driven Micro-Video Recommendation Dataset at Scale"
+  referencia="Ni et al., arXiv:2309.15379, 2023 (atualizações até 2026)"
+  link="https://github.com/westlake-repl/MicroLens"
+  resumo="Micro-vídeos com conteúdo bruto (vídeo, capa, áudio, título, comentários). O MicroLens-100K tem 19.738 vídeos e 100 mil usuários; um arquivo com curtidas e views por vídeo foi adicionado em 2024."
+  numeros={['19.738 vídeos (100K)', 'vídeo bruto disponível']}
+  usar={['Testar embeddings de vídeo completo (módulo 7) sem depender de download do YouTube.']}
+  criticar={['Criado para recomendação: o alvo de popularidade é secundário. É proibido redistribuir cópias modificadas.']}
+/>
+
+---
+
+## Os trabalhos mais próximos do case
+
+<PaperCard
+  titulo="Understanding Virality: A Rubric-based VLM Framework for Short-Form Edutainment Evaluation"
+  referencia="Gupta et al., arXiv:2512.21402, 2025"
+  link="https://arxiv.org/abs/2512.21402"
+  resumo="O trabalho mais parecido com o case. Em 11 mil YouTube Shorts educativos, o Gemini extrai os 5 principais elementos de áudio e de vídeo de cada Short. Esses descritores são embedados (all-mpnet-base-v2), agrupados com K-Means em 20 clusters e, junto com metadados, alimentam um XGBoost. O SHAP explica o resultado."
+  numeros={['Spearman 0,71', 'par-a-par 76,3%', 'R² 0,61', 'energia de áudio: 12,4% do SHAP', 'movimento: 10,7%', 'cortes: 7,6%']}
+  usar={[
+    'A rubrica via VLM + clusterização de descritores como features (aula 4.8).',
+    'A lista de atributos com evidência: energia de áudio, movimento, contraste texto × fala, cortes.',
+    'O teste fora do domínio (Instagram Reels: 64% par-a-par) como ideia de avaliação de generalização.',
+  ]}
+  criticar={[
+    '**Split aleatório** (70/15/15), não temporal: os números podem estar otimistas (aula 2.3).',
+    'O alvo é a razão curtidas/views, que usa uma métrica pós-publicação no denominador. Não serve como alvo "antes de publicar" sem adaptação.',
+    'Sem código nem dados liberados; domínio educativo, não moda, beleza ou automotivo.',
+  ]}
+/>
+
+<PaperCard
+  titulo="Large Language Models Are Natural Video Popularity Predictors"
+  referencia="Kayal, Mettes, Dehmamy e Park, Findings of ACL 2025"
+  link="https://aclanthology.org/2025.findings-acl.597/"
+  resumo="Converte frames em texto com um VLM e pede a um LLM que preveja a popularidade de 13.639 vídeos. Zero-shot, o LLM chega a 82% de acurácia, contra 80% de uma rede supervisionada com embeddings. A combinação chega a 85,5%."
+  numeros={['LLM zero-shot 82%', 'supervisionado 80%', 'combinação 85,5%']}
+  usar={['A referência para a extensão "LLM zero-shot vs. modelo treinado" (aula 7.3) e para usar o LLM como feature.']}
+  criticar={[
+    'Vídeos populares podem estar no pré-treino do LLM (vazamento de memória). Teste com vídeos posteriores ao corte de conhecimento.',
+    'A tarefa é classificação de popularidade, não a ordenação intra-canal do case.',
+  ]}
+/>
+
+<PaperCard
+  titulo="MMRA: Predicting Micro-video Popularity via Multi-modal Retrieval Augmentation"
+  referencia="SIGIR 2024 (doi:10.1145/3626772.3657929); código em github.com/ICDM-UESTC/MMRA"
+  link="https://github.com/ICDM-UESTC/MMRA"
+  resumo="Em vez de prever só a partir do próprio vídeo, recupera vídeos parecidos num banco de memória multimodal e usa a popularidade deles como evidência. Avaliado no MicroLens-100K."
+  usar={['A tool de comparáveis (aula 6.4): "criativos parecidos renderam X" como evidência e como feature.']}
+  criticar={['Na recuperação, só valem vizinhos publicados **antes** do post-alvo; senão, é vazamento.']}
+/>
+
+<PaperCard
+  titulo="Engagement Prediction of Short Videos with Large Multimodal Models"
+  referencia="Sun et al., arXiv:2508.02516, 2025"
+  link="https://arxiv.org/abs/2508.02516"
+  resumo="Compara modelos multimodais grandes para prever engajamento de vídeos curtos (dataset SnapUGC). Modelos que também ouvem o áudio superaram os só-visuais. Venceu o desafio EVQA-SnapUGC do ICCV 2025."
+  usar={['Mais uma evidência de que o **áudio** importa: não pule a aula 4.5.']}
+  criticar={['Fine-tuning de LMMs está fora do orçamento de GPU do case; use como motivação, não como receita.']}
+/>
+
+<PaperCard
+  titulo="Will It Go Viral? Grounding Micro-Video Popularity Prediction on the Open Web"
+  referencia="Heo e Lee, arXiv:2605.18653, 2026"
+  link="https://arxiv.org/abs/2605.18653"
+  resumo="Propõe o dataset WEBSHORTS: 14 mil vídeos com contexto da web aberta capturado no momento do upload (trends) e views diárias por 7 dias. Mostra que adaptar a previsão às tendências do momento ajuda."
+  usar={['A ideia de features de contexto temporal ("o que estava em alta") como extensão.']}
+  criticar={['Licença CC BY-NC-ND: uso não comercial e sem derivados.']}
+/>
+
+---
+
+## Incerteza e explicabilidade
+
+<PaperCard
+  titulo="A Gentle Introduction to Conformal Prediction and Distribution-Free Uncertainty Quantification"
+  referencia="Angelopoulos e Bates, arXiv:2107.07511, 2021"
+  link="https://arxiv.org/abs/2107.07511"
+  resumo="O melhor ponto de partida sobre predição conformal: intuição, garantias, código e armadilhas, em linguagem acessível."
+  usar={['Base da aula 5.3. Leia as seções de regressão e de conformalized quantile regression.']}
+  criticar={['A garantia vale sob permutabilidade: com drift temporal, calibre na fatia mais recente e monitore (aula 7.5).']}
+/>
+
+<PaperCard
+  titulo="Conformalized Quantile Regression"
+  referencia="Romano, Patterson e Candès, NeurIPS 2019, arXiv:1905.03222"
+  link="https://arxiv.org/abs/1905.03222"
+  resumo="Combina regressão quantílica (intervalos que se adaptam à dificuldade de cada caso) com calibração conformal (cobertura garantida)."
+  usar={['O método recomendado para o intervalo da sua tool (aulas 5.2 e 5.3).']}
+/>
+
+<PaperCard
+  titulo="A Unified Approach to Interpreting Model Predictions (SHAP)"
+  referencia="Lundberg e Lee, NeurIPS 2017, arXiv:1705.07874"
+  link="https://arxiv.org/abs/1705.07874"
+  resumo="Unifica métodos de explicação sob os valores de Shapley. A versão para árvores (TreeSHAP) torna o cálculo exato e rápido para GBMs."
+  usar={['Base das aulas 5.5 e 5.6 e da tool de explicabilidade.']}
+  criticar={['SHAP explica o **modelo**, não causalidade no mundo. Features correlacionadas dividem o crédito.']}
+/>
+
+---
+
+## Contexto (opcional, fora do escopo)
+
+<PaperCard
+  titulo="Generative Agent Simulations of 1,000 People"
+  referencia="Park et al., arXiv:2411.10109, 2024 (versão atual renomeada: LLM Agents Grounded in Self-Reports Enable General-Purpose Simulation of Individuals)"
+  link="https://arxiv.org/abs/2411.10109"
+  resumo="Agentes generativos que simulam indivíduos reais a partir de entrevistas: é o tipo de tecnologia por trás de personas sintéticas como as da Galaxies."
+  usar={['Entender quem vai consumir a sua tool, e por que um componente estatístico medido complementa a opinião qualitativa da persona.']}
+  criticar={['Construir ou avaliar personas está **fora do escopo** do case.']}
+/>
