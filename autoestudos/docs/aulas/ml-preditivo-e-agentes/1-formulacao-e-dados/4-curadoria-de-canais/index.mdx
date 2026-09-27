@@ -1,0 +1,383 @@
+---
+sidebar_position: 4
+sidebar_label: 'Curadoria de canais'
+title: 'Curadoria de canais'
+description: 'Critérios de inclusão e exclusão, estratificação por setor e tamanho, viés de sobrevivência e como descobrir e resolver canais pela YouTube Data API sem gastar a cota de busca.'
+tags: [ml-preditivo, dados, youtube-api, curadoria]
+---
+
+# Curadoria de Canais: Quem Entra na Base Decide o que o Modelo Aprende
+
+<LessonMeta
+  tempo="40 min"
+  semana={1}
+  etapa="dados"
+  objetivos={[
+    'Definir critérios explícitos de inclusão e exclusão de canais e justificar cada um',
+    'Estratificar a seleção por setor, faixa de inscritos e tipo de canal (marca oficial ou criador)',
+    'Reconhecer o viés de seleção e de sobrevivência e aplicar medidas para reduzi-lo',
+    'Descobrir canais sem depender do search.list e resolver handles em channel IDs com a API',
+    'Montar a planilha de curadoria, incluindo os canais excluídos e o motivo',
+  ]}
+  prerequisitos={[
+    {label: 'Fontes de dados e o plano da sua base', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/fontes-de-dados-e-plano-da-base'},
+  ]}
+/>
+
+Peça para dez pessoas listarem canais de beleza no YouTube e você vai receber, quase sempre, os mesmos nomes: criadores com milhões de inscritos e as marcas globais mais conhecidas. É natural: são os canais que aparecem para todo mundo. Agora imagine treinar o modelo só com eles e pedir uma previsão para a Lumina, com 180 mil inscritos. O modelo nunca viu um canal desse porte. A previsão vai sair, com casas decimais e tudo, mas será uma extrapolação.
+
+Existe um problema mais sutil. Os canais que você conhece são os que **deram certo**. Os que tentaram Shorts por seis meses, não cresceram e desistiram não aparecem em lista nenhuma. Um modelo treinado só com sobreviventes aprende que "postar Shorts funciona", porque nunca viu o contrário.
+
+A curadoria de canais é a etapa em que você decide a **população** da sua base. Ela é tão importante quanto o modelo, e bem mais difícil de corrigir depois.
+
+:::info[A ideia central]
+Escolha canais com **critérios escritos antes** de olhar os resultados, **estratifique** por setor, faixa de inscritos e tipo de canal, e registre **também os excluídos**, com o motivo. Para descobrir canais, prefira handles resolvidos com `channels.list(forHandle=...)` (1 unidade cada) a buscas com `search.list`, que têm um bucket de só 100 chamadas por dia.
+:::
+
+---
+
+## Critérios de inclusão e exclusão
+
+Um critério bom é **verificável** (outra pessoa aplicaria e chegaria na mesma decisão) e **justificado** (você sabe dizer o que ele protege). Uma proposta para o case:
+
+| Critério | Regra sugerida | O que ele protege |
+| :--- | :--- | :--- |
+| **Setor** | A maioria dos Shorts do canal é de moda, beleza ou automotivo | O alvo e as features fazem sentido dentro do setor |
+| **Idioma e país** | Conteúdo em português, público brasileiro (ou o recorte que você escolher, **um só**) | Misturar idiomas multiplica a variância e confunde as features de texto |
+| **Atividade** | Pelo menos 1 Short nos últimos 90 dias | O período de teste precisa de canais que ainda publicam |
+| **Histórico** | Pelo menos 30 Shorts publicados | O alvo relativo precisa de posts anteriores para ter uma mediana estável |
+| **Curtidas visíveis** | `likeCount` presente na maioria dos vídeos | Sem curtidas não há alvo |
+| **Inscritos visíveis** | `hiddenSubscriberCount` falso | Permite estratificar por tamanho |
+| **Exclusões** | Canais de cortes/reuploads, compilações, agregadores, conteúdo infantil | O "autor" do Short não é quem o canal diz ser, ou o público é outro |
+
+Dois cuidados com os campos da API. O `snippet.country` do canal é **opcional** e muitos canais não preenchem; o `snippet.defaultAudioLanguage` dos vídeos também falta com frequência. Use esses campos como pista, não como verdade: a checagem de idioma e país termina com um olho humano em alguns vídeos do canal. E o `subscriberCount` vem **arredondado para três algarismos significativos** (123.456 vira 123.000) desde 2019, o que basta para estratificar, mas não para calcular crescimento fino.
+
+---
+
+## Mix e estratificação
+
+Com os critérios aplicados, a pergunta passa a ser **quantos de cada tipo**. Três eixos:
+
+**Setor.** Pelo menos dois dos três setores, com número de canais parecido. O número de **Shorts** por setor não vai ser igual (canais de beleza tendem a publicar mais, por exemplo), mas o número de canais é o que você controla.
+
+**Tamanho.** Faixas de inscritos em escala log, como menos de 10 mil, 10 a 100 mil, 100 mil a 1 milhão e mais de 1 milhão. O objetivo não é ter exatamente o mesmo número em cada faixa, e sim **não deixar nenhuma vazia** na faixa em que seus clientes estão. As marcas atendidas pela Galaxies, como a Lumina, tendem a estar nas faixas intermediárias.
+
+**Tipo de canal.** Marcas oficiais e criadores têm dinâmicas diferentes: a marca publica com calendário de campanha e costuma ter verba para impulsionar; o criador depende mais do algoritmo e da própria comunidade. O cliente da Galaxies é a **marca**, então marcas oficiais não podem faltar, mas uma base só de marcas tende a ter poucos Shorts por canal. Registre o tipo numa coluna e decida o mix conscientemente.
+
+Um último controle: **limite de Shorts por canal**. Um canal que publica cinco Shorts por dia pode ter mais linhas do que dez canais juntos, e o modelo passa a aprender aquele canal. Um teto, como os 400 Shorts mais recentes por canal, mantém o equilíbrio. Anote o teto no data card.
+
+<Sketch name="m1/funil-de-curadoria" alt="Funil da curadoria em quatro etapas: candidatos (listas manuais, handles citados em descrições e colabs, canais em destaque via channelSections, search.list com parcimônia), resolver handle em channel_id com channels.list(forHandle) a 1 unidade por handle, filtrar (idioma e país, postou nos últimos 90 dias, 30 ou mais Shorts, curtidas visíveis, não é reupload), estratificar (setor, faixa de inscritos, tipo). O resultado vai para a planilha de curadoria com 60+ canais e as colunas channel_id, handle, setor, tipo, faixa, país, idioma, incluído, motivo, fonte e data de verificação. Notas: viés de sobrevivência e registrar também os excluídos." caption="A curadoria é um funil documentado: cada canal que sai tem um motivo anotado." />
+
+---
+
+## Viés de seleção e de sobrevivência
+
+**Viés de seleção** acontece quando a forma de escolher os exemplos faz a amostra diferir, de forma sistemática, da população sobre a qual você quer tirar conclusões. **Viés de sobrevivência** é um caso particular: você só observa quem passou por um filtro de sucesso.
+
+Na curadoria de canais, os dois aparecem de jeitos concretos:
+
+- **Rankings e listas de "top canais"** só têm sobreviventes. Use-os como ponto de partida, nunca como a lista final.
+- **O critério de atividade** ("postou nos últimos 90 dias") protege o teste, mas remove canais que desistiram. Isso é aceitável, desde que você **escreva** que a base representa canais ativos em 2026.
+- **O search.list ordena por relevância**, e relevância favorece canais grandes e populares. Canais descobertos por busca tendem a ser os mesmos que você já conhecia.
+- **Colabs e citações** ("gravei com a @fulana") puxam canais do mesmo círculo. São ótimas para achar canais médios, mas criam clusters. Varie as sementes.
+
+A medida mais eficaz é simples: **incluir de propósito** canais medianos e pequenos, e deixar registrado como cada canal entrou (`fonte`). Com isso, na análise de erros do módulo 2, você consegue perguntar "o modelo erra mais nos canais que vieram de busca?" e ter a resposta.
+
+---
+
+## Descobrir canais sem gastar a cota de busca
+
+Desde 01/06/2026, o `search.list` tem um bucket próprio de **100 chamadas por dia**, e cada chamada traz até 50 resultados. Isso é pouco para descoberta em massa e nada para listar vídeos. As alternativas, em ordem de preferência:
+
+1. **Listas manuais de handles.** Sites e redes sociais das marcas, perfis de agências, portfólios de criadores. Anote o `@handle` de cada canal; ele aparece na URL `youtube.com/@handle`.
+2. **Handles citados em descrições.** Descrições de Shorts de moda e beleza são cheias de "@marca" e "com a @fulana". Depois da primeira coleta, uma expressão regular sobre as descrições que você já tem revela candidatos **de graça**.
+3. **Canais em destaque.** `channelSections.list(channelId=...)` devolve as seções da página do canal; as do tipo `multipleChannels` listam os canais que ele recomenda. Custa 1 unidade por canal.
+4. **search.list com parcimônia.** Reserve algumas dezenas de chamadas por dia com `type="channel"`, `regionCode="BR"`, `relevanceLanguage="pt"` e termos variados ("maquiagem", "skincare", "moda masculina", "test drive"). Use para descobrir **canais**, e só.
+
+Com os handles em mãos, `channels.list(part=..., forHandle="@handle")` resolve **um handle por chamada** (1 unidade) e já devolve o `channel_id`, os inscritos, o país, o número de vídeos e a playlist de uploads. Depois que você tem os IDs, `channels.list(id=...)` aceita até 50 IDs por chamada e serve para atualizar os metadados.
+
+---
+
+## Na prática: de handles a canais resolvidos
+
+O trecho abaixo resolve uma lista de handles e depois atualiza os metadados em lotes. O bloco `__main__` precisa de chave; o teste logo em seguida roda **sem chave**, com um cliente falso que devolve respostas no formato real da API.
+
+```python
+# curadoria.py (o bloco __main__ requer YOUTUBE_API_KEY)
+import os
+import pandas as pd
+from googleapiclient.discovery import build
+
+PARTES = "snippet,contentDetails,statistics"
+
+def achatar_canal(c: dict, handle: str | None = None) -> dict:
+    sn, st = c["snippet"], c.get("statistics", {})
+    return {
+        "channel_id": c["id"],
+        "handle": handle or sn.get("customUrl"),
+        "titulo": sn["title"],
+        "pais": sn.get("country"),                 # opcional: muitos canais não preenchem
+        "criado_em": sn["publishedAt"],
+        "inscritos": None if st.get("hiddenSubscriberCount") else int(st["subscriberCount"]),
+        "n_videos": int(st.get("videoCount", 0)),
+        "uploads": c["contentDetails"]["relatedPlaylists"]["uploads"],
+    }
+
+def resolver_handles(yt, handles: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    """forHandle aceita UM handle por chamada: custa 1 unidade por handle."""
+    linhas, nao_achados = [], []
+    for h in handles:
+        resp = yt.channels().list(part=PARTES, forHandle=h).execute()
+        itens = resp.get("items", [])           # handle inexistente: sem "items"
+        if itens:
+            linhas.append(achatar_canal(itens[0], handle=h))
+        else:
+            nao_achados.append(h)
+    return pd.DataFrame(linhas), nao_achados
+
+def atualizar_em_lote(yt, channel_ids: list[str]) -> pd.DataFrame:
+    """Com os IDs em mãos, 1 unidade a cada 50 canais."""
+    linhas = []
+    for i in range(0, len(channel_ids), 50):
+        lote = ",".join(channel_ids[i : i + 50])
+        resp = yt.channels().list(part=PARTES, id=lote).execute()
+        linhas += [achatar_canal(c) for c in resp.get("items", [])]
+    return pd.DataFrame(linhas)
+
+if __name__ == "__main__":
+    yt = build("youtube", "v3", developerKey=os.environ["YOUTUBE_API_KEY"])
+    handles = pd.read_csv("candidatos.csv")["handle"].dropna().unique().tolist()
+    canais, faltando = resolver_handles(yt, handles)
+    canais.to_csv("canais_resolvidos.csv", index=False)
+    print(f"{len(canais)} resolvidos, {len(faltando)} não encontrados: {faltando}")
+```
+
+```python
+# teste_curadoria.py: roda SEM chave (uv run python teste_curadoria.py)
+from curadoria import atualizar_em_lote, resolver_handles
+
+CANAL = {
+    "kind": "youtube#channel",
+    "id": "UCabc123LuminaBeauty0000",
+    "snippet": {"title": "Lumina Beauty", "customUrl": "@luminabeauty",
+                "publishedAt": "2019-03-02T14:00:00Z", "country": "BR"},
+    "contentDetails": {"relatedPlaylists": {"likes": "", "uploads": "UUabc123LuminaBeauty0000"}},
+    "statistics": {"viewCount": "48200000", "subscriberCount": "180000",
+                   "hiddenSubscriberCount": False, "videoCount": "912"},
+}
+
+class Req:
+    def __init__(self, resp): self.resp = resp
+    def execute(self): return self.resp
+
+class FakeChannels:
+    def __init__(self): self.chamadas = []
+    def list(self, **kw):
+        self.chamadas.append(kw)
+        if kw.get("forHandle") == "@luminabeauty" or "id" in kw:
+            return Req({"kind": "youtube#channelListResponse", "items": [CANAL]})
+        return Req({"kind": "youtube#channelListResponse", "pageInfo": {"totalResults": 0}})
+
+class FakeYT:
+    def __init__(self): self.ch = FakeChannels()
+    def channels(self): return self.ch
+
+yt = FakeYT()
+df, faltando = resolver_handles(yt, ["@luminabeauty", "@nao-existe"])
+assert faltando == ["@nao-existe"]
+assert df.loc[0, "inscritos"] == 180000 and df.loc[0, "uploads"].startswith("UU")
+atualizar_em_lote(yt, [f"UC{i:022d}" for i in range(120)])
+assert len(yt.ch.chamadas) == 2 + 3          # 2 handles + ceil(120/50) lotes
+print("ok: custo =", len(yt.ch.chamadas), "unidades")   # ok: custo = 5 unidades
+```
+
+Para descobrir candidatos e conferir o equilíbrio da seleção, o trecho a seguir extrai handles citados em descrições, lê os canais em destaque e cruza setor com faixa de inscritos:
+
+```python
+import re
+import numpy as np
+import pandas as pd
+
+# handle: 3 a 30 caracteres; letras, números, "_", "-" e "."; não pode ser e-mail
+RE_HANDLE = re.compile(r"(?<![\w.@])@([\w][\w.-]{1,28}[\w])")
+
+def handles_em_textos(textos: list[str]) -> pd.Series:
+    """Conta menções a @handles em descrições e títulos (colabs, parcerias)."""
+    achados = [f"@{h.lower()}" for t in textos for h in RE_HANDLE.findall(t or "")]
+    return pd.Series(achados, dtype="str").value_counts()
+
+def canais_em_destaque(yt, channel_id: str) -> list[str]:
+    """Seções 'multipleChannels' da página do canal (1 unidade por canal)."""
+    resp = yt.channelSections().list(part="snippet,contentDetails", channelId=channel_id).execute()
+    ids = []
+    for s in resp.get("items", []):
+        if s["snippet"]["type"] == "multipleChannels":
+            ids += s.get("contentDetails", {}).get("channels", [])
+    return ids
+
+FAIXAS = [0, 10_000, 100_000, 1_000_000, np.inf]
+ROTULOS = ["até 10 mil", "10–100 mil", "100 mil–1 mi", "mais de 1 mi"]
+
+def estratificar(canais: pd.DataFrame) -> pd.DataFrame:
+    canais = canais.assign(faixa=pd.cut(canais["inscritos"], FAIXAS, labels=ROTULOS, right=False))
+    return pd.crosstab(canais["setor"], canais["faixa"], margins=True, margins_name="total")
+
+descricoes = [
+    "Look do dia com a @MariaModa e a @lumina.beauty! Contato: contato@marca.com.br",
+    "Test drive do SUV novo com @garagem22 #shorts",
+    "Tutorial feito em parceria com @lumina.beauty",
+]
+print(handles_em_textos(descricoes))
+
+rng = np.random.default_rng(0)   # canais sintéticos, só para mostrar a tabela
+exemplo = pd.DataFrame({
+    "setor": rng.choice(["beleza", "moda", "automotivo"], 60),
+    "inscritos": np.round(10 ** rng.uniform(3.5, 6.8, 60), -2),
+})
+print(estratificar(exemplo))
+```
+
+```text
+@lumina.beauty    2
+@mariamoda        1
+@garagem22        1
+Name: count, dtype: int64
+faixa       até 10 mil  10–100 mil  100 mil–1 mi  mais de 1 mi  total
+setor
+automotivo           3           8             3             6     20
+beleza               2           5             4             8     19
+moda                 3           6            11             1     21
+total                8          19            18            15     60
+```
+
+Repare que a expressão regular ignora o e-mail `contato@marca.com.br` e que a tabela cruzada mostra, de relance, onde a seleção está fraca: no exemplo, só um canal de moda acima de 1 milhão e poucos canais pequenos. É essa tabela que você vai colar no data card.
+
+---
+
+## A planilha de curadoria
+
+A planilha é o artefato que torna a seleção **auditável**. Colunas sugeridas:
+
+| Coluna | Exemplo | Para quê |
+| :--- | :--- | :--- |
+| `channel_id` | `UCabc123...` | Chave estável (handles podem mudar) |
+| `handle` | `@luminabeauty` | Leitura humana |
+| `setor` | beleza | Estratificação e análise por setor |
+| `tipo` | marca / criador | Mix de canais |
+| `faixa_inscritos` | 100 mil–1 mi | Estratificação por tamanho |
+| `inscritos_verificacao` | 180000 | Valor **no dia da verificação** (arredondado pela API) |
+| `pais`, `idioma` | BR, pt | Recorte, com checagem manual |
+| `n_shorts_estimado`, `ultimo_short` | 150, 2026-09-20 | Critérios de histórico e atividade |
+| `incluido`, `motivo` | não, "reuploads de outro canal" | Auditoria das exclusões |
+| `fonte` | colab / lista manual / busca | Rastrear viés de descoberta |
+| `verificado_em` | 2026-09-28 | Data da decisão |
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A Lumina tem cerca de 180 mil inscritos: está na faixa de **100 mil a 1 milhão**, no setor **beleza**, e é uma **marca oficial**. Para que a previsão de A e B não seja uma extrapolação, a célula "beleza × 100 mil–1 mi × marca" da sua tabela cruzada precisa ter canais, idealmente vários.
+
+Se essa célula estiver vazia, o agente ainda devolve números, mas a análise de incerteza do módulo 5 deveria acender o sinal de baixa confiança. Um bom teste de sanidade, no fim do projeto, é perguntar ao agente sobre um canal fictício de cada faixa e ver se o intervalo de predição fica mais largo onde a base é mais rala.
+
+O mesmo vale para a Garagem 22: se todos os canais automotivos da sua base forem de montadoras gigantes, o modelo não sabe nada sobre um canal independente de avaliações de carros.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Curar pelo que você conhece.** Sua memória é um filtro de sobrevivência. Use listas, colabs e canais em destaque para chegar aos medianos.
+2. **Decidir critérios depois de ver as curtidas.** Excluir um canal "porque ele é estranho" depois de ver que ele piora a métrica é ajustar a base ao modelo.
+3. **Gastar o search.list para listar vídeos.** São 100 chamadas por dia e no máximo 500 vídeos por canal. Vídeos vêm da playlist de uploads (aula 1.5).
+4. **Confiar em `snippet.country` como filtro.** O campo é opcional. Faça a checagem de idioma e país com os olhos.
+5. **Não registrar os excluídos.** Sem eles, ninguém consegue avaliar o que a base deixou de fora, inclusive você daqui a três semanas.
+:::
+
+<Quiz
+  id="m1-a4"
+  perguntas={[
+    {
+      pergunta: 'Sua base de beleza tem 25 canais, todos com mais de 1 milhão de inscritos. Qual é o principal problema para prever os Shorts da Lumina?',
+      opcoes: [
+        {texto: 'Nenhum: canais grandes têm mais dados, então o modelo fica melhor para todos.', explicacao: 'Mais dados de uma população não tornam o modelo confiável em outra; a Lumina está fora da faixa observada.'},
+        {texto: 'A previsão para um canal de 180 mil inscritos é uma extrapolação: o modelo nunca viu um canal desse porte.', correta: true, explicacao: 'A faixa de tamanho da Lumina está vazia na base; o número sai, mas sem respaldo nos dados.'},
+        {texto: 'O modelo vai dar erro de execução para canais pequenos.', explicacao: 'Modelos não falham ao extrapolar; eles devolvem um número com confiança que não merecem. Esse é o perigo.'},
+      ],
+    },
+    {
+      pergunta: 'Qual forma de descoberta tende a **reforçar** o viés de sobrevivência?',
+      opcoes: [
+        {texto: 'Resolver handles citados em descrições de canais médios.', explicacao: 'Citações e colabs costumam revelar canais menores, fora das listas de "top".'},
+        {texto: 'Usar só rankings de "maiores canais de beleza".', correta: true, explicacao: 'Rankings contêm apenas quem deu certo e, por construção, os maiores.'},
+        {texto: 'Ler as seções multipleChannels de canais pequenos.', explicacao: 'Canais pequenos recomendam canais do seu círculo, frequentemente também pequenos ou médios.'},
+      ],
+    },
+    {
+      pergunta: 'Você tem 90 handles e quer os channel IDs, os inscritos e a playlist de uploads. Quanto isso custa, e depois, para atualizar os mesmos 90 canais?',
+      opcoes: [
+        {texto: '90 unidades para resolver e 2 unidades para atualizar por ID.', correta: true, explicacao: 'forHandle aceita um handle por chamada (90 × 1); por ID, channels.list aceita até 50 por chamada (2 chamadas).'},
+        {texto: '2 unidades para resolver e 90 para atualizar.', explicacao: 'É o contrário: forHandle não aceita lista, e id aceita até 50 IDs.'},
+        {texto: '9.000 unidades, porque cada canal custa 100.', explicacao: 'channels.list custa 1 unidade por chamada. O custo de 100 unidades era o do search.list antes de 01/06/2026.'},
+      ],
+    },
+    {
+      pergunta: 'Um canal de moda publica 5 Shorts por dia e tem 3 mil Shorts, mais do que 20 outros canais juntos. O que fazer? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Aplicar um teto de Shorts por canal (por exemplo, os 400 mais recentes).', correta: true, explicacao: 'Evita que o modelo aprenda aquele canal em vez de aprender o setor.'},
+        {texto: 'Registrar o teto no data card.', correta: true, explicacao: 'Quem ler a base precisa saber que os canais prolíficos foram limitados.'},
+        {texto: 'Excluir o canal porque ele atrapalha a métrica.', explicacao: 'Excluir por efeito na métrica é ajustar a base ao modelo; o teto resolve o desequilíbrio sem perder o canal.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: monte a sua planilha de curadoria]
+1. Reúna **pelo menos 90 handles candidatos** em `candidatos.csv`, com uma coluna `fonte` (lista manual, colab, destaque, busca). Pelo menos um terço precisa vir de fontes que não sejam rankings ou busca.
+2. Rode `curadoria.py` e resolva os handles.
+3. Aplique os critérios da tabela desta aula, preenchendo `incluido` e `motivo` para **todos** os candidatos.
+4. Gere a tabela cruzada setor × faixa de inscritos dos incluídos. Identifique a célula mais fraca e busque mais cinco candidatos para ela.
+5. Escreva, em três linhas, qual população a sua base representa e qual ela não representa.
+:::
+
+<details>
+<summary>Ver dicas e um exemplo de resultado</summary>
+
+- **Onde achar handles de marcas brasileiras:** site oficial (rodapé), perfil no Instagram (link na bio), página "Sobre" de lojas on-line. Muitas marcas usam o mesmo nome de usuário em todas as redes.
+- **Não encontrou pelo handle?** Tente sem o `@`, confira a grafia na URL do canal e, se ainda falhar, use uma das suas chamadas diárias de `search.list` com `type="channel"`.
+- **Idioma:** abra três Shorts recentes de cada canal. Se dois estiverem em outra língua, exclua com o motivo "idioma".
+
+Um resultado típico: 94 candidatos, 71 incluídos. Exclusões: 9 com menos de 30 Shorts, 6 inativos há mais de 90 dias, 4 com curtidas ocultas, 3 de cortes/reuploads, 1 handle não encontrado. Célula mais fraca: "automotivo × até 10 mil".
+
+> *A base representa canais brasileiros ativos em 2026, de beleza, moda e automotivo, com pelo menos 30 Shorts. Não representa canais inativos, canais que ocultam curtidas nem canais muito pequenos do setor automotivo.*
+
+</details>
+
+---
+
+## Resumo
+
+- A curadoria define a **população** da base; o modelo só é confiável dentro dela.
+- Critérios **escritos antes**: setor, idioma/país, atividade, histórico, curtidas e inscritos visíveis, exclusão de reuploads e conteúdo infantil.
+- **Estratifique** por setor, faixa de inscritos e tipo de canal, e limite o número de Shorts por canal.
+- **Viés de sobrevivência**: rankings e buscas trazem quem deu certo; inclua medianos e pequenos de propósito e registre a **fonte** de cada canal.
+- Descubra canais com **handles** (`forHandle`, 1 unidade), **colabs** e **channelSections**; use o `search.list` (100 chamadas/dia) com parcimônia.
+
+## Referências
+
+- Google. [`channels.list`](https://developers.google.com/youtube/v3/docs/channels/list): parâmetros `forHandle` e `id`; e o recurso [`channels`](https://developers.google.com/youtube/v3/docs/channels) (campos `country`, `subscriberCount`, `hiddenSubscriberCount`).
+- Google. [`channelSections.list`](https://developers.google.com/youtube/v3/docs/channelSections/list) e [`search.list`](https://developers.google.com/youtube/v3/docs/search/list).
+- Google. [Revision History da YouTube Data API](https://developers.google.com/youtube/v3/revision_history): `forHandle` (31/01/2024), arredondamento de inscritos (10/09/2019) e bucket do `search.list` (01/06/2026).
+- YouTube Help. [Saiba mais sobre os identificadores (handles) do YouTube](https://support.google.com/youtube/answer/11585688).
+- Gebru et al. [*Datasheets for Datasets*](https://arxiv.org/abs/1803.09010). arXiv:1803.09010. Seção sobre o processo de coleta e amostragem.
+
+**Próxima aula:** [Construindo o coletor com a YouTube Data API](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor): da planilha de canais a uma base de Shorts idempotente, com snapshots, retries e contador de cota.

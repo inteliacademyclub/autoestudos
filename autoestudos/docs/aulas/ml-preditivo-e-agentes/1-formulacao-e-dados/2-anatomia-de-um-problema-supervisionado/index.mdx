@@ -1,0 +1,384 @@
+---
+sidebar_position: 2
+sidebar_label: 'Anatomia de um problema supervisionado'
+title: 'Anatomia de um problema supervisionado'
+description: 'Features, alvo e função de perda; treino, validação e teste; overfitting, underfitting e o dilema viés-variância, com o futuro como o único "dado nunca visto" que importa.'
+tags: [ml-preditivo, formulacao, fundamentos]
+---
+
+# Anatomia de um Problema Supervisionado: Features, Alvo, Perda e o Futuro
+
+<LessonMeta
+  tempo="45 min"
+  semana={1}
+  etapa={['dados', 'modelo']}
+  objetivos={[
+    'Identificar as peças de um problema supervisionado (unidade, features, alvo, modelo e perda) no case Galaxies',
+    'Comparar MSE, MAE e Huber e prever como cada uma reage a um viral',
+    'Explicar os papéis de treino, validação e teste e por que o teste é usado uma vez só',
+    'Diagnosticar underfitting e overfitting a partir das curvas de erro de treino e de validação',
+    'Justificar por que, neste projeto, "dados nunca vistos" significa dados do futuro',
+  ]}
+  prerequisitos={[
+    {label: 'Do LLM ao modelo preditivo', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/do-llm-ao-modelo-preditivo'},
+  ]}
+/>
+
+Você treina uma árvore de decisão nos Shorts da sua base e mede o erro nos mesmos Shorts: quase zero. O modelo "acerta" as curtidas de todos os vídeos que viu. Animado, você pede a ele a previsão para os Shorts publicados no mês seguinte, e o erro fica **maior do que o de uma árvore com três perguntas**.
+
+Esse paradoxo, o modelo que melhor explica o passado ser um dos piores para o futuro, é a coisa mais importante que você precisa internalizar antes de coletar um único dado. Ele decide como você vai separar a base, qual métrica vai reportar e quanto vai confiar no número que o agente entrega para a Lumina.
+
+Nesta aula, você vai desmontar um problema supervisionado peça por peça e, no fim, ver o paradoxo acontecer num código de 30 linhas.
+
+:::info[A ideia central]
+Um problema supervisionado tem cinco peças: a **unidade** (o que é uma linha), as **features** $$x$$ (o que se sabe antes), o **alvo** $$y$$ (o que se quer prever), o **modelo** $$f$$ e a **função de perda** (o que conta como errar). Treinar é escolher $$f$$ que minimiza a perda **no treino**; avaliar é medir o erro em dados que o treino não tocou. No case Galaxies, esses dados são **Shorts publicados depois** dos que você usou para treinar.
+:::
+
+:::info[Ambiente deste módulo]
+Todo o código do módulo 1 roda em Python 3.12 com estas versões (as mesmas do venv em que os trechos foram testados):
+
+```bash
+uv init galaxies --python 3.12
+cd galaxies
+uv add pandas==3.0.6 numpy==2.5.3 scipy==1.18.1 scikit-learn==1.9.1 \
+  pyarrow==25.0.1 duckdb==1.5.5 google-api-python-client==2.200.0 \
+  isodate==0.7.2 tenacity==9.1.4 pydantic==2.13.5 pandera==0.33.1
+uv add --dev pytest==9.1.1
+```
+
+Rode os trechos com `uv run python arquivo.py` e os testes com `uv run pytest`. A chave da YouTube Data API entra por variável de ambiente (`YOUTUBE_API_KEY`), nunca no código.
+:::
+
+---
+
+## As cinco peças
+
+Um conjunto de dados supervisionado é uma tabela de pares $$(x_i, y_i)$$. Antes de escrever qualquer linha de código, você precisa conseguir preencher esta tabela para o seu projeto:
+
+| Peça | Pergunta que ela responde | No case Galaxies |
+| :--- | :--- | :--- |
+| **Unidade** | O que é uma linha? | Um Short de um canal com histórico |
+| **Features** ($$x$$) | O que se sabe **antes** de publicar? | Histórico do canal, duração, horário planejado, legenda, atributos do vídeo |
+| **Alvo** ($$y$$) | O que se quer prever? | $$\log(1+\text{curtidas})$$ ou o alvo relativo ao canal, medido com 30+ dias |
+| **Modelo** ($$f$$) | Que família de funções liga $$x$$ a $$y$$? | Gradient boosting (módulo 3) |
+| **Perda** ($$L$$) | O que conta como errar, e quanto? | Quadrática, absoluta ou Huber, em escala log |
+
+Duas observações sobre essa tabela.
+
+Primeiro, a coluna das <Termo id="feature">features</Termo> tem uma regra que não se negocia: tudo precisa existir **no instante da previsão**. Se a informação só aparece depois da publicação (views, comentários, inscritos ganhos), ela pode ser alvo, nunca feature. Você viu isso na [aula anterior](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/do-llm-ao-modelo-preditivo) e vai ver de novo, com mais detalhe, em [Vazamento de dados](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados).
+
+Segundo, o <Termo id="alvo">alvo</Termo> não é "curtidas" cru. Curtidas variam de dezenas a centenas de milhares entre canais, e um erro de 1.000 curtidas é enorme para um canal pequeno e irrelevante para um grande. Por isso a trilha trabalha em escala log e, de preferência, relativa ao canal. A justificativa completa está em [Engajamento é cauda longa](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa).
+
+---
+
+## A função de perda: o que significa errar
+
+O modelo não sabe o que você quer. Ele só sabe minimizar um número, a **perda**, calculada a partir dos resíduos $$r_i = y_i - \hat{y}_i$$. As três perdas que você vai encontrar em regressão:
+
+- **MSE** (erro quadrático médio): $$\frac{1}{n}\sum_i r_i^2$$. Erros grandes pesam muito, porque são elevados ao quadrado.
+- **MAE** (erro absoluto médio): $$\frac{1}{n}\sum_i |r_i|$$. Todo erro pesa proporcionalmente ao seu tamanho.
+- **Huber**: quadrática para resíduos pequenos e linear para os grandes, com um limiar $$\delta$$:
+
+$$
+L_\delta(r) =
+\begin{cases}
+\tfrac{1}{2} r^2 & \text{se } |r| \le \delta \\
+\delta \left(|r| - \tfrac{1}{2}\delta\right) & \text{caso contrário}
+\end{cases}
+$$
+
+A melhor forma de sentir a diferença é perguntar: **se o modelo só pudesse prever um número constante, qual número cada perda escolheria?** A resposta é um resultado clássico: a MSE escolhe a **média**, a <Termo id="mae">MAE</Termo> escolhe a **mediana**, e a Huber fica entre as duas, mais perto da mediana quando $$\delta$$ é pequeno. O trecho abaixo confere isso com os Shorts de um canal que teve um viral:
+
+```python
+import numpy as np
+
+# curtidas de 9 Shorts de um canal: 8 "normais" e 1 viral
+curtidas = np.array([900, 1100, 1300, 1500, 1800, 2100, 2400, 2900, 48000])
+
+def mse(c):
+    return np.mean((curtidas - c) ** 2)
+
+def mae(c):
+    return np.mean(np.abs(curtidas - c))
+
+def huber(c, delta=1000):
+    r = np.abs(curtidas - c)
+    return np.mean(np.where(r <= delta, 0.5 * r**2, delta * (r - 0.5 * delta)))
+
+# qual previsão constante minimiza cada perda? (busca em grade)
+grade = np.arange(0, 20001, 10)
+for nome, perda in [("MSE", mse), ("MAE", mae), ("Huber", huber)]:
+    melhor = grade[np.argmin([perda(c) for c in grade])]
+    print(f"{nome:>5}: melhor constante = {melhor:>6}")
+print(f"média = {curtidas.mean():.0f} | mediana = {np.median(curtidas):.0f}")
+
+# saída:
+#   MSE: melhor constante =   6890
+#   MAE: melhor constante =   1800
+# Huber: melhor constante =   1870
+# média = 6889 | mediana = 1800
+```
+
+Um único viral puxou a "melhor previsão" da MSE para 6.890 curtidas, um valor que **nenhum** dos nove Shorts teve e que erra oito deles por mais de 4.000. A MAE e a Huber ficaram perto do Short típico. É por isso que a perda precisa ser escolhida junto com a escala do alvo:
+
+| Perda | Vantagem | Risco neste projeto | Quando usar |
+| :--- | :--- | :--- | :--- |
+| MSE | Suave, padrão de quase toda biblioteca | Persegue virais; em escala bruta, o canal grande domina | Em escala log, como ponto de partida |
+| MAE | Robusta a outliers | Gradiente constante: treina mais devagar em boosting | Quando o viral é ruído, não sinal |
+| Huber | Robusta **e** suave perto do zero | Mais um hiperparâmetro ($$\delta$$) | Bom padrão em escala log; foi a escolha do vencedor da trilha de vídeo do SMP Challenge 2025 |
+
+Duas notas práticas. Em escala log, um resíduo de 0,5 significa errar por um fator de $$e^{0,5} \approx 1{,}65$$, seja o canal pequeno ou grande; a transformação já faz boa parte do trabalho de "robustez". E a perda de **treino** não precisa ser a métrica de **avaliação**: você pode treinar com Huber e reportar Spearman e acurácia par-a-par, que é o que a Galaxies quer ver. Isso é assunto de [Métricas de erro e de ordenação](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao). No LightGBM, as três perdas são `objective="regression"`, `"regression_l1"` e `"huber"` (com `alpha` fazendo o papel de $$\delta$$).
+
+---
+
+## Treino, validação e teste: três papéis diferentes
+
+Com a perda definida, treinar é só otimização. O difícil é **saber se o resultado presta**. Para isso, a base é dividida em três partes, cada uma com um papel:
+
+- **Treino**: o modelo ajusta os parâmetros aqui (os limiares das árvores, os pesos). Ele "vê" as respostas.
+- **Validação**: você usa para **tomar decisões**: profundidade da árvore, quais features entram, quando parar de treinar. O modelo não treina nela, mas **você** olha para ela muitas vezes.
+- **Teste**: medido **uma vez**, no fim, para reportar o número que vai no README. Se você volta e muda o modelo porque o teste ficou ruim, o teste virou validação e você perdeu sua régua honesta.
+
+A analogia do vestibular ajuda. O treino são os exercícios resolvidos da apostila; a validação, os simulados que você usa para decidir o que estudar; o teste, a prova de verdade. Um aluno que decorou as respostas dos simulados tira 10 neles e não aprendeu nada. Um modelo também.
+
+Não existe proporção mágica (70/15/15, 80/10/10). O que existe é uma restrição: o teste precisa ser grande o bastante para que a métrica não oscile demais por acaso, e a validação precisa refletir a situação real de uso. Neste projeto, as duas coisas apontam para o mesmo lugar: o **período mais recente** da base.
+
+---
+
+## Generalização: underfitting, overfitting e o dilema viés-variância
+
+**Generalizar** é errar pouco em dados que não participaram do treino. Os dois jeitos de falhar têm nome:
+
+- **Underfitting**: o modelo é simples demais para o padrão. Erra muito no treino **e** na validação. Uma reta tentando seguir uma curva.
+- <Termo id="overfitting">**Overfitting**</Termo>: o modelo é flexível demais e aprende o **ruído** da amostra de treino como se fosse padrão. Erra pouco no treino e muito na validação.
+
+<Sketch name="m1/bias-variance" alt="Três painéis com os mesmos pontos de treino: uma reta que ignora a curva (underfitting), uma curva suave que segue o padrão (na medida) e uma linha em zigue-zague que passa por todos os pontos (overfitting). Abaixo, um gráfico do erro por profundidade da árvore: o erro de treino cai sempre até zero; o erro de validação cai até a profundidade 6 e depois sobe, em forma de U, acima de uma linha tracejada de ruído irredutível em 0,36." caption="Os números do gráfico de baixo são a saída do código desta aula." />
+
+A teoria por trás do desenho é a decomposição **viés-variância**. Para um ponto $$x$$ e um modelo $$\hat f$$ treinado numa amostra aleatória, o erro quadrático esperado se divide em três partes:
+
+$$
+\mathbb{E}\big[(y - \hat f(x))^2\big] = \underbrace{\text{Viés}\big[\hat f(x)\big]^2}_{\text{simples demais}} + \underbrace{\text{Var}\big[\hat f(x)\big]}_{\text{sensível à amostra}} + \underbrace{\sigma^2}_{\text{ruído irredutível}}
+$$
+
+- **Viés** é o erro sistemático: mesmo com infinitas amostras, uma reta não vira curva.
+- **Variância** é quanto o modelo mudaria se você o treinasse com outra amostra do mesmo mundo. Uma árvore profunda treinada em outros 3 mil Shorts teria folhas completamente diferentes.
+- **Ruído irredutível** ($$\sigma^2$$) é o que nenhuma feature explica: o humor do algoritmo naquele dia, um compartilhamento por acaso. Nenhum modelo passa abaixo dele.
+
+Aumentar a complexidade troca viés por variância. O ponto ótimo fica no meio, e **só a validação mostra onde ele está**, porque o erro de treino cai sempre. No case Galaxies, o ruído irredutível é grande: dois Shorts quase idênticos do mesmo canal podem ter curtidas bem diferentes. Por isso a literatura fala em acertar a **ordenação** (Spearman de 0,55 a 0,85) e não o número exato.
+
+---
+
+## Por que "dados nunca vistos" é o futuro
+
+A teoria clássica de validação supõe que os dados são **i.i.d.**: cada linha é sorteada, de forma independente, da mesma distribuição. Sob essa hipótese, sortear 20% das linhas para validação é honesto.
+
+Shorts não são i.i.d. no tempo. Canais crescem, formatos entram e saem de moda, o algoritmo muda, e a própria contagem de métricas mudou duas vezes desde 2025 (você verá isso em [O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente)). E o uso real do modelo é sempre o mesmo: prever um Short que **ainda não foi publicado**, a partir do que aconteceu **antes**.
+
+<Sketch name="m1/split-no-tempo" alt="Duas linhas de quadrados ordenados por data de publicação. No split aleatório, quadrados de treino, validação e teste aparecem misturados ao longo do tempo, e uma nota em vermelho diz que o treino enxerga posts publicados depois dos de teste. No split temporal, o treino ocupa o passado, a validação o meio e o teste o período mais recente, seguido de uma caixa 'produção: próximo Short'." caption="O split temporal simula a situação real de uso: treinar no passado e prever o futuro." />
+
+Com um split aleatório, o modelo treina com posts de novembro e é avaliado em posts de agosto do mesmo canal. Ele "sabe" que o canal cresceu, que um formato explodiu, que houve um viral na semana seguinte. A métrica fica otimista e você só descobre isso quando a Lumina usar o agente. O <Termo id="split-temporal">split temporal</Termo> fecha essa porta: treino no passado, validação no meio, teste no fim. Variações mais robustas, como o <Termo id="walk-forward">walk-forward</Termo> e o split por canal, são o assunto de [Validação temporal e por canal](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal).
+
+---
+
+## Na prática: o paradoxo em 30 linhas
+
+O código abaixo gera uma base **sintética** com efeitos conhecidos (tamanho do canal, um efeito não linear do gancho, duração) e ruído com desvio 0,6, ou seja, $$\sigma^2 = 0{,}36$$. Depois treina árvores de profundidade crescente, com validação nos 20% **mais recentes**:
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+from sklearn.tree import DecisionTreeRegressor
+
+rng = np.random.default_rng(42)
+n = 3000
+
+# Base sintética com efeitos conhecidos (NÃO são dados reais)
+df = pd.DataFrame({
+    "dia": np.sort(rng.integers(0, 540, n)),            # dia de publicação
+    "log_inscritos": rng.normal(11.5, 1.2, n),          # ~100 mil inscritos
+    "gancho": rng.integers(0, 11, n),                   # nota 0-10
+    "duracao_s": rng.integers(8, 180, n),
+})
+sinal = (
+    0.8 * df["log_inscritos"]
+    + 0.25 * np.sin(df["gancho"] / 2)                   # efeito não linear
+    - 0.004 * df["duracao_s"]
+)
+df["y"] = sinal + rng.normal(0, 0.6, n)                 # y = log1p(curtidas)
+
+X = df[["log_inscritos", "gancho", "duracao_s"]]
+y = df["y"]
+
+# "Nunca visto" = futuro: treino no passado, validação nos últimos 20%
+corte = df["dia"].quantile(0.8)
+tr, va = df["dia"] <= corte, df["dia"] > corte
+
+print("prof.  MSE treino  MSE validação")
+for prof in [1, 2, 3, 4, 6, 8, 12, 16, None]:
+    m = DecisionTreeRegressor(max_depth=prof, random_state=0)
+    m.fit(X[tr], y[tr])
+    mse_tr = mean_squared_error(y[tr], m.predict(X[tr]))
+    mse_va = mean_squared_error(y[va], m.predict(X[va]))
+    print(f"{str(prof):>5}  {mse_tr:10.3f}  {mse_va:13.3f}")
+```
+
+```text
+prof.  MSE treino  MSE validação
+    1       0.782          0.747
+    2       0.524          0.574
+    3       0.454          0.474
+    4       0.403          0.465
+    6       0.332          0.430
+    8       0.268          0.500
+   12       0.098          0.626
+   16       0.016          0.709
+ None       0.000          0.731
+```
+
+Leia a tabela de cima para baixo:
+
+1. **Profundidade 1 a 3**: os dois erros são altos e parecidos. É underfitting: o modelo não tem perguntas suficientes para capturar o efeito do canal e do gancho.
+2. **Profundidade 6**: o melhor erro de validação (0,430), ainda acima do ruído irredutível de 0,36, como a teoria prevê.
+3. **Sem limite**: erro de treino **zero**. A árvore criou uma folha para cada Short e decorou o ruído. O erro de validação é quase o mesmo da árvore de uma pergunta só.
+
+A última linha é o paradoxo do começo da aula, agora com números. Nenhuma métrica de treino teria avisado.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Traduzindo as cinco peças para a decisão da Lumina:
+
+- **Unidade**: cada Short (A ou B) é uma linha. O agente vai pontuar as duas linhas separadamente e depois compará-las.
+- **Features**: o histórico do canal é **idêntico** para A e B (mesma marca, mesma semana). Tudo o que o modelo usar para diferenciar os dois precisa vir do conteúdo e do contexto de publicação: duração (55 s vs. 22 s), formato, gancho, texto na tela, dia e hora planejados. Se o seu modelo só tiver features de canal, ele vai dar **o mesmo número** para A e B, e isso é um diagnóstico útil, não um bug.
+- **Alvo e perda**: com alvo em escala log e perda Huber, um erro de 0,3 significa errar por cerca de 35% para mais ou para menos, tanto para a Lumina (mediana de 2.300 curtidas) quanto para um canal de 20 mil inscritos.
+- **Overfitting**: imagine um canal parecido com a Lumina na sua base, com uns 150 Shorts. Um modelo profundo pode aprender que "os tutoriais desse canal em março de 2026 foram mal" e punir qualquer tutorial parecido, como o Short A, quando o que aconteceu em março foi outra coisa. A validação temporal é o que denuncia esse tipo de regra decorada.
+- **Futuro**: A e B serão publicados **depois** de tudo o que está na sua base. Um modelo avaliado com split aleatório promete uma precisão que ele não vai ter nessa decisão.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Reportar o erro de treino.** Ele só mede memória. O número que importa vem de dados que o treino não tocou.
+2. **Olhar o teste várias vezes.** Cada ajuste feito "porque o teste piorou" transforma o teste em validação. Separe o período de teste no dia 1 e só abra no fim.
+3. **Escolher a perda pelo nome da biblioteca.** `objective="regression"` é MSE. Com curtidas em escala bruta, ela persegue virais e o canal grande domina.
+4. **Sortear linhas para validar.** Split aleatório em dados temporais é otimista por construção. Ordene por `published_at` antes de cortar.
+5. **Achar que dá para bater o ruído.** Se o erro de validação estiver abaixo do que parece plausível para o problema, desconfie de vazamento antes de comemorar.
+:::
+
+<Quiz
+  id="m1-a2"
+  perguntas={[
+    {
+      pergunta: 'Um canal teve 8 Shorts com cerca de 1.500 curtidas e 1 viral com 48 mil. Se o modelo só pudesse prever uma constante, qual perda levaria a uma previsão perto de 1.800?',
+      opcoes: [
+        {texto: 'MSE', explicacao: 'A constante que minimiza a MSE é a média, puxada pelo viral para perto de 6.900.'},
+        {texto: 'MAE', correta: true, explicacao: 'A constante que minimiza a MAE é a mediana, que ignora o tamanho do viral.'},
+        {texto: 'Qualquer perda dá o mesmo resultado, porque a constante é a mesma para todos.', explicacao: 'Cada perda define "o melhor número" de um jeito diferente: média, mediana ou algo entre elas.'},
+      ],
+    },
+    {
+      pergunta: 'Seu modelo tem MSE de treino 0,02 e MSE de validação 0,71. Uma versão mais simples tem 0,40 e 0,46. O que isso indica?',
+      opcoes: [
+        {texto: 'O primeiro modelo é melhor, porque erra muito menos.', explicacao: 'Ele erra menos só nos dados que já viu. Na validação, que simula o uso real, é bem pior.'},
+        {texto: 'O primeiro modelo está em overfitting; o segundo generaliza melhor.', correta: true, explicacao: 'Erro de treino muito baixo com validação alta é a assinatura clássica de variância alta.'},
+        {texto: 'Os dois estão em underfitting.', explicacao: 'Underfitting aparece como erro alto no treino e na validação ao mesmo tempo, o que não é o caso do primeiro.'},
+      ],
+    },
+    {
+      pergunta: 'Você ajustou a profundidade da árvore olhando o conjunto de teste até ele ficar bom. O que aconteceu?',
+      opcoes: [
+        {texto: 'Nada: o modelo não treinou no teste, então o número continua honesto.', explicacao: 'O modelo não treinou, mas você tomou decisões com base nele. A métrica de teste ficou otimista.'},
+        {texto: 'O teste virou validação e você precisa de um novo período, nunca usado, para reportar o resultado.', correta: true, explicacao: 'Exato. O teste só é honesto se for consultado uma vez, depois de todas as decisões.'},
+        {texto: 'O modelo entrou em underfitting.', explicacao: 'O problema não é a capacidade do modelo, e sim o uso indevido do teste para tomar decisões.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o split aleatório tende a superestimar a qualidade do modelo neste projeto? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Porque o treino inclui posts publicados depois dos posts de validação do mesmo canal.', correta: true, explicacao: 'O modelo aprende sobre o "futuro" do canal (crescimento, virais) e usa isso para acertar o "passado".'},
+        {texto: 'Porque canais crescem e tendências mudam: os dados não são i.i.d. no tempo.', correta: true, explicacao: 'Com mudança de distribuição ao longo do tempo, sortear linhas mistura regimes diferentes no treino e na validação.'},
+        {texto: 'Porque o split aleatório sempre deixa menos dados para o treino.', explicacao: 'As proporções podem ser as mesmas nos dois casos. O problema é quais linhas vão para cada lado, não quantas.'},
+        {texto: 'Porque o uso real é prever Shorts ainda não publicados, e o split aleatório não simula isso.', correta: true, explicacao: 'A validação precisa imitar a situação de uso. Aqui, a situação de uso é sempre o futuro.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: faça o split aleatório mentir]
+Pegue o código da seção "Na prática" e adicione um **drift**: faça o alvo crescer com o tempo, como um canal que ganha público, somando `0.002 * df["dia"]` ao `y`. Depois, com uma árvore de profundidade 6, compare o MSE de validação em dois cenários:
+
+1. validação nos 20% mais recentes (temporal);
+2. validação em 20% sorteados com `train_test_split`.
+
+Antes de rodar, escreva qual dos dois você espera que seja menor, e por quê. Depois, explique em duas frases qual deles você reportaria para a Galaxies.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeRegressor
+
+rng = np.random.default_rng(42)
+n = 3000
+df = pd.DataFrame({
+    "dia": np.sort(rng.integers(0, 540, n)),
+    "log_inscritos": rng.normal(11.5, 1.2, n),
+    "gancho": rng.integers(0, 11, n),
+    "duracao_s": rng.integers(8, 180, n),
+})
+sinal = 0.8 * df["log_inscritos"] + 0.25 * np.sin(df["gancho"] / 2) - 0.004 * df["duracao_s"]
+df["y"] = sinal + 0.002 * df["dia"] + rng.normal(0, 0.6, n)   # drift: +1,08 em 540 dias
+X, y = df[["log_inscritos", "gancho", "duracao_s"]], df["y"]
+
+def avaliar(tr, va):
+    m = DecisionTreeRegressor(max_depth=6, random_state=0).fit(X[tr], y[tr])
+    return mean_squared_error(y[va], m.predict(X[va]))
+
+corte = df["dia"].quantile(0.8)
+temporal = avaliar(df["dia"] <= corte, df["dia"] > corte)
+idx_tr, idx_va = train_test_split(df.index, test_size=0.2, random_state=0)
+aleatorio = avaliar(df.index.isin(idx_tr), df.index.isin(idx_va))
+print(f"MSE validação  aleatório: {aleatorio:.3f} | temporal: {temporal:.3f}")
+# MSE validação  aleatório: 0.567 | temporal: 0.710
+```
+
+O split aleatório parece cerca de 20% melhor. Ele mistura dias antigos e recentes nos dois lados, então o modelo "já viu" o nível atual do alvo. No split temporal, o período de validação tem um nível que o treino nunca viu, e árvores não extrapolam tendência. O número honesto para a Galaxies é o **temporal**: é o que acontece quando a Lumina pede uma previsão para um Short da semana que vem.
+
+</details>
+
+---
+
+## Resumo
+
+- Um problema supervisionado tem cinco peças: **unidade**, **features** (só o que existe antes), **alvo**, **modelo** e **função de perda**.
+- **MSE** persegue a média e os virais; **MAE** fica na mediana; **Huber** combina robustez e suavidade e é um bom padrão em escala log.
+- **Treino** ajusta, **validação** decide, **teste** mede uma vez. Olhar o teste para decidir destrói a régua.
+- O erro total se decompõe em **viés**, **variância** e **ruído irredutível**; o ponto ótimo de complexidade só aparece na validação.
+- Neste projeto, "nunca visto" significa **futuro**: valide com split temporal.
+
+## Referências
+
+- James, Witten, Hastie, Tibshirani e Taylor. [*An Introduction to Statistical Learning* (com Python)](https://www.statlearning.com/). Capítulo 2, sobre o dilema viés-variância; edição gratuita on-line.
+- scikit-learn. [*Underfitting vs. Overfitting*](https://scikit-learn.org/stable/auto_examples/model_selection/plot_underfitting_overfitting.html) e [*Validation curves*](https://scikit-learn.org/stable/modules/learning_curve.html).
+- Google. [*Datasets, generalization, and overfitting*](https://developers.google.com/machine-learning/crash-course/overfitting). Machine Learning Crash Course.
+- scikit-learn. [`HuberRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.HuberRegressor.html): definição da perda Huber usada na biblioteca.
+- Ye et al. [*MVP: Winning Solution to SMP Challenge 2025 Video Track*](https://arxiv.org/abs/2507.00950). arXiv:2507.00950. Usa CatBoost com perda Huber.
+
+**Próxima aula:** [Fontes de dados e o plano da sua base](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/fontes-de-dados-e-plano-da-base): de onde vêm os Shorts que você vai usar, o que cada fonte representa, e por que começar a coletar hoje.

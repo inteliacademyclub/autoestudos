@@ -1,0 +1,335 @@
+---
+sidebar_position: 7
+sidebar_label: 'O tempo mente'
+title: 'O tempo mente'
+description: 'Maturação das métricas e a regra dos 30 dias, as mudanças na contagem de views como quebras de regime, os inscritos como foto do dia da coleta, drift, sazonalidade e as variáveis de tempo que toda base precisa carregar.'
+tags: [ml-preditivo, dados, tempo, drift]
+---
+
+# O Tempo Mente: Maturação, Quebras de Regime e a Foto do Dia da Coleta
+
+<LessonMeta
+  tempo="45 min"
+  semana={1}
+  etapa="dados"
+  objetivos={[
+    'Justificar a idade mínima do rótulo e medir a maturação das curtidas na sua própria base',
+    'Identificar as mudanças de contagem de views como quebras de regime e justificar curtidas como alvo',
+    'Reconhecer que inscritos e estatísticas do canal são uma foto do dia da coleta e escolher alternativas',
+    'Distinguir drift de sazonalidade e anotar idade, regime e horário local em cada linha',
+  ]}
+  prerequisitos={[
+    {label: 'Construindo o coletor', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor'},
+    {label: 'Engajamento é cauda longa', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa'},
+  ]}
+/>
+
+Dois Shorts do mesmo canal de beleza estão lado a lado na sua base. O primeiro, publicado em março de 2025, tem 40 mil views. O segundo, de setembro de 2026, tem 90 mil. O segundo foi melhor?
+
+Não dá para saber. O primeiro teve as views contadas por **duas regras diferentes** dentro do seu primeiro mês de vida, e o segundo por uma **terceira**. O segundo tem 17 dias e ainda está crescendo; o primeiro tem mais de um ano. E se você olhar a coluna de inscritos, verá o mesmo número nas duas linhas: 180 mil, o valor **de hoje**, que não existia quando nenhum dos dois foi publicado.
+
+Todo número da sua base carrega duas datas: a da **publicação** e a da **coleta**. Quando você esquece uma delas, os dados mentem, com toda a aparência de verdade.
+
+:::info[A ideia central]
+Rotule só depois da **maturação** (30 dias ou mais) e meça, na sua base, quanto os Shorts ainda crescem depois disso. Prefira **curtidas** como alvo: a contagem de views mudou em 31/03/2025 e em 24/08/2026, criando **quebras de regime**. Trate inscritos e estatísticas do canal como uma **foto do dia da coleta**: para posts antigos, são informação do futuro. E anote em cada linha a **idade**, o **regime** e o **horário local**.
+:::
+
+---
+
+## Maturação: por que 30 dias
+
+Curtidas se acumulam. Um Short recebe a maior parte do engajamento nos primeiros dias, quando o algoritmo o distribui no feed, mas pode continuar sendo encontrado por semanas ou meses. Comparar as curtidas de um Short de 3 dias com as de um de 300 dias mistura duas coisas diferentes: o desempenho do conteúdo e o tempo que ele teve para acumular.
+
+A literatura mostra que a velocidade de maturação depende da plataforma. Szabo e Huberman observaram que, para prever a popularidade de 30 dias com a mesma precisão, bastavam 2 horas de dados no Digg, mas eram necessários 10 dias no YouTube, porque vídeos do YouTube **continuam sendo encontrados muito depois** da publicação. Esse estudo é de vídeos longos, anterior aos Shorts; ninguém publicou uma curva oficial de maturação de curtidas de Shorts. A regra dos 30 dias da trilha é uma **convenção razoável**, e você deve **verificá-la na sua base**.
+
+O método é simples com os snapshots do coletor: compare dois snapshots do mesmo Short, tirados com algumas semanas de intervalo, e veja quanto ele cresceu em função da idade na primeira coleta. O trecho abaixo faz isso com snapshots **sintéticos**, gerados sob a hipótese de que 80% dos Shorts saturam em dias e 20% são "perenes":
+
+```python
+import numpy as np
+import pandas as pd
+
+# Snapshots SINTÉTICOS de 400 Shorts em duas coletas com 21 dias de intervalo.
+# Na sua base: snaps = con.execute("SELECT * FROM snapshots JOIN videos USING (video_id)").df()
+rng = np.random.default_rng(3)
+n = 400
+pub = pd.Timestamp("2026-09-28", tz="UTC") - pd.to_timedelta(rng.uniform(1, 120, n), unit="D")
+final = np.exp(rng.normal(7.5, 1.0, n))
+# hipótese do simulador: 80% "rápidos" (saturam em dias), 20% "perenes" (seguem crescendo)
+tau = np.where(rng.random(n) < 0.8, rng.uniform(2, 8, n), rng.uniform(30, 90, n))
+snaps = []
+for coleta in [pd.Timestamp("2026-09-28", tz="UTC"), pd.Timestamp("2026-10-19", tz="UTC")]:
+    idade = ((coleta - pub) / pd.Timedelta(days=1)).to_numpy()
+    snaps.append(pd.DataFrame({"video_id": np.arange(n), "published_at": pub, "collected_at": coleta,
+                               "likes": np.round(final * (1 - np.exp(-idade / tau)))}))
+snaps = pd.concat(snaps, ignore_index=True)
+
+# 1) idade de cada snapshot, em dias
+snaps["age_days"] = (snaps["collected_at"] - snaps["published_at"]) / pd.Timedelta(days=1)
+
+# 2) quanto cada vídeo ainda cresceu entre a 1ª e a 2ª coleta, por faixa de idade na 1ª
+par = snaps.sort_values("collected_at").groupby("video_id").agg(
+    idade_1=("age_days", "first"), likes_1=("likes", "first"), likes_2=("likes", "last"))
+par["cresc_pct"] = 100 * (par["likes_2"] / par["likes_1"].clip(lower=1) - 1)
+faixa = pd.cut(par["idade_1"], [0, 7, 14, 30, 60, 120], right=False)
+resumo = par.groupby(faixa, observed=True)["cresc_pct"].agg(
+    mediana="median", p90=lambda s: s.quantile(0.9), frac_mais_10pct=lambda s: (s > 10).mean())
+print(resumo.round(2))
+```
+
+```text
+           mediana     p90  frac_mais_10pct
+idade_1
+[0, 7)      300.99  721.89             0.94
+[7, 14)      23.31  132.42             0.76
+[14, 30)      1.58   50.99             0.18
+[30, 60)      0.05   19.90             0.14
+[60, 120)     0.00    7.30             0.06
+```
+
+Com esta hipótese, a mediana de crescimento depois dos 30 dias é praticamente zero, mas 14% dos Shorts ainda crescem mais de 10% em três semanas. É o padrão que você deve procurar na sua base real: **a mediana diz se a regra é razoável; a cauda diz quanto ruído sobra no rótulo**. Se os seus dados mostrarem crescimento relevante depois dos 30 dias, aumente a idade mínima ou trate a idade do rótulo como variável de controle (a seguir).
+
+### A idade do rótulo não é constante
+
+Na primeira coleta, um Short de junho de 2025 entra com um snapshot aos 470 dias, e um de agosto de 2026 com um aos 35 dias. O coletor usa o **primeiro snapshot com 30 dias ou mais**, mas para os Shorts antigos não existe um snapshot aos 30 dias: você não pode voltar no tempo. Três saídas honestas:
+
+1. **Aceitar e medir**: guarde `age_days` do rótulo, verifique se o erro do modelo depende dela e reporte.
+2. **Controlar**: inclua a idade do rótulo como variável no treino e fixe-a em 30 na hora de prever. Isso é diferente de usar a idade como informação sobre o conteúdo.
+3. **Restringir**: treine só com rótulos entre 30 e, por exemplo, 90 dias. É o mais limpo, mas corta muito a base num projeto de quatro semanas.
+
+Qualquer que seja a escolha, ela vai para o data card.
+
+---
+
+## Quebras de regime: quando a régua muda
+
+Uma **quebra de regime** acontece quando a forma de medir muda, e números de antes e depois deixam de ser comparáveis. A YouTube Data API documentou duas no período da sua base, as duas na contagem de **views**:
+
+- **31/03/2025**: para Shorts, a view passou a ser contada a cada vez que o Short **começa a tocar ou repete**, sem tempo mínimo de exibição. Antes, era preciso assistir alguns segundos.
+- **24/08/2026**: para todos os formatos, incluindo Shorts, a view pública passou a ser contada **no momento em que o vídeo começa a tocar** (inclui autoplay). As métricas "engajadas", usadas para monetização, não mudaram, mas elas não estão no `statistics.viewCount`.
+
+<Sketch name="m1/regimes-do-tempo" alt="Linha do tempo de outubro de 2024 a outubro de 2026. Marcos: 15/10/2024, Shorts de até 3 minutos; 31/03/2025, replays passam a contar como view; 24/08/2026, view contada no primeiro frame; hoje, 27/09/2026. Faixas de regime de views: R0 (view após alguns segundos), R1 (todo play ou replay de Short conta) e R2. Uma faixa verde contínua para curtidas indica que nenhuma mudança de contagem foi anunciada no período. Notas: um Short de março de 2025 tem views contadas com duas regras nos mesmos 30 dias; inscritos e estatísticas do canal são uma foto do dia da coleta." caption="Views mudaram de régua duas vezes; curtidas, nenhuma vez anunciada." />
+
+As consequências para a base:
+
+- **Views não servem de alvo.** Um Short com 50 mil views em R0 e outro com 50 mil em R1 não tiveram o mesmo alcance. O modelo aprenderia a data, não o conteúdo.
+- **Razões com views herdam o problema.** Curtidas/views, uma formulação comum na literatura, muda de escala com a regra do denominador. Uma das críticas ao estudo *Understanding Virality* é justamente usar likes/views como alvo.
+- **Janelas que atravessam a quebra são mistas.** Um Short publicado em 10/03/2025 teve 21 dias em R0 e 9 em R1. Marque essas linhas.
+- **Curtidas são o alvo mais estável.** Nenhuma mudança na contagem de curtidas foi anunciada no histórico de revisões da API nesse período. "Não anunciada" não é garantia; é a melhor evidência disponível, e é por isso que o briefing e a trilha usam curtidas.
+
+Não confunda quebra de regime com as mudanças do **algoritmo** de recomendação, que também afetam curtidas. Essas não mudam a régua; mudam o mundo medido. É **drift**, e tem tratamento próprio.
+
+---
+
+## A foto do dia da coleta: inscritos e estatísticas do canal
+
+O `channels.list` devolve o `subscriberCount` **de hoje**, arredondado para três algarismos significativos. Não existe, na API, o número de inscritos que o canal tinha em março de 2025.
+
+Usar esse número como feature de um post antigo é usar **informação do futuro**, e com um agravante: um Short que viralizou trouxe inscritos. O canal tem mais inscritos **por causa** do viral, e o modelo aprende uma relação de causa invertida: "canais com mais inscritos têm virais". Quanto mais antigo o post, maior a distância entre a foto e a realidade da época.
+
+Alternativas, da mais para a menos recomendada:
+
+| Alternativa | Por que funciona | Limite |
+| :--- | :--- | :--- |
+| **Histórico de curtidas do canal** (mediana dos posts anteriores, número de Shorts anteriores, frequência de publicação) | Calculado com posts publicados **antes**; mede o tamanho efetivo do canal no momento certo | Exige histórico mínimo; é o que o alvo relativo já usa |
+| **Série própria de inscritos**, com um snapshot diário por canal (`channels.list` por ID, 1 unidade a cada 50 canais) | Dá o valor correto para posts publicados **depois** que você começou | Quase não ajuda no treino deste projeto, mas é o desenho certo para o produto |
+| **Inscritos da coleta só como faixa** (estratificação, análise de erros) | Faixas em escala log mudam devagar | Continua sendo informação do futuro; não use como feature de treino sem ablação |
+| **Sites de terceiros com histórico** | Parecem resolver o problema | Em geral obtidos por scraping; conflitam com as políticas da API (aula 1.8) |
+
+A mesma lógica vale para **título, descrição e tags**: a API devolve a versão atual, e um canal pode ter editado o título depois que o Short viralizou. É menos grave, mas é o mesmo tipo de risco. O exercício desta aula transforma essa checagem em código.
+
+---
+
+## Drift e sazonalidade
+
+<Termo id="drift">**Drift**</Termo> é a mudança, ao longo do tempo, da distribuição das features ou da relação entre features e alvo. Exemplos no seu recorte: o limite de duração dos Shorts foi de 60 s para 3 min em outubro de 2024, o que mudou o mix de durações; formatos entram e saem de moda; o algoritmo muda. O drift é a razão de fundo para validar no tempo, e o [conformal adaptativo](/aulas/ml-preditivo-e-agentes/ir-alem/conformal-adaptativo) do módulo 7 lida com ele na incerteza.
+
+**Sazonalidade** é variação que se repete: dia da semana, horário, datas comerciais. No Brasil, beleza e moda têm picos previsíveis, como Dia das Mães, Dia dos Namorados (12 de junho), Black Friday e Natal. A sazonalidade não é um problema; é **informação**, desde que as features que a capturam existam antes da publicação (e existem: a data planejada é conhecida).
+
+Um cuidado prático: a API devolve `publishedAt` em **UTC**. Às 19h de uma quinta em Brasília são 22h UTC. Features de hora e dia da semana precisam ser calculadas no **fuso do público**, ou o modelo vai achar que "22h" é o horário nobre. O trecho abaixo anota idade, rotulabilidade, cruzamento de quebras, regime e horário local:
+
+```python
+import numpy as np
+import pandas as pd
+
+# Mudanças na contagem de VIEWS (revision history da YouTube Data API)
+QUEBRAS = {
+    "replays": pd.Timestamp("2025-03-31", tz="UTC"),     # Shorts: replays passam a contar
+    "1o_frame": pd.Timestamp("2026-08-24", tz="UTC"),    # todos os formatos: view no 1º frame
+}
+FUSO = "America/Sao_Paulo"  # a API devolve UTC; o público (e a Lumina) vivem no horário local
+
+
+def anotar_tempo(df: pd.DataFrame, janela_dias: int = 30) -> pd.DataFrame:
+    df = df.copy()
+    df["age_days"] = (df["collected_at"] - df["published_at"]) / pd.Timedelta(days=1)
+    df["rotulavel"] = df["age_days"] >= janela_dias
+    fim = df["published_at"] + pd.Timedelta(days=janela_dias)
+    for nome, data in QUEBRAS.items():  # a janela de 30 dias atravessa a quebra?
+        df[f"cruza_{nome}"] = (df["published_at"] < data) & (fim > data)
+    df["regime_views"] = np.select(
+        [df["published_at"] < QUEBRAS["replays"], df["published_at"] < QUEBRAS["1o_frame"]],
+        ["R0", "R1"], default="R2")
+    local = df["published_at"].dt.tz_convert(FUSO)
+    df["hora_local"], df["dia_semana"] = local.dt.hour, local.dt.dayofweek  # 0 = segunda
+    return df
+
+
+df = pd.DataFrame({
+    "video_id": ["a", "b", "c", "d"],
+    "published_at": pd.to_datetime(["2025-03-10T17:00:00Z", "2025-11-04T17:00:00Z",
+                                    "2026-08-06T22:00:00Z", "2026-09-10T22:00:00Z"]),
+    "collected_at": pd.Timestamp("2026-09-28T12:00:00Z"),
+})
+cols = ["video_id", "age_days", "rotulavel", "cruza_replays", "cruza_1o_frame",
+        "regime_views", "hora_local", "dia_semana"]
+print(anotar_tempo(df)[cols].round(1).to_string(index=False))
+```
+
+```text
+video_id  age_days  rotulavel  cruza_replays  cruza_1o_frame regime_views  hora_local  dia_semana
+       a     566.8       True           True           False           R0          14           0
+       b     327.8       True          False           False           R1          14           1
+       c      52.6       True          False            True           R1          19           3
+       d      17.6      False          False           False           R2          19           3
+```
+
+O vídeo `a` atravessa a primeira quebra; o `c` atravessa a segunda; o `d` ainda não pode ser rotulado. E repare na hora: o `c` foi publicado às 22h UTC, que são **19h de quinta** em Brasília.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Aqui mora uma sutileza que confunde muita gente: para prever os Shorts **A e B**, os 180 mil inscritos de hoje **são** informação legítima. A e B ainda não foram publicados; a foto de hoje é, para eles, o passado. O problema está no **treino**: os posts históricos usados para ensinar o modelo "viram" inscritos que só existiram depois deles. Um modelo treinado assim aprende uma relação que não vale no momento de uso. Esse descompasso entre treino e uso tem nome, *training-serving skew*, e o jeito mais seguro de evitá-lo é usar a mediana de curtidas dos posts anteriores, que tem o mesmo significado no treino e na previsão.
+
+Outras três consequências para a análise de A e B:
+
+- **Horário:** "terça 14h" e "quinta 19h" são horários de Brasília. Se as features de hora do treino estiverem em UTC, o modelo vai comparar o B com posts das 16h.
+- **Regime:** A e B serão publicados em R2. Se o alvo fosse views, a maior parte do treino estaria em R1 e a previsão sairia de outra escala. Com curtidas, esse problema não existe.
+- **Maturação:** a resposta que a Lumina recebe é sobre as curtidas **aos 30 dias**. Se ela conferir o resultado do B com três dias de publicado, vai achar que o modelo errou para cima.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Rotular Shorts jovens.** Um Short de 5 dias com poucas curtidas não é um fracasso; é um Short de 5 dias. Espere 30 dias ou mais.
+2. **Usar views como alvo.** A régua mudou duas vezes desde 2025. Curtidas são o alvo estável.
+3. **Usar inscritos da coleta como feature de posts antigos.** É informação do futuro, com causalidade invertida nos virais.
+4. **Calcular hora e dia da semana em UTC.** O público vive no horário local; converta para `America/Sao_Paulo` (ou o fuso do seu recorte).
+5. **Ignorar a idade do rótulo.** Rótulos de 35 e de 470 dias não são a mesma medida. Guarde `age_days` e decida o que fazer com ela.
+:::
+
+<Quiz
+  id="m1-a7"
+  perguntas={[
+    {
+      pergunta: 'Por que curtidas são preferíveis a views como alvo nesta base?',
+      opcoes: [
+        {texto: 'Porque curtidas são sempre maiores que views.', explicacao: 'É o contrário, e a escala não é o ponto. O problema é a régua mudar.'},
+        {texto: 'Porque a contagem de views de Shorts mudou em 31/03/2025 e em 24/08/2026, e nenhuma mudança na contagem de curtidas foi anunciada no período.', correta: true, explicacao: 'As mudanças de contagem criam quebras de regime que o modelo confundiria com efeito do conteúdo.'},
+        {texto: 'Porque views não estão disponíveis na YouTube Data API.', explicacao: 'Estão: statistics.viewCount. O problema é a comparabilidade ao longo do tempo.'},
+      ],
+    },
+    {
+      pergunta: 'Você quer usar o número de inscritos do canal como feature no treino. Qual é o risco principal?',
+      opcoes: [
+        {texto: 'O número vem arredondado para três algarismos significativos.', explicacao: 'É uma limitação real, mas pequena. O risco principal é outro.'},
+        {texto: 'O valor é o do dia da coleta: para posts antigos, inclui inscritos ganhos depois (até por causa do próprio post).', correta: true, explicacao: 'É informação do futuro, com causalidade invertida nos virais.'},
+        {texto: 'Canais com mais inscritos sempre têm mais curtidas, então a feature é inútil.', explicacao: 'A feature seria muito preditiva, e justamente por isso o vazamento é perigoso: a métrica melhora por um motivo errado.'},
+      ],
+    },
+    {
+      pergunta: 'Para prever o Short B da Lumina, que ainda não foi publicado, usar os 180 mil inscritos de hoje é vazamento?',
+      opcoes: [
+        {texto: 'Sim, inscritos são sempre vazamento.', explicacao: 'Para um post futuro, o número de hoje é passado. O problema é usar o número de hoje para posts antigos no treino.'},
+        {texto: 'Não para a previsão; o problema está no treino, em que posts antigos veem inscritos do futuro, criando descompasso entre treino e uso.', correta: true, explicacao: 'É o training-serving skew: a feature tem significados diferentes nos dois momentos.'},
+        {texto: 'Não, e também não há problema no treino.', explicacao: 'No treino, a foto de hoje é posterior aos posts históricos, e isso distorce o que o modelo aprende.'},
+      ],
+    },
+    {
+      pergunta: 'Um Short foi publicado às 22h00 UTC de uma quinta-feira. Qual hora local deve entrar como feature para um público brasileiro?',
+      opcoes: [
+        {texto: '22h, porque é o valor da API.', explicacao: 'A API devolve UTC. O público vive no horário local.'},
+        {texto: '19h de quinta, em America/Sao_Paulo.', correta: true, explicacao: 'O Brasil está em UTC−3 sem horário de verão desde 2019; 22h UTC são 19h em Brasília.'},
+        {texto: '01h de sexta.', explicacao: 'Isso seria somar 3 horas; a conversão de UTC para Brasília subtrai 3 horas.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: audite as datas das suas features]
+Para cada feature que você pretende usar, anote **quando** o valor dela foi observado: no instante da publicação, no último post anterior, ou no dia da coleta. Depois, escreva uma função `auditar_datas(df, observado_em)` que receba a tabela e um dicionário `{feature: coluna_de_data}` e devolva, para cada feature, a fração de linhas em que ela foi observada **depois** de `published_at`.
+
+Rode com pelo menos: inscritos do canal, título/descrição, mediana dos posts anteriores e hora local. Para cada feature com fração maior que zero, decida: remover, substituir ou manter com ablação e registro no data card.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import pandas as pd
+
+
+def auditar_datas(df: pd.DataFrame, observado_em: dict[str, str]) -> pd.Series:
+    """Fração das linhas em que cada feature foi observada DEPOIS da publicação."""
+    return pd.Series({
+        feat: float((df[col] > df["published_at"]).mean())
+        for feat, col in observado_em.items()
+    }, name="observada_depois").sort_values(ascending=False)
+
+
+df = pd.DataFrame({
+    "published_at": pd.to_datetime(["2025-03-10T17:00Z", "2026-08-06T22:00Z", "2026-09-10T22:00Z"]),
+    "collected_at": pd.Timestamp("2026-09-28T12:00Z"),
+    # a mediana dos anteriores é "observada" na data do último post anterior
+    "ultimo_post_anterior": pd.to_datetime(["2025-03-06T17:00Z", "2026-08-02T22:00Z", "2026-09-06T22:00Z"]),
+})
+mapa = {
+    "inscritos_canal": "collected_at",          # foto do dia da coleta
+    "titulo_e_descricao": "collected_at",       # versão atual (pode ter sido editada)
+    "mediana_anteriores": "ultimo_post_anterior",
+    "hora_local": "published_at",               # conhecida no instante da publicação
+}
+print(auditar_datas(df, mapa))
+```
+
+```text
+inscritos_canal       1.0
+titulo_e_descricao    1.0
+mediana_anteriores    0.0
+hora_local            0.0
+Name: observada_depois, dtype: float64
+```
+
+Inscritos: **substituir** pela mediana de curtidas dos posts anteriores (e, se quiser, guardar a faixa de inscritos só para análise). Título e descrição: **manter com registro**, porque edições depois da publicação são raras, e verificar numa amostra se títulos de virais foram alterados. Mediana dos anteriores e hora local: observadas no momento certo.
+
+</details>
+
+---
+
+## Resumo
+
+- **Maturação**: rotule com **30+ dias** e meça, com dois snapshots, quanto os Shorts ainda crescem depois disso; a idade do rótulo (`age_days`) precisa ser guardada e tratada.
+- **Quebras de regime**: views mudaram de régua em **31/03/2025** e **24/08/2026**; **curtidas** são o alvo mais estável.
+- **Foto do dia da coleta**: inscritos, título e estatísticas do canal são de hoje; para posts antigos, são **informação do futuro**. Prefira o histórico de curtidas do canal.
+- **Drift** muda a relação ao longo do tempo; **sazonalidade** é informação legítima, calculada no **fuso local**.
+- Toda linha carrega **publicação**, **coleta**, **idade**, **regime** e **hora local**.
+
+## Referências
+
+- Google. [Revision History da YouTube Data API](https://developers.google.com/youtube/v3/revision_history): entradas de 26/03/2025 (views de Shorts a partir de 31/03/2025), 27/08/2026 (contagem unificada) e 10/09/2019 (arredondamento de inscritos).
+- Google. Recurso [`videos`](https://developers.google.com/youtube/v3/docs/videos): descrição de `statistics.viewCount` (a partir de 24/08/2026) e de `snippet.publishedAt`.
+- YouTube Help. [How engagement metrics are counted](https://support.google.com/youtube/answer/2991785) e [Understand three-minute YouTube Shorts](https://support.google.com/youtube/answer/15424877).
+- Szabo e Huberman. [*Predicting the popularity of online content*](https://arxiv.org/abs/0811.0405). Communications of the ACM, 2010.
+- Gama et al. *A survey on concept drift adaptation*. ACM Computing Surveys, 2014. [DOI 10.1145/2523813](https://doi.org/10.1145/2523813).
+- Gupta et al. [*Understanding Virality*](https://arxiv.org/abs/2512.21402). arXiv:2512.21402. Exemplo de alvo likes/views.
+
+**Próxima aula:** [Documentação, ética e termos de uso](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos): o data card da sua base, o esquema validado com Pydantic e pandera, e o que as políticas do YouTube e do Gemini pedem de você.

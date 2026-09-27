@@ -1,0 +1,526 @@
+---
+sidebar_position: 5
+sidebar_label: 'Features do canal e do tempo'
+title: 'Features do canal e do tempo'
+description: 'Como construir o histórico do canal sem vazamento (shift, expanding, rolling, merge_asof), testar a ausência de vazamento e codificar horário, calendário e cadência para modelos de árvore.'
+tags: [ml-preditivo, gradient-boosting, features, vazamento]
+---
+
+# Features do Canal e do Tempo: o Passado Que Pode Ser Usado
+
+<LessonMeta
+  tempo="55 min"
+  semana={2}
+  etapa="modelo"
+  objetivos={[
+    'Construir features de histórico do canal (mediana, média, desvio, contagem, janelas recentes, tendência, cadência) usando só posts anteriores',
+    'Provar que as features não vazam, com um assert de datas e um teste de perturbação do futuro',
+    'Juntar tabelas externas com data usando merge_asof sem olhar o futuro',
+    'Tratar inscritos como snapshot da coleta e reconhecer o vazamento que isso traz',
+    'Codificar horário, dia da semana, feriados e idade do canal, sabendo quando sin/cos importa',
+  ]}
+  prerequisitos={[
+    {label: 'Vazamento de dados', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+    {label: 'LightGBM, CatBoost e XGBoost na prática', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost'},
+  ]}
+/>
+
+Nas últimas três aulas, você trocou árvore única por ensemble, ensemble por boosting, e boosting por três bibliotecas diferentes. O ganho total de MAE, somando tudo, foi de alguns centésimos. Em todas elas, a mesma frase apareceu no fim: *o que falta não é algoritmo, é informação sobre o canal*.
+
+Esta aula entrega essa informação. A pergunta que o modelo não conseguia responder era "como este canal vem performando **ultimamente**?". Nenhuma coluna da base dizia isso: `inscritos` é um número parado, e os canais do gerador (como os reais) sobem e descem mês a mês. A resposta está nos posts anteriores do próprio canal. O problema é que "posts anteriores" é exatamente o tipo de feature em que um `groupby` descuidado coloca o futuro dentro do passado, e o modelo fica brilhante no notebook e inútil em produção.
+
+Por isso a aula tem duas metades de igual importância: construir as features e **provar** que elas não vazam.
+
+:::info[A ideia central]
+Para cada post, toda feature do canal deve ser calculada **só com posts publicados antes dele**. No pandas, isso se faz ordenando por `published_at` e usando `groupby(canal) + shift(1)` antes de `expanding` ou `rolling` (ou `searchsorted`, quando há empates ou uma lacuna de maturação). Para tabelas externas com data, use `merge_asof` com `direction="backward"`. E teste: embaralhar o alvo dos posts futuros **não pode** mudar nenhuma feature dos posts passados.
+:::
+
+---
+
+## O que o histórico do canal responde
+
+<Sketch name="m3/historico-do-canal" alt="Linha do tempo de um canal com 22 posts. Os posts anteriores estão em ciano; um colchete marca todo o passado, usado nas estatísticas expanding e na janela dos últimos 20, e outro colchete marca os últimos 5 posts. Um post cinza logo antes do post a prever marca a lacuna opcional. O post a prever está em roxo, com published_at igual a t. Os posts depois dele estão em vermelho, com o rótulo futuro: nunca entra. Abaixo, três caixas: todo o passado com hist_mediana, hist_media, hist_desvio e hist_n; janelas recentes com hist_med5, hist_med20 e tendência igual a med5 menos med20; cadência e calendário com dias desde o último post, posts nos últimos 30 dias, hora local, feriado e idade do canal. Uma nota em vermelho diz que o próprio post e os posts futuros nunca entram na conta, e que embaralhar o alvo do futuro não pode mudar nenhuma feature do passado." caption="Cada feature olha só para a esquerda do post que está sendo previsto." />
+
+Pense no que um analista de mídia perguntaria antes de apostar num Short:
+
+| Pergunta | Feature | Como calcular (só com posts anteriores) |
+| :--- | :--- | :--- |
+| Qual o desempenho típico deste canal? | `hist_mediana`, `hist_media` | mediana e média de $$y$$ de todos os posts anteriores |
+| Quão imprevisível ele é? | `hist_desvio` | desvio-padrão de $$y$$ dos anteriores |
+| Quanto histórico existe? | `hist_n` | número de posts anteriores |
+| Ele está em alta ou em baixa? | `tendencia` | mediana dos últimos 5 menos mediana dos últimos 20 |
+| Com que frequência posta? | `dias_desde_ultimo`, `posts_30d` | intervalo desde o post anterior; posts nos 30 dias antes |
+
+A mediana é preferível à média como "nível típico" porque o log das curtidas ainda tem virais na cauda, e um único viral desloca a média. Guarde as duas: a diferença entre elas é, ela mesma, um sinal de o quanto o canal depende de acertos raros. E `hist_n` importa mais do que parece: uma mediana de 3 posts vale muito menos que uma de 40, e a árvore precisa saber a diferença para confiar mais ou menos nas outras features.
+
+---
+
+## O padrão canônico: ordenar, agrupar, deslocar
+
+O trecho abaixo usa o gerador da [aula 3.1](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao). O ponto crítico é o `shift(1)`: ele desloca o alvo uma posição **dentro de cada canal**, e só depois o `expanding` ou o `rolling` agregam. Sem o `shift`, a mediana do post $$i$$ incluiria o próprio $$y_i$$, e o modelo aprenderia a ler a resposta.
+
+```python
+import numpy as np
+import pandas as pd
+from shorts_sinteticos import gerar_shorts
+
+df = gerar_shorts().sort_values(["canal_id", "published_at"], ignore_index=True)
+g = df.groupby("canal_id", sort=False)
+
+df["hist_n"] = g.cumcount()                              # nº de posts ANTERIORES do canal
+anterior = g["y"].shift(1)                               # y do post anterior; NaN no primeiro
+ga = anterior.groupby(df["canal_id"], sort=False)        # expanding/rolling SEM o post atual
+df["hist_mediana"] = ga.transform(lambda s: s.expanding().median())
+df["hist_media"] = ga.transform(lambda s: s.expanding().mean())
+df["hist_desvio"] = ga.transform(lambda s: s.expanding().std())
+df["hist_med5"] = ga.transform(lambda s: s.rolling(5, min_periods=1).median())
+df["hist_med20"] = ga.transform(lambda s: s.rolling(20, min_periods=1).median())
+df["tendencia"] = df["hist_med5"] - df["hist_med20"]     # > 0: o canal está acima do próprio normal
+df["dias_desde_ultimo"] = g["published_at"].diff().dt.total_seconds() / 86_400
+
+cols = ["published_at", "y", "hist_n", "hist_mediana", "hist_med5", "tendencia", "dias_desde_ultimo"]
+print(df.loc[df["canal_id"] == "bele_03", cols].head(6).to_string(index=False, float_format="%.2f"))
+```
+
+```text
+             published_at    y  hist_n  hist_mediana  hist_med5  tendencia  dias_desde_ultimo
+2024-06-10 00:56:00+00:00 3.99       0           NaN        NaN        NaN                NaN
+2024-08-27 22:32:00+00:00 4.89       1          3.99       3.99       0.00              78.90
+2024-09-03 01:55:00+00:00 4.90       2          4.44       4.44       0.00               6.14
+2024-09-08 13:46:00+00:00 4.57       3          4.89       4.89       0.00               5.49
+2024-09-16 23:40:00+00:00 5.02       4          4.73       4.73       0.00               8.41
+2024-09-21 18:35:00+00:00 5.54       5          4.89       4.89       0.00               4.79
+```
+
+Confira linha a linha: o primeiro post não tem histórico (NaN, e a árvore sabe lidar com isso); o segundo vê só o primeiro (mediana 3,99); o terceiro vê os dois primeiros (mediana de 3,99 e 4,89 = 4,44). Nenhuma linha usa o próprio `y`.
+
+---
+
+## A versão robusta: empates e lacuna de maturação
+
+O `shift(1)` tem duas fraquezas no mundo real:
+
+1. **Empates.** Se um canal publica dois Shorts no mesmo minuto, o segundo "vê" o primeiro, embora os dois fossem desconhecidos no momento da previsão.
+2. **Maturação.** As curtidas da sua base foram medidas **na coleta**, quando os posts já tinham semanas ou meses. No momento em que você prevê um Short novo, o post que o canal publicou ontem ainda tem só uma fração das curtidas finais. Se o treino usa as curtidas finais do post de ontem, e a produção usa as de um dia, a feature tem distribuições diferentes no treino e na produção.
+
+A versão abaixo resolve os dois com `np.searchsorted`: para cada post, conta quantos posts do canal foram publicados **estritamente antes** de `published_at - lacuna` e usa as estatísticas até ali. Com `lacuna_dias=0`, ela reproduz o `shift(1)` (salvo empates); com `lacuna_dias=7`, ignora a última semana, cujas curtidas ainda não amadureceram. Ela também guarda `hist_ultimo_ts`, a data do post mais recente usado, que vai servir para o teste de vazamento.
+
+```python
+def historico_do_canal(df, lacuna_dias=0):
+    """Features do canal usando SÓ posts publicados antes de (published_at - lacuna_dias)."""
+    partes = []
+    for _, d in df.sort_values("published_at").groupby("canal_id", sort=False):
+        t = d["published_at"].dt.tz_convert(None).to_numpy()          # datetime64 em UTC
+        k = np.searchsorted(t, t - np.timedelta64(lacuna_dias, "D"), side="left")  # nº de posts antes do corte
+        y = d["y"].reset_index(drop=True)
+        stats = pd.DataFrame({"hist_mediana": y.expanding().median(), "hist_media": y.expanding().mean(),
+                              "hist_desvio": y.expanding().std(),
+                              "hist_med5": y.rolling(5, min_periods=1).median(),
+                              "hist_med20": y.rolling(20, min_periods=1).median()})
+        f = stats.iloc[np.maximum(k - 1, 0)].reset_index(drop=True)   # estatísticas até o post k-1
+        f[k == 0] = np.nan                                             # canal sem histórico ainda
+        f["hist_n"] = k
+        f["tendencia"] = f["hist_med5"] - f["hist_med20"]
+        ultimo = pd.Series(t[np.maximum(k - 1, 0)]).where(k > 0)
+        f["hist_ultimo_ts"] = ultimo.dt.tz_localize("UTC")             # guardado para o teste de vazamento
+        f["dias_desde_ultimo"] = (pd.Series(t) - ultimo).dt.total_seconds() / 86_400
+        k30 = np.searchsorted(t, t - np.timedelta64(30, "D"), side="left")
+        f["posts_30d"] = k - np.minimum(k30, k)                        # cadência: posts nos 30 dias antes
+        f.index = d.index
+        partes.append(f)
+    return pd.concat(partes).loc[df.index]
+
+
+hist = historico_do_canal(df)
+print("igual à versão com shift(1)?", np.allclose(hist["hist_mediana"], df["hist_mediana"], equal_nan=True))
+```
+
+```text
+igual à versão com shift(1)? True
+```
+
+---
+
+## Provando que não vaza
+
+Código de features sem teste é uma promessa. Dois testes transformam a promessa em garantia, e os dois deveriam rodar toda vez que você mexer nas features:
+
+1. **Assert de datas:** o post mais recente usado por cada feature é estritamente anterior ao post previsto.
+2. **Teste de perturbação do futuro:** embaralhe o alvo de todos os posts a partir de uma data; as features dos posts até essa data **não podem mudar**. Esse teste é genérico: funciona para qualquer função de features, inclusive as que você ainda vai escrever, porque não depende de como a feature foi calculada.
+
+```python
+def teste_de_perturbacao(gerar_features, df, data=pd.Timestamp("2025-06-01", tz="UTC")):
+    """Embaralha o alvo dos posts a partir de `data`; features de posts até `data` não podem mudar."""
+    antes = gerar_features(df)
+    mexido = df.copy()
+    futuro = mexido["published_at"] >= data
+    mexido.loc[futuro, "y"] = np.random.default_rng(0).permutation(mexido.loc[futuro, "y"].to_numpy())
+    depois = gerar_features(mexido)
+    ate = df["published_at"] <= data
+    num = antes.select_dtypes("number").columns
+    return np.allclose(antes.loc[ate, num], depois.loc[ate, num], equal_nan=True)
+
+
+# 1) nenhum post usado é posterior (ou simultâneo) ao post que está sendo previsto
+usado = hist["hist_ultimo_ts"].notna()
+assert (hist.loc[usado, "hist_ultimo_ts"] < df.loc[usado, "published_at"]).all(), "usa post do futuro!"
+
+# 2) perturbação do futuro: a versão correta passa, a ingênua é pega
+ingenua = lambda d: d.groupby("canal_id")["y"].transform("median").to_frame("mediana_do_canal")
+print("historico_do_canal passa?", teste_de_perturbacao(historico_do_canal, df))
+print("mediana do canal inteiro passa?", teste_de_perturbacao(ingenua, df))
+```
+
+```text
+historico_do_canal passa? True
+mediana do canal inteiro passa? False
+```
+
+A versão "ingênua", `groupby("canal_id")["y"].transform("median")`, é a feature de canal mais comum em notebooks, e ela usa todos os posts do canal, inclusive os futuros. O teste a pega na hora. Vale transformar os dois testes em testes automatizados do seu projeto (por exemplo, com `pytest`), para que ninguém reintroduza o vazamento sem perceber.
+
+---
+
+## Tabelas externas com data: merge_asof
+
+Algumas informações vêm de outra tabela, com data própria: snapshots de inscritos que o seu coletor grava toda semana, um índice de interesse do setor, a data de uma mudança de algoritmo. A junção certa é "para cada post, o valor mais recente **antes** dele", que é exatamente o que `pd.merge_asof` faz:
+
+```python
+# Tabela externa com data: snapshots semanais de inscritos que o SEU coletor gravou
+# (aqui simulados a partir de jun/2025; antes disso, o coletor não existia)
+datas = pd.date_range("2025-06-01", "2026-06-30", freq="7D", tz="UTC")
+snap = pd.concat([pd.DataFrame({"canal_id": c, "coletado_em": datas,
+                                "inscritos_snap": (i * np.exp(-0.003 * np.arange(len(datas))[::-1])).round()})
+                  for c, i in df.groupby("canal_id")["inscritos"].first().items()])
+
+base = df.sort_values("published_at")                    # merge_asof exige as duas tabelas ordenadas
+com_snap = pd.merge_asof(base, snap.sort_values("coletado_em"),
+                         left_on="published_at", right_on="coletado_em", by="canal_id",
+                         direction="backward",           # só o snapshot mais recente ANTES do post
+                         allow_exact_matches=False)      # snapshot no mesmo instante também não vale
+ok = com_snap["coletado_em"].notna()
+assert (com_snap.loc[ok, "coletado_em"] < com_snap.loc[ok, "published_at"]).all()
+print(f"posts com snapshot disponível: {ok.mean():.0%} (os anteriores a jun/2025 ficam NaN)")
+```
+
+```text
+posts com snapshot disponível: 51% (os anteriores a jun/2025 ficam NaN)
+```
+
+Três detalhes: as duas tabelas precisam estar **ordenadas pela chave de tempo**; `by="canal_id"` restringe a busca ao mesmo canal; e `direction="backward"` com `allow_exact_matches=False` garante que só entra informação estritamente anterior. Os posts antigos ficam com `NaN`, e está certo: você não sabia os inscritos deles naquela época. Um `merge` comum pela chave do canal, pegando "o snapshot mais recente da tabela", seria vazamento.
+
+---
+
+## Inscritos: um snapshot que sabe do futuro
+
+O seu coletor do módulo 1 chama `channels.list` uma vez e guarda `statistics.subscriberCount` **do dia da coleta**. Esse valor entra em todos os posts do canal, inclusive nos de dois anos atrás. Para um post de 2024, a feature diz quantos inscritos o canal tinha em 2026, e um canal que cresceu muito desde então tem, por construção, posts recentes melhores. O gerador sintético reproduz esse problema de propósito: `inscritos` inclui a tendência acumulada até o fim do período.
+
+Há ainda dois detalhes da própria API: a [documentação do recurso `channels`](https://developers.google.com/youtube/v3/docs/channels) informa que `subscriberCount` é arredondado para baixo em três algarismos significativos, e canais podem ocultar a contagem (`hiddenSubscriberCount`).
+
+O que fazer:
+
+- **Use `log(inscritos)`**, nunca o valor cru, para ler e comparar; para a árvore não muda nada, mas para você e para o SHAP muda.
+- **Deixe as features de histórico carregarem o nível do canal.** Elas são calculadas no tempo certo. A ablação abaixo mostra que, com elas, remover `inscritos` custa só 0,010 de MAE.
+- **Comece a gravar snapshots datados agora** e use `merge_asof`. Em poucas semanas, os posts novos terão inscritos "da época".
+- **Documente a limitação** no seu data card, se mantiver o snapshot.
+
+---
+
+## Horário, calendário e idade do canal
+
+A API devolve `publishedAt` em UTC. O horário que importa para o público brasileiro é o local; converta antes de extrair hora e dia da semana. O Brasil não tem horário de verão desde 2019, mas deixe a conversão para o pandas em vez de subtrair 3 horas na mão.
+
+```python
+from dateutil.easter import easter   # já vem instalado com o pandas (python-dateutil)
+
+local = df["published_at"].dt.tz_convert("America/Sao_Paulo")   # a API devolve UTC
+df["hora_local"] = local.dt.hour
+df["dia_semana_local"] = local.dt.dayofweek                     # 0 = segunda
+assert (df["hora_local"] == df["hora"]).all()                   # confere com o gerador
+df["hora_sin"] = np.sin(2 * np.pi * df["hora_local"] / 24)      # só para modelos que precisam
+df["hora_cos"] = np.cos(2 * np.pi * df["hora_local"] / 24)
+
+
+def feriados_br(anos):
+    """Feriados nacionais fixos + Sexta-feira Santa + segunda e terça de Carnaval (ponto facultativo)."""
+    dias = []
+    for a in anos:
+        for md in ["01-01", "04-21", "05-01", "09-07", "10-12", "11-02", "11-15", "11-20", "12-25"]:
+            dias.append(pd.Timestamp(f"{a}-{md}").date())
+        pascoa = pd.Timestamp(easter(a))
+        dias += [(pascoa - pd.Timedelta(days=n)).date() for n in (2, 47, 48)]
+    return dias
+
+
+df["feriado"] = local.dt.date.isin(feriados_br(range(2024, 2027))).astype(int)
+primeiro = df.groupby("canal_id")["published_at"].transform("min")   # proxy; o ideal é snippet.publishedAt
+df["idade_canal_dias"] = (df["published_at"] - primeiro).dt.days
+print(df[["feriado", "idade_canal_dias"]].describe().loc[["mean", "max"]].round(3))
+```
+
+```text
+      feriado  idade_canal_dias
+mean    0.033           385.322
+max     1.000           884.000
+```
+
+Sobre a **idade do canal**: o proxy acima (dias desde o primeiro post da **sua base**) depende de quando a sua coleta começa. O valor certo é a data de criação do canal, que a API devolve em `snippet.publishedAt` do recurso `channels`. Repare que `transform("min")` aqui não vaza: o primeiro post é sempre anterior ou igual ao post atual.
+
+**Sin/cos: quando importa?** A codificação cíclica existe para que 23h e 0h fiquem "perto". Para um modelo linear ou uma rede neural, isso faz diferença. Para uma árvore, quase nunca: ela corta a hora em faixas e aprende a faixa que importa com dois splits. O trecho abaixo mostra a capacidade de cada codificação de representar o degrau verdadeiro do gerador (+0,12 entre 18h e 22h), sem ruído:
+
+```python
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
+
+h = np.arange(24)
+efeito = 0.12 * ((h >= 18) & (h <= 22))                  # o degrau verdadeiro do gerador
+cod = {"crua (0-23)": h[:, None],
+       "sin/cos": np.c_[np.sin(2 * np.pi * h / 24), np.cos(2 * np.pi * h / 24)],
+       "one-hot": np.eye(24)}
+for nome, X in cod.items():
+    lin = LinearRegression().fit(X, efeito).predict(X)
+    print(f"linear + {nome:<12} erro máximo: {np.abs(lin - efeito).max():.3f}")
+arv = DecisionTreeRegressor(max_depth=2).fit(h[:, None], efeito).predict(h[:, None])
+print(f"árvore + crua (0-23)     erro máximo: {np.abs(arv - efeito).max():.3f}")
+print("distância 23h -> 0h:  crua =", abs(23 - 0),
+      "| sin/cos =", round(float(np.linalg.norm(cod["sin/cos"][23] - cod["sin/cos"][0])), 3))
+```
+
+```text
+linear + crua (0-23)  erro máximo: 0.076
+linear + sin/cos      erro máximo: 0.058
+linear + one-hot      erro máximo: 0.000
+árvore + crua (0-23)     erro máximo: 0.000
+distância 23h -> 0h:  crua = 23 | sin/cos = 0.261
+```
+
+A árvore com a hora crua representa o degrau exatamente; o modelo linear precisa de one-hot. O sin/cos resolve a distância entre 23h e 0h, mas não transforma um degrau em algo linear. Para o boosting, a regra prática é: **hora crua (local) e dia da semana como inteiro bastam**; sin/cos só vale se você também treinar um modelo linear ou uma rede, ou se o efeito for de fato suave e cruzar a meia-noite. Num teste na base sintética com ruído (alvo relativo ao canal, só conteúdo e hora), as três codificações deram MAE entre 0,586 e 0,588 com LightGBM: o efeito do horário é pequeno perto do ruído, e a codificação não muda nada para a árvore.
+
+---
+
+## Na prática: quanto o histórico vale
+
+Agora a ablação que responde à pergunta do módulo. O trecho continua os anteriores, treina um LightGBM com quatro conjuntos de features e mede MAE, Spearman e a <Termo id="pairwise">acurácia par-a-par</Termo> **dentro do mesmo canal**, a métrica mais parecida com a decisão "A ou B?".
+
+```python
+import lightgbm as lgb
+from scipy.stats import spearmanr
+
+df = df.join(hist.drop(columns=df.columns.intersection(hist.columns)))   # versão robusta do histórico
+df["log_inscritos"] = np.log(df["inscritos"])
+df["setor"] = df["setor"].astype("category")
+df[["rosto", "texto_tela"]] = df[["rosto", "texto_tela"]].astype(int)
+BASE = ["setor", "duracao_s", "gancho", "rosto", "texto_tela", "energia", "hora_local", "dia_semana_local"]
+HIST = ["hist_n", "hist_mediana", "hist_media", "hist_desvio", "hist_med5", "hist_med20", "tendencia",
+        "dias_desde_ultimo", "posts_30d", "feriado", "idade_canal_dias"]
+
+
+def par_a_par_intra(d, p):
+    """Fração de pares do MESMO canal em que o modelo acerta qual post rendeu mais."""
+    acertos = total = 0
+    for _, g in d.assign(p=p).groupby("canal_id"):
+        yy, pp = g["y"].to_numpy(), g["p"].to_numpy()
+        i, j = np.triu_indices(len(g), 1)
+        m = yy[i] != yy[j]
+        acertos += ((yy[i] > yy[j]) == (pp[i] > pp[j]))[m].sum()
+        total += m.sum()
+    return acertos / total
+
+
+corte = pd.Timestamp("2026-01-01", tz="UTC")
+treino, teste = df[df["published_at"] < corte], df[df["published_at"] >= corte]
+params = {"objective": "regression", "learning_rate": 0.05, "num_leaves": 15, "min_data_in_leaf": 20,
+          "feature_fraction": 0.9, "verbosity": -1, "seed": 0, "num_threads": 1}
+print(f"{'features':<34} {'MAE':>6} {'Spearman':>9} {'par-a-par intra':>16}")
+for nome, feats, relativo in [("inscritos + conteúdo", ["log_inscritos"] + BASE, False),
+                              ("+ histórico do canal", ["log_inscritos"] + BASE + HIST, False),
+                              ("histórico, sem inscritos", BASE + HIST, False),
+                              ("histórico + alvo relativo", ["log_inscritos"] + BASE + HIST, True)]:
+    ref_tr = treino["hist_mediana"].fillna(treino["y"].median()) if relativo else 0
+    ref_te = teste["hist_mediana"].fillna(treino["y"].median()) if relativo else 0
+    m = lgb.train(params, lgb.Dataset(treino[feats], treino["y"] - ref_tr), num_boost_round=300)
+    p = m.predict(teste[feats]) + ref_te
+    print(f"{nome:<34} {np.mean(np.abs(teste['y'] - p)):>6.3f} {spearmanr(teste['y'], p).statistic:>9.3f}"
+          f" {par_a_par_intra(teste, p):>16.3f}")
+print(f"{'teto: o próprio sinal verdadeiro':<34} {'':>6} {'':>9} {par_a_par_intra(teste, teste['sinal_verdadeiro'].to_numpy()):>16.3f}")
+```
+
+```text
+features                              MAE  Spearman  par-a-par intra
+inscritos + conteúdo                0.595     0.913            0.607
++ histórico do canal                0.508     0.930            0.558
+histórico, sem inscritos            0.518     0.924            0.563
+histórico + alvo relativo           0.518     0.922            0.571
+teto: o próprio sinal verdadeiro                               0.656
+```
+
+Quatro leituras, uma delas incômoda:
+
+1. **O histórico é o maior ganho do módulo.** O MAE caiu de 0,595 para 0,508, quase dez vezes o que separou as bibliotecas na aula anterior. O Spearman global também subiu.
+2. **O snapshot de inscritos virou quase dispensável.** Sem ele, o MAE sobe só 0,010. O nível do canal agora vem de features calculadas no tempo certo.
+3. **A ordenação dentro do canal piorou** (0,607 → 0,558). Por quê? As features de histórico mudam de um post para o outro do mesmo canal com o **ruído** dos posts recentes: um viral na semana passada sobe `hist_med5` e todas as previsões seguintes do canal. Para ordenar posts do mesmo canal publicados em **datas diferentes**, esse ruído atrapalha. O alvo relativo recupera parte da perda (0,571).
+4. **O teto é baixo.** Mesmo quem conhece o sinal verdadeiro acerta só 65,6% dos pares do mesmo canal, porque o ruído do gerador (desvio 0,5) é grande perto dos efeitos de conteúdo. Nos seus dados reais o teto é desconhecido, mas existe; lembre disso quando a meta de cerca de 60% par-a-par da Galaxies parecer modesta.
+
+O item 3 não significa que o histórico atrapalha a decisão da Lumina. A decisão "A ou B?" compara dois criativos **do mesmo canal, no mesmo momento**, e aí as features de histórico são idênticas para os dois. A seção seguinte mostra o que acontece nesse caso.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Para a Lumina, A e B compartilham tudo que é do canal e do momento: mesmo histórico, mesma tendência, mesma cadência. O que muda é o conteúdo e o horário (terça 14h contra quinta 19h). Encaixamos o par no momento atual de cada um dos 20 canais de beleza da base e medimos a diferença prevista:
+
+```text
+inscritos + conteúdo   B - A em 20 canais de beleza: média 0.68, de 0.45 a 0.95
++ histórico do canal   B - A em 20 canais de beleza: média 0.75, de 0.64 a 1.01
+```
+
+<details>
+<summary>Ver o código (continua o trecho da ablação)</summary>
+
+```python
+# A e B da Lumina "encaixados" no momento atual de cada canal de beleza da base:
+# tudo que é do canal e do momento é igual para A e B; só conteúdo e horário mudam
+conteudo = {"duracao_s": [55, 22], "gancho": [3, 8], "rosto": [1, 1], "texto_tela": [0, 1],
+            "energia": [3, 7], "hora_local": [14, 19], "dia_semana_local": [1, 3]}
+todas = ["log_inscritos"] + BASE + HIST
+refs = teste[teste["setor"] == "beleza"].groupby("canal_id", observed=True).tail(1)   # post mais recente de cada canal
+for nome, feats in [("inscritos + conteúdo", ["log_inscritos"] + BASE),
+                    ("+ histórico do canal", todas)]:
+    m = lgb.train({**params, "bagging_fraction": 0.8, "bagging_freq": 1},
+                  lgb.Dataset(treino[feats], treino["y"]), num_boost_round=300)
+    difs = []
+    for _, ref in refs.iterrows():
+        par = pd.DataFrame([ref[todas]] * 2).assign(**conteudo).astype(treino[todas].dtypes.to_dict())
+        a, b = m.predict(par[feats])
+        difs.append(b - a)
+    print(f"{nome:<22} B - A em {len(difs)} canais de beleza: média {np.mean(difs):.2f}, "
+          f"de {np.min(difs):.2f} a {np.max(difs):.2f}")
+```
+
+</details>
+
+Sem histórico, a diferença prevista depende muito de **qual** canal você usa como referência (de 0,45 a 0,95): o modelo usa faixas de inscritos como identificador de canal, e o efeito do conteúdo vem misturado com isso. Com histórico, a diferença fica mais estável (de 0,64 a 1,01) e mais próxima da verdadeira (1,09). O nível do canal passou a vir de features próprias, e os splits ficaram livres para o conteúdo.
+
+Na prática, para a Lumina você vai precisar dos posts recentes do canal dela: a tool de histórico do [módulo 6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/as-cinco-tools) busca esses posts pela API e calcula exatamente estas features, com a mesma função e a mesma lacuna usadas no treino.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas com features de canal e tempo]
+1. **`groupby("canal_id")["y"].transform("mean")` sem `shift`.** É a feature vazada mais comum de todas. O teste de perturbação pega na hora.
+2. **Esquecer de ordenar por `published_at` antes do `shift`.** O `shift(1)` desloca pela ordem das linhas, não pela data.
+3. **Calcular features no DataFrame de treino e no de teste separadamente.** O primeiro post do teste perderia todo o histórico do treino. Calcule sobre a base inteira, em ordem temporal, e só depois separe.
+4. **Usar curtidas finais de posts muito recentes.** Em produção, os posts da última semana ainda não maturaram. Use uma lacuna ou registre a limitação.
+5. **Extrair a hora sem converter de UTC.** Um post das 19h em São Paulo aparece como 22h na API.
+6. **Tratar o snapshot de inscritos como se fosse da época do post.** Ele sabe do crescimento futuro do canal.
+7. **Usar `merge` comum para tabelas com data.** Use `merge_asof` com `direction="backward"`.
+:::
+
+<Quiz
+  id="m3-a5"
+  perguntas={[
+    {
+      pergunta: 'Qual destas features de canal **vaza**?',
+      opcoes: [
+        {texto: '`g["y"].shift(1)` seguido de `expanding().median()` por canal, com a base ordenada por data.', explicacao: 'Esse é o padrão correto: o post atual e os futuros ficam de fora.'},
+        {texto: '`df.groupby("canal_id")["y"].transform("median")`.', correta: true, explicacao: 'Usa todos os posts do canal, inclusive o próprio e os futuros. No teste de perturbação, falhou.'},
+        {texto: 'Número de posts do canal nos 30 dias antes da publicação.', explicacao: 'Só olha para o passado; não usa nenhum alvo.'},
+      ],
+    },
+    {
+      pergunta: 'Você embaralha o alvo de todos os posts a partir de jun/2025 e recalcula as features. A `hist_mediana` de um post de março/2025 mudou. O que isso prova?',
+      opcoes: [
+        {texto: 'Nada: o embaralhamento é aleatório, então as features mudam mesmo.', explicacao: 'Um post de março não deveria depender de nenhum alvo de junho em diante. Se mudou, depende.'},
+        {texto: 'Que a feature usa informação de posts posteriores ao post de março: há vazamento.', correta: true, explicacao: 'É exatamente o que o teste de perturbação detecta, sem precisar entender como a feature foi calculada.'},
+        {texto: 'Que a data do teste foi mal escolhida.', explicacao: 'Qualquer data serve; o teste falhar é sinal de vazamento.'},
+      ],
+    },
+    {
+      pergunta: 'Você tem snapshots semanais de inscritos a partir de jun/2025. Como juntá-los aos posts?',
+      opcoes: [
+        {texto: '`merge` pelo `canal_id`, usando o snapshot mais recente da tabela.', explicacao: 'O snapshot mais recente é do futuro para quase todos os posts.'},
+        {texto: '`merge_asof` por `published_at`, com `by="canal_id"`, `direction="backward"` e `allow_exact_matches=False`.', correta: true, explicacao: 'Cada post recebe o último snapshot estritamente anterior a ele; posts antes de jun/2025 ficam NaN, corretamente.'},
+        {texto: '`merge_asof` com `direction="nearest"`.', explicacao: 'O mais próximo pode ser posterior ao post: vazamento.'},
+      ],
+    },
+    {
+      pergunta: 'Seu modelo é um LightGBM. Como codificar a hora de publicação?',
+      opcoes: [
+        {texto: 'Obrigatoriamente com sin/cos, senão a árvore acha que 23h e 0h estão longe.', explicacao: 'A árvore corta em faixas; ela representa o degrau do horário nobre com dois splits na hora crua.'},
+        {texto: 'Hora local crua (0 a 23) basta; sin/cos só importa para modelos lineares, redes ou efeitos suaves que cruzam a meia-noite.', correta: true, explicacao: 'No teste sem ruído, a árvore com hora crua representou o degrau com erro zero.'},
+        {texto: 'Hora em UTC, como vem da API, para evitar conversões.', explicacao: 'O público reage à hora local. Converta de UTC para America/Sao_Paulo.'},
+      ],
+    },
+    {
+      pergunta: 'Com as features de histórico, o MAE caiu de 0,595 para 0,508, mas a acurácia par-a-par dentro do canal caiu de 0,607 para 0,558. Quais interpretações são corretas? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'O histórico melhora a estimativa do nível do canal, e por isso o MAE e o Spearman global melhoram.', correta: true, explicacao: 'O nível do canal é a maior fonte de variação entre posts.'},
+        {texto: 'As features de histórico variam entre posts do mesmo canal com o ruído dos posts recentes, o que atrapalha ordenar posts de datas diferentes.', correta: true, explicacao: 'Um viral recente muda hist_med5 e desloca todas as previsões seguintes do canal.'},
+        {texto: 'Para comparar A e B da Lumina no mesmo momento, o histórico é igual para os dois, e a comparação depende do conteúdo.', correta: true, explicacao: 'No experimento, a diferença B − A ficou mais estável e mais próxima da verdadeira com histórico.'},
+        {texto: 'O histórico tem vazamento, e por isso a métrica intra-canal piorou.', explicacao: 'As features passaram no assert de datas e no teste de perturbação. A queda tem outra causa.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: quanto custa a lacuna de maturação?]
+1. Recalcule o histórico com `historico_do_canal(..., lacuna_dias=L)` para L = 0, 7 e 30.
+2. Para cada L, treine o LightGBM com `["log_inscritos"] + BASE + HIST` e meça o MAE de teste.
+3. Rode o teste de perturbação com a função de cada lacuna.
+4. Discuta: no gerador sintético, as curtidas não "amadurecem". Na sua base real, qual lacuna você usaria, e como descobriria quanto tempo um Short leva para acumular a maior parte das curtidas?
+:::
+
+<details>
+<summary>Ver a solução</summary>
+
+```python
+for lacuna in [0, 7, 30]:
+    h = historico_do_canal(df[["canal_id", "published_at", "y"]], lacuna_dias=lacuna)
+    d = df.drop(columns=df.columns.intersection(h.columns)).join(h)
+    tr_, te_ = d[d["published_at"] < corte], d[d["published_at"] >= corte]
+    feats = ["log_inscritos"] + BASE + HIST
+    m = lgb.train(params, lgb.Dataset(tr_[feats], tr_["y"]), num_boost_round=300)
+    passa = teste_de_perturbacao(lambda x: historico_do_canal(x, lacuna), d[["canal_id", "published_at", "y"]])
+    print(f"lacuna {lacuna:>2} dias | MAE teste {np.mean(np.abs(te_['y'] - m.predict(te_[feats]))):.3f} | "
+          f"passa no teste de perturbação: {passa}")
+```
+
+```text
+lacuna  0 dias | MAE teste 0.508 | passa no teste de perturbação: True
+lacuna  7 dias | MAE teste 0.508 | passa no teste de perturbação: True
+lacuna 30 dias | MAE teste 0.514 | passa no teste de perturbação: True
+```
+
+Na base sintética, a lacuna só joga informação fora, e o custo é pequeno (0,006 com 30 dias). Na base real, ela troca um pouco de informação por consistência entre treino e produção. Para escolher o valor, colete as curtidas de alguns Shorts recentes em dias diferentes (por exemplo, com 1, 3, 7, 14 e 30 dias de idade) e veja a partir de quando a curva estabiliza.
+
+</details>
+
+---
+
+## Resumo
+
+- As **features de histórico do canal** (mediana, média, desvio, contagem, janelas recentes, **tendência**, **cadência**) foram o maior ganho de MAE do módulo.
+- O padrão é **ordenar por data, agrupar por canal, `shift(1)`, depois `expanding`/`rolling`**; a versão com `searchsorted` trata empates e uma **lacuna de maturação**.
+- Toda função de features deve passar no **assert de datas** e no **teste de perturbação do futuro**.
+- Tabelas externas com data entram por **`merge_asof`** com `direction="backward"`. O **snapshot de inscritos** da coleta sabe do futuro: use log, prefira o histórico e comece a gravar snapshots datados.
+- Converta a hora de **UTC para o horário local**. Para árvores, hora crua basta; **sin/cos** importa para modelos lineares e redes.
+
+## Referências
+
+- Documentação do pandas: [`merge_asof`](https://pandas.pydata.org/docs/reference/api/pandas.merge_asof.html), [janelas (`rolling`, `expanding`)](https://pandas.pydata.org/docs/user_guide/window.html) e [`groupby`](https://pandas.pydata.org/docs/user_guide/groupby.html).
+- YouTube Data API: [recurso `channels`](https://developers.google.com/youtube/v3/docs/channels) (`snippet.publishedAt`, `statistics.subscriberCount` arredondado a três algarismos significativos).
+- Kaufman, Rosset, Perlich e Stitelman. [*Leakage in data mining: formulation, detection, and avoidance*](https://doi.org/10.1145/2382577.2382579). ACM TKDD, 6(4), 2012.
+- Documentação do NumPy: [`searchsorted`](https://numpy.org/doc/stable/reference/generated/numpy.searchsorted.html).
+
+**Próxima aula:** [Features de texto](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto): título, descrição e hashtags como features manuais, TF-IDF e embeddings multilíngues, sem vazar o teste para o PCA.

@@ -1,0 +1,457 @@
+---
+sidebar_position: 3
+sidebar_label: 'Validação temporal e por canal'
+title: 'Validação temporal e por canal'
+description: 'Holdout temporal com gap, walk-forward, split por canal e "canal novo no futuro": como montar a validação que responde à pergunta da Galaxies, e por que o KFold aleatório é proibido como métrica final.'
+tags: [ml-preditivo, avaliacao, validacao]
+---
+
+import SplitExplorer from '@site/src/components/interativos/SplitExplorer';
+
+# Validação Temporal e por Canal: A Métrica Que Responde à Pergunta Certa
+
+<LessonMeta
+  tempo="50 min"
+  semana={1}
+  etapa="avaliacao"
+  objetivos={[
+    'Explicar por que a validação cruzada aleatória é otimista em dados de canais ao longo do tempo',
+    'Implementar holdout temporal com gap, walk-forward por data e split por canal',
+    'Escolher o esquema de validação a partir da pergunta de uso (próximo post de canal conhecido ou canal novo)',
+    'Posicionar o conjunto de calibração dos intervalos entre o treino e o teste',
+  ]}
+  prerequisitos={[
+    {label: 'Vazamento de dados', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+  ]}
+/>
+
+Duas duplas treinam **o mesmo modelo**, com as **mesmas features**, na **mesma base**. A primeira reporta Spearman intra-canal de **0,27**. A segunda, **0,17**. A primeira dupla não é mais competente: ela usou `KFold(shuffle=True)`, e a segunda usou walk-forward por data.
+
+As duas métricas estão "certas", no sentido de que o código não tem bug. Elas só respondem a perguntas diferentes. A primeira mede *"quão bem o modelo preenche buracos no passado, conhecendo o antes e o depois de cada post"*. A segunda mede *"quão bem ele prevê posts que ainda não existem"*. A Galaxies só se interessa pela segunda.
+
+Esta aula é sobre escolher a pergunta antes de escolher o split.
+
+:::info[Ideia central]
+O esquema de validação precisa **simular o uso real**. No case, o uso é prever Shorts que ainda não foram publicados, de canais que o modelo já conhece ou, no caso de um cliente novo como a Lumina, de canais que ele nunca viu. Treino sempre no passado, teste sempre no futuro e, quando a pergunta for "canal novo", canais do teste fora do treino.
+:::
+
+---
+
+## Por que o KFold aleatório mente aqui
+
+A validação cruzada aleatória supõe que os exemplos são **independentes e identicamente distribuídos**: embaralhar não muda nada. Em posts de canais ao longo do tempo, isso é falso por três motivos.
+
+1. **Autocorrelação dentro do canal.** Posts vizinhos no tempo, do mesmo canal, se parecem: o canal estava numa fase boa, tinha acabado de viralizar, mudou de formato. Com o split aleatório, o modelo treina com o post de terça e o de quinta e é testado no de quarta. Ele interpola; em produção, precisa extrapolar.
+2. **Drift.** A plataforma muda. A contagem de views de Shorts mudou em 31/03/2025, quando replays passaram a contar, e de novo em ago/2026 ([O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente)). Trends passam. Um split aleatório mistura os regimes e esconde quanto o modelo sofre com a mudança.
+3. **Features de histórico só fazem sentido para a frente.** A mediana do canal é calculada com o passado de cada post. Um teste que mistura passado e futuro avalia o modelo em uma situação que nunca vai acontecer.
+
+No código desta aula, o mesmo LightGBM com as mesmas features dá MAE de **0,680** no KFold aleatório e **0,760** no walk-forward: o KFold promete 10% menos erro do que o modelo entrega. No Spearman intra-canal, a diferença é de **0,268** para **0,167**, ou seja, o KFold infla em 60% justamente a métrica da decisão A vs. B.
+
+:::danger[Regra do projeto]
+KFold aleatório **não entra no relatório** como métrica de desempenho. Ele pode servir para depurar código rapidamente, nunca para escolher modelo, hiperparâmetro ou feature, e nunca para o README.
+:::
+
+<Sketch name="m2/esquemas-de-split" alt="Quatro grades com 4 canais nas linhas e 8 períodos nas colunas. A, aleatório (KFold): células de teste espalhadas; nota em vermelho: otimista, o treino tem posts depois do teste do mesmo canal. B, holdout temporal com gap: 5 colunas de treino, 1 de gap e 2 de teste para todos os canais; nota em verde: honesto para próximo post de canal conhecido, o gap imita o alvo que ainda não amadureceu. C, por canal (GroupKFold): o canal 3 inteiro no teste; nota em vermelho: mede canal nunca visto, mas deixa o treino ver o futuro. D, canal novo no futuro: canais 1, 2 e 4 treinam até o gap, o canal 3 só é testado nas 2 últimas colunas; nota em verde: o mais exigente, o caso de um cliente novo." caption="Quatro jeitos de separar treino e teste. Cada um responde a uma pergunta diferente." />
+
+Explore os esquemas no componente abaixo: escolha aleatório, temporal ou por canal e compare a métrica otimista com a honesta. Os dados do componente são simulados, com a mesma estrutura de nível e tendência por canal.
+
+<SplitExplorer />
+
+---
+
+## Holdout temporal e o gap
+
+O esquema mais simples e honesto é o **holdout temporal**: escolha uma data de corte, treine com tudo o que veio antes e teste com tudo o que veio depois. É o <Termo id="split-temporal">split temporal</Termo>.
+
+Falta um detalhe: o **gap** (ou *embargo*). Entre o fim do treino e o início do teste, deixe uma janela sem uso. No case, a justificativa é concreta:
+
+- **Maturidade do alvo.** O alvo é a contagem de curtidas com o vídeo tendo pelo menos 30 dias. Se você treinar um modelo hoje, os posts mais recentes com alvo maduro são de 30 dias atrás. Um gap de 30 dias faz a avaliação reproduzir essa limitação.
+- **Autocorrelação na fronteira.** Posts de um dia antes do corte se parecem com os de um dia depois. O gap reduz esse contágio.
+
+A ideia de "purgar" e "embargar" observações perto da fronteira vem da validação de modelos financeiros, onde o problema é o mesmo: rótulos que dependem de uma janela de tempo futura (López de Prado, 2018, cap. 7).
+
+**Como escolher o corte.** O teste precisa ser recente (é o regime em que o agente vai operar), longo o bastante para ter vários posts por canal (de 3 a 6 meses é um bom começo) e anterior ao último mês, cujo alvo ainda não amadureceu. Com a base sintética, o corte é 01/03/2026.
+
+---
+
+## Walk-forward: várias medições no futuro
+
+Um único holdout é uma única medição, sujeita ao acaso daquele período. O <Termo id="walk-forward">walk-forward</Termo> repete o holdout avançando no tempo. Para cada fold $$k$$, com janela de teste começando em $$t_k$$:
+
+$$
+\text{treino}_k = \{\, i : t_i < t_k - \text{gap} \,\}, \qquad
+\text{teste}_k = \{\, i : t_k \le t_i < t_{k+1} \,\}
+$$
+
+O treino cresce a cada fold (**janela expansiva**). A alternativa é a **janela deslizante**, que usa só os últimos meses de treino; ela ajuda quando dados antigos atrapalham, por exemplo depois de uma mudança de regime da plataforma. O exercício compara as duas.
+
+<Sketch name="m2/walk-forward" alt="Quatro folds de walk-forward numa linha do tempo de jan/2024 até hoje. Em cada fold, uma barra verde de treino (janela expansiva) que cresce, um pequeno bloco cinza tracejado de gap e uma janela amarela de teste que avança. Nota: o gap de 30 dias existe porque o alvo dos posts mais recentes ainda não amadureceu. Abaixo, a linha da entrega: treino do modelo final, calibração em rosa e teste final, nessa ordem de data; nota: a calibração do módulo 5 fica entre o treino e o teste, também por data, nunca sorteada." caption="Walk-forward com gap. Na entrega, a calibração dos intervalos fica entre o treino e o teste." />
+
+Reporte a média das métricas entre os folds **e** os valores de cada fold. Uma queda sistemática nos folds mais recentes é sinal de drift, e isso é informação para o README, não ruído a esconder.
+
+**Por que não o `TimeSeriesSplit` do scikit-learn?** Ele é ótimo para uma série única, mas no case tem três problemas:
+
+- ele corta por **posição de linha**, não por data. Se o DataFrame estiver ordenado por canal (como fica depois do `groupby`), o "futuro" vira "os últimos canais da lista";
+- mesmo ordenado por data, posts do mesmo dia podem cair dos dois lados, e o parâmetro `gap` é em número de linhas, não em dias;
+- ele não sabe nada de grupos.
+
+O passo 5 do código mostra o primeiro problema acontecendo. A saída é escrever o split por data, explicitamente, como na função `walk_forward` abaixo.
+
+---
+
+## Por canal: GroupKFold e GroupShuffleSplit
+
+Quando a pergunta é *"como o modelo se sai com um canal que nunca viu?"*, todos os posts de um canal precisam ficar do mesmo lado. O scikit-learn tem isso pronto:
+
+- `GroupKFold(n_splits=5)` com `groups=df["canal"]` gera folds sem canal repetido entre treino e teste;
+- `GroupShuffleSplit(test_size=0.25)` sorteia uma fração dos **grupos** (não das linhas) para o teste;
+- `StratifiedGroupKFold` tenta equilibrar uma variável (por exemplo, o setor) entre os folds, respeitando os grupos.
+
+Um ponto sutil: "canal que o modelo nunca viu" não quer dizer "canal sem histórico". A Lumina tem histórico no YouTube, e a mediana dos posts anteriores dela pode entrar como feature. O que muda é que **nenhum post dela foi usado para treinar**.
+
+O split por canal sozinho ainda deixa o treino ver o futuro dos outros canais. Por isso existe a combinação a seguir.
+
+---
+
+## Canal novo no futuro
+
+A pergunta mais exigente, e a mais próxima de um cliente novo da Galaxies, é: *"canal fora do treino, publicando depois do corte"*. O treino usa só canais do grupo de treino **e** só datas antes do corte menos o gap; o teste usa só canais do grupo de teste **e** só datas depois do corte. Os posts antigos dos canais de teste não entram no treino, mas continuam alimentando as features de histórico deles.
+
+No código, essa combinação dá o pior número da tabela (Spearman intra-canal de 0,117). Não é um defeito da validação: é o preço real de prever para quem o modelo nunca viu. Reporte os dois cenários, "próximo post de canal conhecido" (walk-forward) e "canal novo no futuro", e deixe claro qual deles vale para a Lumina.
+
+---
+
+## Onde fica a calibração
+
+No [módulo 5](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal), você vai calibrar intervalos de predição com <Termo id="conformal">predição conformal</Termo>. Ela precisa de um terceiro conjunto, o de **calibração**, com erros de um modelo que não o viu no treino. A ordem, por data, é:
+
+**treino** → gap → **calibração** → **teste**
+
+A calibração vem depois do treino porque a garantia de cobertura supõe que os erros do futuro se parecem com os da calibração: quanto mais perto do teste, melhor. E ela vem antes do teste porque o teste precisa continuar intocado. Atenção: no MAPIE 1.x, a função `train_conformalize_test_split` sorteia as linhas aleatoriamente. Para o case, separe os três blocos **por data, à mão** (último trecho do código).
+
+---
+
+## Na prática (código)
+
+<details>
+<summary>Passo 1: o gerador da base sintética (o mesmo em todo o módulo)</summary>
+
+```python
+import numpy as np
+import pandas as pd
+
+
+def gerar_base(n_canais=60, seed=42):
+    """Shorts sintéticos: nível próprio por canal + tendência lenta + ruído."""
+    rng = np.random.default_rng(seed)
+    efeito_rosto = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}
+    partes = []
+    for c in range(n_canais):
+        setor = ["moda", "beleza", "automotivo"][c % 3]
+        inscritos = int(np.exp(np.clip(rng.normal(11.3, 1.3), 8, 15.5)))
+        nivel = 0.85 * np.log(inscritos) - 4.2 + rng.normal(0, 0.55)
+        tendencia = np.cumsum(rng.normal(rng.normal(0, 0.03), 0.09, 32))  # por mês
+        inicio = rng.integers(0, 400) if rng.random() < 0.85 else rng.integers(700, 900)
+        n = max(8, int((960 - inicio) / rng.uniform(6, 20)))  # 1 post a cada 6-20 dias
+        dia = np.sort(rng.integers(inicio, 960, n))
+        hora = np.where(rng.random(n) < 0.4, rng.integers(18, 23, n), rng.integers(7, 24, n))
+        duracao = np.clip(rng.normal(38 if setor == "automotivo" else 28, 12, n), 8, 90).round()
+        rosto = rng.random(n) < (0.35 if setor == "automotivo" else 0.7)
+        texto_tela = rng.random(n) < 0.5
+        cortes_10s = np.clip(rng.normal(2.5, 1.0, n), 0, 6).round(1)
+        pergunta = rng.random(n) < 0.3
+        gancho = np.clip(rng.normal(5, 2, n), 0, 10).round()  # nota do VLM, 0-10
+        conteudo = (0.09 * (gancho - 5) + efeito_rosto[setor] * rosto + 0.15 * texto_tela
+                    + 0.05 * (cortes_10s - 2.5) - 0.05 * (duracao - 30) / 10
+                    + 0.06 * pergunta + 0.12 * ((hora >= 18) & (hora <= 22)))
+        viral = rng.random(n) < 0.03
+        y = (nivel + tendencia[dia // 30] + conteudo + rng.normal(0, 0.7, n)
+             + viral * rng.normal(1.5, 0.4, n))
+        curtidas = np.maximum(0, np.round(np.expm1(y)))
+        regime = np.where(dia >= 455, 1.7, 1.0)  # replays contam desde 31/03/2025
+        views = np.round((curtidas + 1) * np.exp(rng.normal(np.log(35), 0.35, n)) * regime)
+        partes.append(pd.DataFrame({
+            "canal": f"c{c:02d}", "setor": setor, "inscritos": inscritos,
+            "data_pub": pd.Timestamp("2024-01-01") + pd.to_timedelta(dia, "D")
+                        + pd.to_timedelta(hora, "h"),
+            "hora": hora, "duracao_s": duracao, "rosto": rosto, "texto_tela": texto_tela,
+            "cortes_10s": cortes_10s, "titulo_pergunta": pergunta,
+            "legenda_chars": np.clip(rng.normal(90, 45, n), 0, None).round(),
+            "gancho_vlm": gancho, "curtidas": curtidas, "views": views,
+            "comentarios": rng.poisson(curtidas * 0.02),
+        }))
+    df = pd.concat(partes, ignore_index=True)
+    df["y"] = np.log1p(df["curtidas"])
+    return df.sort_values(["data_pub", "canal"]).reset_index(drop=True)
+```
+
+</details>
+
+**Passo 2: as três funções de split.** Todas devolvem rótulos do índice do DataFrame e cortam por **data**, nunca por posição. Guarde-as num `splits.py`: a aula [2.5](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis) escreve testes para elas.
+
+```python
+def split_temporal(df, data_corte, gap_dias=0):
+    """Treino: antes de (corte - gap). Teste: a partir do corte."""
+    corte = pd.Timestamp(data_corte)
+    treino = df.index[df["data_pub"] < corte - pd.Timedelta(days=gap_dias)]
+    teste = df.index[df["data_pub"] >= corte]
+    return treino, teste
+
+def walk_forward(df, n_folds=4, gap_dias=30, inicio_teste="2025-09-01"):
+    """Janela expansiva: o futuro é fatiado em n_folds janelas por DATA."""
+    fim = df["data_pub"].max() + pd.Timedelta(days=1)
+    bordas = pd.date_range(pd.Timestamp(inicio_teste), fim, periods=n_folds + 1)
+    for ini, fim_janela in zip(bordas[:-1], bordas[1:]):
+        treino = df.index[df["data_pub"] < ini - pd.Timedelta(days=gap_dias)]
+        teste = df.index[(df["data_pub"] >= ini) & (df["data_pub"] < fim_janela)]
+        yield treino, teste
+
+def split_por_canal(df, frac=0.25, seed=0):
+    """Sorteia canais inteiros para o teste: nenhum canal aparece dos dois lados."""
+    canais = np.sort(df["canal"].unique())
+    rng = np.random.default_rng(seed)
+    teste_canais = rng.choice(canais, size=round(frac * len(canais)), replace=False)
+    no_teste = df["canal"].isin(teste_canais)
+    return df.index[~no_teste], df.index[no_teste]
+```
+
+**Passo 3: um modelo e uma função que o avalia em qualquer esquema.** De propósito, as features incluem o código do canal e o número de dias desde jan/2024, como muita gente faz na primeira versão. São exatamente as features que deixam o modelo "interpolar" o canal no tempo.
+
+```python
+import lightgbm as lgb
+from sklearn.model_selection import KFold
+
+df = gerar_base().sort_values(["canal", "data_pub"]).reset_index(drop=True)
+df["mediana_canal"] = df.groupby("canal")["y"].transform(
+    lambda s: s.shift(1).expanding().median())
+df["log_inscritos"] = np.log(df["inscritos"])
+df["dias"] = (df["data_pub"] - pd.Timestamp("2024-01-01")).dt.days
+df["canal_cod"] = df["canal"].astype("category").cat.codes  # "id do canal" como feature
+X_COLS = ["canal_cod", "dias", "log_inscritos", "mediana_canal", "hora", "duracao_s",
+          "rosto", "texto_tela", "cortes_10s", "titulo_pergunta", "gancho_vlm"]
+
+def spearman(a, b):
+    ra, rb = pd.Series(a).rank().to_numpy(), pd.Series(b).rank().to_numpy()
+    return 0.0 if ra.std() == 0 or rb.std() == 0 else float(np.corrcoef(ra, rb)[0, 1])
+
+def spearman_intra(y, p, canal, min_posts=3):
+    d = pd.DataFrame({"y": y, "p": p, "c": canal})
+    partes = [(spearman(x["y"], x["p"]), len(x)) for _, x in d.groupby("c")
+              if len(x) >= min_posts]
+    return sum(r * n for r, n in partes) / sum(n for _, n in partes)
+
+def avaliar(folds):
+    """Treina o MESMO modelo em cada fold e devolve as métricas médias."""
+    res = []
+    for tr, te in folds:
+        m = lgb.LGBMRegressor(n_estimators=400, learning_rate=0.05, num_leaves=31,
+                              n_jobs=1, random_state=0, verbose=-1)
+        m.fit(df.loc[tr, X_COLS].astype(float), df.loc[tr, "y"])
+        p = m.predict(df.loc[te, X_COLS].astype(float))
+        res.append({"MAE_log": np.abs(df.loc[te, "y"] - p).mean(),
+                    "spearman": spearman(df.loc[te, "y"], p),
+                    "spearman_intra": spearman_intra(df.loc[te, "y"].to_numpy(), p,
+                                                     df.loc[te, "canal"].to_numpy())})
+    return pd.DataFrame(res).mean()
+```
+
+**Passo 4: o mesmo modelo sob cinco esquemas.** O índice do DataFrame é `0..n-1`, então as posições que o `KFold` devolve coincidem com os rótulos usados no `.loc`.
+
+```python
+tr_c, te_c = split_por_canal(df, frac=0.25, seed=0)
+tr_t, te_t = split_temporal(df, "2026-03-01", gap_dias=30)
+esquemas = {
+    "KFold aleatório": KFold(5, shuffle=True, random_state=0).split(df),
+    "walk-forward (gap 30d)": walk_forward(df, n_folds=4, gap_dias=30),
+    "holdout temporal": [(tr_t, te_t)],
+    "canal novo": [(tr_c, te_c)],
+    "canal novo no futuro": [(tr_t.intersection(tr_c), te_t.intersection(te_c))],
+}
+tabela = pd.DataFrame({nome: avaliar(f) for nome, f in esquemas.items()}).T
+print(tabela.round(3))
+```
+
+```text
+                        MAE_log  spearman  spearman_intra
+KFold aleatório           0.680     0.860           0.268
+walk-forward (gap 30d)    0.760     0.845           0.167
+holdout temporal          0.803     0.841           0.167
+canal novo                0.774     0.830           0.219
+canal novo no futuro      0.945     0.785           0.117
+```
+
+Como ler:
+
+- **KFold aleatório** é o mais otimista em todas as colunas. É o número que você **não** reporta.
+- **Walk-forward** e **holdout temporal** medem "próximo post de canal conhecido". Eles cobrem períodos de teste diferentes (desde set/2025 e desde mar/2026), então os MAE não precisam coincidir.
+- **Canal novo** (split por canal, sem respeitar o tempo) ainda é otimista no intra-canal (0,219): o treino vê o futuro dos outros canais.
+- **Canal novo no futuro** é o mais duro e o mais realista para um cliente fora da base.
+
+**Passo 5: o `TimeSeriesSplit` num DataFrame ordenado por canal.**
+
+```python
+from sklearn.model_selection import TimeSeriesSplit
+
+for tr, te in TimeSeriesSplit(n_splits=3).split(df):  # df está ordenado por canal!
+    print("treino vai até", df.loc[tr, "data_pub"].max().date(),
+          "| teste começa em", df.loc[te, "data_pub"].min().date())
+```
+
+```text
+treino vai até 2026-08-16 | teste começa em 2024-02-15
+treino vai até 2026-08-17 | teste começa em 2024-01-23
+treino vai até 2026-08-17 | teste começa em 2024-03-31
+```
+
+Em todos os folds, o treino chega a ago/2026 e o teste começa em 2024. O nome da classe promete uma coisa e, neste formato de dados, entrega o oposto, sem nenhum aviso.
+
+**Passo 6: treino, calibração e teste por data.**
+
+```python
+def split_treino_cal_teste(df, inicio_cal, inicio_teste, gap_dias=30):
+    """Três blocos em ordem de data: treino | gap | calibração | teste."""
+    t_cal, t_teste = pd.Timestamp(inicio_cal), pd.Timestamp(inicio_teste)
+    treino = df.index[df["data_pub"] < t_cal - pd.Timedelta(days=gap_dias)]
+    cal = df.index[(df["data_pub"] >= t_cal) & (df["data_pub"] < t_teste)]
+    teste = df.index[df["data_pub"] >= t_teste]
+    return treino, cal, teste
+
+tr, cal, te = split_treino_cal_teste(df, "2026-01-01", "2026-04-01")
+print(len(tr), len(cal), len(te))
+```
+
+```text
+2255 426 711
+```
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A Lumina pergunta se A ou B vai render mais. Que esquema de validação sustenta a resposta?
+
+- Se a Lumina **está** na sua base, a pergunta é "próximo post de canal conhecido": walk-forward com gap de 30 dias.
+- Se **não está** (o caso mais provável, já que é uma cliente da Galaxies), a pergunta é "canal novo no futuro". O histórico dela, puxado pela API, alimenta as features de canal, mas nenhum post dela treinou o modelo.
+
+Na aula, a diferença entre os dois cenários no Spearman intra-canal é de 0,167 para 0,117. Se a sua base mostrar algo parecido, a confiança que você comunica à Lumina tem que vir do cenário **mais duro**. E o intervalo que o agente entregar para A e B (módulo 5) precisa ter sido calibrado num bloco de calibração posterior ao treino, por data.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas de validação]
+1. **Reportar KFold aleatório.** É a métrica mais otimista, e a diferença não é pequena: 60% a mais no Spearman intra-canal da aula.
+2. **Usar `TimeSeriesSplit` num painel de canais.** Ele corta por posição de linha. Escreva o split por data.
+3. **Esquecer o gap.** Sem ele, o treino inclui posts cujo alvo ainda não teria amadurecido no momento da previsão.
+4. **Ajustar hiperparâmetros olhando o teste.** A escolha acontece em folds de validação **dentro** do período de treino; o teste final é usado uma vez.
+5. **Sortear a calibração.** A calibração dos intervalos também é por data, entre o treino e o teste.
+6. **Um único fold curto.** Um holdout de poucas semanas depende demais do acaso daquele período. Prefira walk-forward e reporte a variação entre os folds.
+7. **Split por canal quando a pergunta é temporal (ou o contrário).** Cada esquema responde a uma pergunta. Escolha pela pergunta de uso.
+:::
+
+<Quiz
+  id="m2-a3"
+  perguntas={[
+    {
+      pergunta: 'Com o mesmo modelo, o KFold aleatório dá Spearman intra-canal 0,27 e o walk-forward dá 0,17. O que você reporta?',
+      opcoes: [
+        {texto: 'A média dos dois, 0,22.', explicacao: 'Média de uma métrica otimista com uma honesta continua otimista, e sem significado claro.'},
+        {texto: 'O walk-forward (0,17), porque simula prever posts que ainda não existem.', correta: true, explicacao: 'Exato. O KFold mede a capacidade de interpolar o passado conhecendo o antes e o depois de cada post.'},
+        {texto: 'O KFold (0,27), porque usa todos os dados no teste.', explicacao: 'Usar todos os dados não compensa medir a pergunta errada.'},
+      ],
+    },
+    {
+      pergunta: 'Você usou `TimeSeriesSplit(n_splits=3)` num DataFrame ordenado por canal e depois por data. O que acontece?',
+      opcoes: [
+        {texto: 'Funciona, porque dentro de cada canal os posts estão em ordem de data.', explicacao: 'O `TimeSeriesSplit` não sabe que existem canais: ele corta pela posição da linha no DataFrame inteiro.'},
+        {texto: 'O teste vira "os últimos canais da lista", e o treino inclui posts de datas posteriores ao teste.', correta: true, explicacao: 'Exato, como mostra o passo 5: o treino vai até ago/2026 e o teste começa em 2024.'},
+        {texto: 'Dá erro, porque o índice não é do tipo data.', explicacao: 'Não dá erro nenhum. Esse é justamente o perigo.'},
+      ],
+    },
+    {
+      pergunta: 'Por que usar um gap de 30 dias entre treino e teste neste projeto?',
+      opcoes: [
+        {texto: 'Para ter menos dados de treino e evitar overfitting.', explicacao: 'O objetivo não é reduzir o treino, e sim reproduzir uma limitação real.'},
+        {texto: 'Porque o alvo só amadurece 30 dias após a publicação: ao treinar hoje, os posts mais recentes com alvo conhecido são de 30 dias atrás.', correta: true, explicacao: 'Exato. O gap faz a avaliação respeitar o que se sabe no momento do treino, e ainda reduz o contágio na fronteira.'},
+        {texto: 'Porque a YouTube Data API só devolve vídeos com mais de 30 dias.', explicacao: 'A API devolve vídeos recentes normalmente. O problema é a maturidade do alvo.'},
+      ],
+    },
+    {
+      pergunta: 'A Galaxies vai usar o agente para uma marca que não está na sua base. Qual esquema estima melhor o desempenho nesse uso?',
+      opcoes: [
+        {texto: 'Walk-forward com todos os canais.', explicacao: 'Mede "próximo post de canal conhecido": o canal da marca teria posts no treino.'},
+        {texto: 'Split por canal sem respeitar o tempo.', explicacao: 'Melhor, mas o treino ainda vê o futuro dos outros canais: continua otimista.'},
+        {texto: 'Canal novo no futuro: canais de teste fora do treino e datas de teste depois do corte.', correta: true, explicacao: 'Exato. É o esquema mais exigente e o que reproduz o caso de um cliente novo.'},
+      ],
+    },
+    {
+      pergunta: 'Onde deve ficar o conjunto de calibração dos intervalos (conformal)?',
+      opcoes: [
+        {texto: 'Sorteado aleatoriamente de toda a base, com `train_conformalize_test_split`.', explicacao: 'No MAPIE 1.x essa função sorteia as linhas: mistura passado e futuro.'},
+        {texto: 'Entre o treino e o teste, por data.', correta: true, explicacao: 'Exato: treino, gap, calibração, teste. A calibração fica perto do regime do teste sem tocá-lo.'},
+        {texto: 'Dentro do próprio conjunto de teste.', explicacao: 'Calibrar no teste contamina a avaliação da cobertura.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: janela expansiva ou deslizante?]
+Escreva uma variação do `walk_forward` que use só os últimos `janela_dias` de treino antes do gap (janela deslizante). Compare 365 e 180 dias com a janela expansiva, usando a função `avaliar` do passo 3. Qual vence na base sintética? Em que situação da sua base real você esperaria o contrário?
+:::
+
+<details>
+<summary>Ver uma solução (continua o código do passo 3)</summary>
+
+```python
+def walk_forward_deslizante(df, janela_dias=365, **kwargs):
+    """Igual ao walk_forward, mas o treino só usa os últimos `janela_dias` antes do gap."""
+    for treino, teste in walk_forward(df, **kwargs):
+        limite = df.loc[treino, "data_pub"].max() - pd.Timedelta(days=janela_dias)
+        yield treino[df.loc[treino, "data_pub"] >= limite], teste
+
+print(pd.DataFrame({
+    "expansiva": avaliar(walk_forward(df, n_folds=4, gap_dias=30)),
+    "deslizante 365d": avaliar(walk_forward_deslizante(df, janela_dias=365, n_folds=4, gap_dias=30)),
+    "deslizante 180d": avaliar(walk_forward_deslizante(df, janela_dias=180, n_folds=4, gap_dias=30)),
+}).T.round(3))
+```
+
+```text
+                 MAE_log  spearman  spearman_intra
+expansiva          0.760     0.845           0.167
+deslizante 365d    0.766     0.834           0.149
+deslizante 180d    0.768     0.835           0.128
+```
+
+Na base sintética, a expansiva vence: os efeitos do conteúdo não mudam com o tempo, então mais dados só ajudam. Na base real, a deslizante pode vencer se houver quebra de regime, por exemplo se você usasse views como alvo (a contagem mudou em mar/2025 e em ago/2026) ou se um formato de Short deixou de funcionar. Esse é mais um motivo para preferir curtidas como alvo.
+
+</details>
+
+---
+
+## Resumo
+
+- O esquema de validação precisa **simular o uso**: treino no passado, teste no futuro e, para cliente novo, canais de teste fora do treino.
+- **KFold aleatório** é otimista em dados de canal ao longo do tempo (na aula, +60% no Spearman intra-canal) e não entra no relatório.
+- Use **holdout temporal com gap** de 30 dias e **walk-forward** por data, reportando a média e cada fold. O `TimeSeriesSplit` corta por posição, não por data.
+- **GroupKFold/GroupShuffleSplit** respondem "canal nunca visto"; **canal novo no futuro** combina grupo e tempo e é o cenário da Lumina.
+- A **calibração** dos intervalos fica entre o treino e o teste, por data.
+
+## Referências
+
+- Bergmeir e Benítez. [*On the use of cross-validation for time series predictor evaluation*](https://doi.org/10.1016/j.ins.2011.12.028). Information Sciences, 2012.
+- Roberts et al. [*Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure*](https://doi.org/10.1111/ecog.02881). Ecography, 2017. Validação em blocos quando os dados têm estrutura de grupo e tempo.
+- López de Prado. *Advances in Financial Machine Learning*, cap. 7 ("Cross-Validation in Finance"). Wiley, 2018. Origem dos termos *purging* e *embargo*.
+- Hyndman e Athanasopoulos. [*Forecasting: Principles and Practice*, seção "Time series cross-validation"](https://otexts.com/fpp3/tscv.html).
+- scikit-learn. [Cross-validation: evaluating estimator performance](https://scikit-learn.org/stable/modules/cross_validation.html), seções sobre dados agrupados e séries temporais; [`TimeSeriesSplit`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html); [`GroupKFold`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.GroupKFold.html); [`StratifiedGroupKFold`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.StratifiedGroupKFold.html).
+
+**Próxima aula:** [Métricas de erro e de ordenação](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao): MAE em log, MAPE, Spearman global e intra-canal, par-a-par e o intervalo de confiança de cada uma.

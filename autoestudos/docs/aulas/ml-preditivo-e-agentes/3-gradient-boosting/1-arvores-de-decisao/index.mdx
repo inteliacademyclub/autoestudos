@@ -1,0 +1,524 @@
+---
+sidebar_position: 1
+sidebar_label: 'Árvores de decisão por dentro'
+title: 'Árvores de decisão por dentro'
+description: 'Como uma árvore de regressão escolhe cada pergunta, por que ela lida bem com dados tabulares e por que, sozinha, ela é instável demais para o projeto.'
+tags: [ml-preditivo, gradient-boosting, arvores]
+---
+
+import TreeSplitter from '@site/src/components/interativos/TreeSplitter';
+
+# Árvores de Decisão por Dentro: Como um Modelo Aprende a Fazer Perguntas
+
+<LessonMeta
+  tempo="45 min"
+  semana={2}
+  etapa="modelo"
+  objetivos={[
+    'Calcular a redução de erro quadrático (SSE) de um split e explicar como a árvore escolhe a melhor pergunta',
+    'Controlar a complexidade da árvore com profundidade, número de folhas e min_samples_leaf',
+    'Explicar por que árvores lidam bem com não-linearidade, interações e escala das features',
+    'Treinar e ler uma DecisionTreeRegressor numa base sintética de Shorts com split temporal',
+    'Demonstrar a instabilidade (alta variância) de uma árvore única',
+  ]}
+  prerequisitos={[
+    {label: 'Anatomia de um problema supervisionado', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/anatomia-de-um-problema-supervisionado'},
+    {label: 'Baselines', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/baselines'},
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+  ]}
+/>
+
+Você passou os últimos meses trabalhando com modelos de bilhões de parâmetros. O modelo que vai produzir o número dentro do seu agente é bem mais modesto: uma soma de algumas centenas de blocos `if/else`. Cada bloco faz perguntas do tipo "o canal tem mais de 110 mil inscritos?" ou "o gancho tem nota maior que 6?" e, no fim, devolve uma média.
+
+Parece um retrocesso, mas não é. Em 2022, Grinsztajn, Oyallon e Varoquaux compararam modelos em 45 conjuntos de dados tabulares de tamanho médio (cerca de 10 mil linhas) e concluíram que métodos baseados em árvores, como XGBoost e random forest, ainda superavam as redes neurais profundas nesse regime. A base que você está montando para a Galaxies, com alguns milhares de Shorts e dezenas de colunas, é exatamente esse caso.
+
+Antes de somar centenas de árvores, que é o que o gradient boosting faz, você precisa entender uma árvore só: como ela escolhe cada pergunta, o que controla o tamanho dela e por que, sozinha, ela é instável demais para decidir entre o Short A e o Short B da Lumina.
+
+:::info[Ambiente deste módulo]
+Todo o código do módulo 3 foi executado com Python 3.12 e estas versões:
+
+```bash
+uv add pandas==3.0.6 numpy==2.5.3 scipy==1.18.1 scikit-learn==1.9.1 \
+  lightgbm==4.7.0 catboost==1.2.10 xgboost==3.4.1 optuna==5.0.0 pyarrow==25.0.1 \
+  sentence-transformers==6.1.0 torch==2.14.0
+```
+
+- As aulas 3.1 a 3.5 rodam em CPU em poucos segundos.
+- A aula 3.6 baixa um modelo de embeddings do Hugging Face na primeira execução.
+- Os dados são **sintéticos**, gerados pelo arquivo `shorts_sinteticos.py` que você cria nesta aula. Os efeitos são conhecidos de propósito, para você conferir se o modelo os recupera. Os números absolutos não representam o YouTube real.
+:::
+
+:::info[A ideia central]
+Uma **árvore de regressão** divide o espaço das features em retângulos, fazendo uma pergunta de sim/não por vez. Cada pergunta é escolhida de forma **gulosa**: entre todas as features e todos os limiares possíveis, a árvore fica com o split que mais reduz o erro quadrático. Em cada retângulo final (a **folha**), a previsão é a média do alvo dos exemplos de treino que caíram ali.
+:::
+
+---
+
+## Uma árvore é uma sequência de perguntas
+
+Leia a árvore abaixo de cima para baixo. Um Short novo entra pela **raiz**, responde à primeira pergunta, desce para o lado do "sim" ou do "não", responde à próxima e assim por diante até chegar a uma **folha**. A folha guarda um número: a previsão $$\hat{y}$$ em $$\log(1+\text{curtidas})$$.
+
+<Sketch name="m3/arvore-de-regressao" alt="À esquerda, uma árvore de profundidade 2: a raiz pergunta se log_inscritos é menor ou igual a 11,6; o lado sim pergunta se o gancho é menor ou igual a 4,5 e o lado não pergunta se o gancho é menor ou igual a 6,5; as quatro folhas preveem 4,9, 5,4, 6,6 e 7,3. À direita, o mesmo modelo desenhado como quatro retângulos num plano com log_inscritos no eixo horizontal e gancho no vertical: um corte vertical em 11,6 e cortes horizontais em 4,5 à esquerda e 6,5 à direita." caption="A mesma árvore como perguntas (esquerda) e como partição do espaço das features (direita)." />
+
+O lado direito do diagrama mostra o que a árvore faz geometricamente: cada pergunta é um corte paralelo a um eixo, e cada folha é um retângulo. A previsão é **constante por partes**: dentro de um retângulo, todos os Shorts recebem o mesmo número, e ela muda em degraus quando você cruza um corte.
+
+Três termos que vão aparecer em todas as bibliotecas:
+
+- **profundidade** (*depth*): o número máximo de perguntas entre a raiz e uma folha. Uma árvore de profundidade $$d$$ tem até $$2^d$$ folhas;
+- **folha** (*leaf*): um nó sem filhos, onde a previsão é feita;
+- **split**: o par (feature, limiar) de um nó interno.
+
+---
+
+## Como a árvore escolhe a pergunta
+
+Suponha que um nó contém o conjunto $$S$$ de posts de treino. O erro desse nó, se ele previsse a média $$\bar{y}_S$$ para todos, é a soma dos quadrados dos resíduos (*sum of squared errors*, SSE):
+
+$$
+\text{SSE}(S) = \sum_{i \in S} \left(y_i - \bar{y}_S\right)^2
+$$
+
+Um split na feature $$j$$ com limiar $$t$$ divide $$S$$ em $$E = \{i : x_{ij} \le t\}$$ e $$D = \{i : x_{ij} > t\}$$. O **ganho** do split é quanto o erro cai:
+
+$$
+\Delta(j, t) = \text{SSE}(S) - \text{SSE}(E) - \text{SSE}(D)
+$$
+
+Como $$\text{SSE}(S) = |S| \cdot \text{Var}(S)$$, isso é o mesmo que a **redução de variância ponderada** pelo tamanho de cada lado. A árvore testa todas as features e, para cada uma, todos os limiares candidatos (os pontos médios entre valores consecutivos já ordenados), e escolhe o par com maior $$\Delta$$. Depois repete o processo, recursivamente, em $$E$$ e em $$D$$.
+
+Por que a média na folha? Porque, para a perda quadrática, a constante $$c$$ que minimiza $$\sum_i (y_i - c)^2$$ é justamente a média. Se a perda fosse o erro absoluto, o melhor valor seria a mediana. Guarde essa ligação entre perda e valor da folha: ela é o coração do gradient boosting na [aula 3.3](/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo).
+
+Veja o cálculo com oito Shorts de um mesmo canal, usando só a nota do gancho:
+
+```python
+import numpy as np
+
+# 8 Shorts de um mesmo canal: nota do gancho (0-10) e y = log1p(curtidas)
+gancho = np.array([2, 3, 4, 5, 6, 7, 8, 9])
+y = np.array([5.0, 5.3, 5.1, 5.6, 5.4, 6.1, 6.3, 6.0])
+
+def sse(v):
+    return ((v - v.mean()) ** 2).sum() if len(v) else 0.0
+
+print(f"SSE do nó pai: {sse(y):.3f}")
+for t in (gancho[:-1] + gancho[1:]) / 2:          # limiares candidatos: pontos médios
+    esq, dir_ = y[gancho <= t], y[gancho > t]
+    ganho = sse(y) - sse(esq) - sse(dir_)
+    print(f"gancho <= {t:.1f}: esq={esq.mean():.2f} (n={len(esq)})  "
+          f"dir={dir_.mean():.2f} (n={len(dir_)})  ganho={ganho:.3f}")
+```
+
+```text
+SSE do nó pai: 1.640
+gancho <= 2.5: esq=5.00 (n=1)  dir=5.69 (n=7)  ganho=0.411
+gancho <= 3.5: esq=5.15 (n=2)  dir=5.75 (n=6)  ganho=0.540
+gancho <= 4.5: esq=5.13 (n=3)  dir=5.88 (n=5)  ganho=1.045
+gancho <= 5.5: esq=5.25 (n=4)  dir=5.95 (n=4)  ganho=0.980
+gancho <= 6.5: esq=5.28 (n=5)  dir=6.13 (n=3)  ganho=1.365
+gancho <= 7.5: esq=5.42 (n=6)  dir=6.15 (n=2)  ganho=0.807
+gancho <= 8.5: esq=5.54 (n=7)  dir=6.00 (n=1)  ganho=0.183
+```
+
+O vencedor é `gancho <= 6.5`, que tira 1,365 dos 1,640 de SSE. Numa base real, a árvore faz esse mesmo cálculo para cada feature (inscritos, duração, hora...) e fica com o melhor split entre todas. Ordenando cada coluna uma vez, o custo é de ordem $$n \log n$$ por feature, o que explica por que treinar uma árvore em milhares de linhas leva milissegundos.
+
+Repare no que o algoritmo **não** faz: ele não olha dois passos à frente. Um split fraco que abriria caminho para um ótimo split embaixo pode nunca ser escolhido; essa miopia gulosa é o preço da velocidade.
+
+Experimente você mesmo: no componente abaixo, escolha a feature e arraste o limiar. O componente mostra a redução de erro de cada escolha; tente achar o melhor split para cada feature. Os dados do componente são **simulados**, com os mesmos efeitos de conteúdo do gerador desta aula.
+
+<TreeSplitter />
+
+---
+
+## Profundidade, folhas e min_samples_leaf
+
+Se ninguém mandar parar, a árvore continua dividindo até cada folha ter um único post, ou posts com o mesmo alvo. Nesse ponto ela decorou o treino, e o erro de treino vai a zero. É o <Termo id="overfitting">overfitting</Termo> na sua forma mais pura.
+
+Os hiperparâmetros que controlam o tamanho da árvore no scikit-learn são:
+
+| Hiperparâmetro | O que faz | Efeito típico |
+| :--- | :--- | :--- |
+| `max_depth` | limita o número de perguntas da raiz até a folha | o controle mais direto; 3 a 8 é comum para árvore única |
+| `min_samples_leaf` | exige um mínimo de exemplos em cada folha | suaviza a previsão; evita folhas com 1 ou 2 posts |
+| `max_leaf_nodes` | limita o número total de folhas | cresce a árvore pelos melhores splits primeiro |
+| `min_impurity_decrease` | só aceita splits com ganho mínimo | corta splits marginais |
+| `ccp_alpha` | poda por custo-complexidade depois de crescer | alternativa à parada antecipada |
+
+A tabela abaixo foi gerada com o código da seção "Na prática", treinando no período até dez/2025 e testando em 2026 (split temporal). Veja o padrão clássico: o erro de treino só cai, e o de teste cai, chega a um mínimo e volta a subir.
+
+```text
+prof. | folhas | MAE treino | MAE teste
+    1 |      2 |      0.820 |     0.923
+    2 |      4 |      0.679 |     0.742
+    3 |      8 |      0.627 |     0.680
+    4 |     16 |      0.592 |     0.672
+    6 |     61 |      0.518 |     0.654
+    8 |    202 |      0.418 |     0.689
+   12 |   1046 |      0.148 |     0.769
+ None |   2013 |      0.000 |     0.791
+```
+
+A árvore sem limite tem 2.013 folhas para 2.034 posts de treino: praticamente uma folha por post, e erro de treino zero por decoreba. O ponto ótimo fica em torno da profundidade 6. Com `min_samples_leaf=20`, sem limitar a profundidade, o MAE de teste chega a 0,642, um pouco melhor: exigir folhas "populosas" costuma funcionar melhor do que cortar a árvore numa altura fixa, porque a árvore pode ir fundo onde há muitos dados e ficar rasa onde há poucos.
+
+:::warning[Escolher a profundidade olhando o teste é trapaça]
+A tabela acima usa o teste só para mostrar o fenômeno. No projeto, você escolhe hiperparâmetros num conjunto de **validação** temporal (ou em <Termo id="walk-forward">walk-forward</Termo>) e toca o teste uma única vez, no fim. A [aula 3.4](/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost) monta essa busca com Optuna.
+:::
+
+---
+
+## Por que árvores gostam de dados tabulares
+
+Quatro propriedades explicam por que árvores (e as somas de árvores) dominam problemas como o seu.
+
+**1. Não-linearidade e limiares de graça.** O efeito do horário no gerador sintético é um degrau: publicar entre 18h e 22h soma 0,12 no log das curtidas, e fora disso não soma nada. Uma regressão linear sobre a hora não enxerga um degrau no meio da escala. A árvore resolve com dois splits (`hora > 17.5` e `hora <= 22.5`).
+
+**2. Interações sem você pedir.** No gerador, aparecer um rosto vale +0,35 em beleza, +0,15 em moda e só +0,05 em automotivo. Num modelo linear, você precisaria criar a coluna `rosto × setor` na mão. A árvore captura isso sozinha: basta um split em `setor_beleza` seguido de um split em `rosto` só naquele ramo. O diagrama mostra o mesmo fenômeno: o limiar do gancho muda conforme o tamanho do canal.
+
+**3. Escala não importa.** Um split só depende da **ordem** dos valores. Qualquer transformação monotônica (log, raiz, padronização) gera exatamente a mesma partição dos dados de treino. Testamos: treinar com `inscritos` cru ou com `log(inscritos)` levou os 2.034 posts de treino para as mesmas folhas, e as previsões de teste foram idênticas. Não é preciso padronizar nada. O log continua útil para **você** ler os splits e para outros modelos, mas a árvore não precisa dele.
+
+**4. Valores ausentes.** LightGBM e XGBoost tratam `NaN` nativamente, aprendendo para qual lado mandar os ausentes em cada split; no scikit-learn, `DecisionTreeRegressor` aceita `NaN` desde a versão 1.3. No projeto, vários atributos vão faltar: vídeos sem fala não têm transcrição, e o VLM às vezes falha.
+
+As fraquezas vêm do mesmo lugar. A previsão é constante por partes, então um efeito linear e suave (como os +0,09 por ponto de gancho) vira uma escada que precisa de muitos splits para ser aproximada. E a árvore **não extrapola**: um canal com 10 milhões de inscritos, maior que todos do treino, cai na mesma folha do maior canal visto e recebe a mesma previsão.
+
+---
+
+## O calcanhar de Aquiles: instabilidade
+
+Uma árvore é um modelo de **alta variância**: pequenas mudanças no treino podem mudar a primeira pergunta, e toda a estrutura embaixo muda junto, porque cada split depende dos anteriores.
+
+Dá para medir isso. O trecho abaixo treina 50 árvores de profundidade 6, cada uma numa reamostragem com reposição (*bootstrap*) do mesmo treino, e observa as previsões para os dois Shorts da Lumina e para o conjunto de teste:
+
+```text
+raiz mais comum: [('log_inscritos <= 11.63', 32), ('log_inscritos <= 11.18', 18)]
+A: média 6.67, desvio 0.22
+B: média 7.40, desvio 0.22
+B - A: média 0.73, mín 0.00, máx 1.33, empates (mesma folha) 4%
+desvio médio entre árvores no teste: 0.31
+```
+
+A raiz alterna entre dois limiares, e a previsão de um mesmo post de teste varia, em média, 0,31 em log (cerca de 36% em curtidas) só porque o treino foi reamostrado. Para comparar dois criativos do mesmo canal, cuja diferença verdadeira pode ser de poucos décimos, isso é ruído demais. A [próxima aula](/aulas/ml-preditivo-e-agentes/gradient-boosting/bagging-vs-boosting) mostra as duas saídas clássicas: tirar a média de muitas árvores (bagging) ou somar árvores pequenas em sequência (boosting).
+
+---
+
+## Na prática: uma árvore no scikit-learn
+
+Primeiro, o gerador sintético que o módulo inteiro vai usar. Salve os dois trechos abaixo, em sequência, no arquivo `shorts_sinteticos.py`. Ele cria 60 canais (20 por setor) com cerca de 2.600 Shorts entre jan/2024 e jun/2026. Cada canal tem um nível próprio e uma tendência que muda mês a mês, e o conteúdo tem efeitos conhecidos, iguais aos do simulador dos componentes interativos. O título carrega efeitos escondidos que a [aula 3.6](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto) vai tentar recuperar.
+
+```python title="shorts_sinteticos.py (parte 1 de 2)"
+# shorts_sinteticos.py: base SINTÉTICA de Shorts com efeitos conhecidos.
+# Espelha o simulador dos componentes interativos da trilha. Não são dados reais.
+import numpy as np
+import pandas as pd
+
+# Efeitos verdadeiros, em escala log (somam no log das curtidas)
+EFEITOS = {"gancho": 0.09, "texto_tela": 0.15, "energia": 0.05, "duracao_10s": -0.05,
+           "horario_nobre": 0.12, "rosto": {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}}
+# Efeitos escondidos no título (a aula 3.6 tenta recuperá-los a partir do texto)
+FORMATOS = {"antes e depois": 0.20, "tutorial": -0.05, "review": 0.0, "dica": 0.05}
+EFEITOS_TITULO = {"pergunta": 0.06, "cta": 0.05}  # hashtags, emoji e caixa alta: efeito zero
+MODELOS = {
+    "antes e depois": ["Antes e depois: {t}", "Transformação com {t}", "Olha a diferença: {t}"],
+    "tutorial": ["Tutorial de {t} em 5 passos", "Como fazer {t} passo a passo", "Aprenda {t} do jeito certo"],
+    "review": ["Testei {t} por uma semana", "Review sincero: {t}", "Minha opinião sobre {t}"],
+    "dica": ["Dica rápida de {t}", "1 truque para {t}", "Ninguém te conta isso sobre {t}"],
+}
+TEMAS = {"beleza": ["base líquida", "delineado", "pele glow", "skincare", "batom matte"],
+         "moda": ["look de inverno", "jeans reto", "tênis branco", "alfaiataria", "peças básicas"],
+         "automotivo": ["SUV compacto", "troca de óleo", "câmbio automático", "carro elétrico", "pneu aro 17"]}
+
+
+def _titulo(rng, setor):
+    formato = str(rng.choice(list(FORMATOS)))
+    pergunta, cta = rng.random() < 0.2, rng.random() < 0.25
+    t = str(rng.choice(MODELOS[formato])).format(t=rng.choice(TEMAS[setor]))
+    if pergunta:
+        t = str(rng.choice(["Vale a pena? ", "Funciona mesmo? ", "Você sabia? "])) + t
+    if cta:
+        t += str(rng.choice([" | comenta aqui", " | salva pra depois", " | link na bio"]))
+    if rng.random() < 0.1:
+        t = t.upper()
+    t += " ✨" * (rng.random() < 0.3) + " #shorts" * (rng.random() < 0.7)
+    efeito = FORMATOS[formato] + EFEITOS_TITULO["pergunta"] * pergunta + EFEITOS_TITULO["cta"] * cta
+    return t, efeito
+```
+
+```python title="shorts_sinteticos.py (parte 2 de 2)"
+def gerar_shorts(canais_por_setor=20, posts_por_canal=45, seed=7):
+    rng = np.random.default_rng(seed)
+    inicio, dias_total, linhas = pd.Timestamp("2024-01-01", tz="America/Sao_Paulo"), 900, []
+    for setor in ["moda", "beleza", "automotivo"]:
+        for c in range(canais_por_setor):
+            canal = f"{setor[:4]}_{c:02d}"
+            log_insc = np.clip(rng.normal(11.3, 1.5), 7.5, 16)
+            nivel = 0.85 * log_insc - 4.2 + rng.normal(0, 0.55)       # nível próprio do canal
+            passos = rng.normal(rng.normal(0, 0.03), 0.09, dias_total // 30 + 1)
+            tendencia = np.cumsum(passos) - passos[0]                  # passeio aleatório mensal
+            n = max(12, round(posts_por_canal * rng.uniform(0.6, 1.4)))
+            for k, dia in enumerate(np.sort(rng.integers(rng.integers(0, 200), dias_total, n))):
+                hora = int(rng.integers(18, 23) if rng.random() < 0.4 else rng.integers(7, 24))
+                p = dict(duracao_s=int(np.clip(rng.normal(38 if setor == "automotivo" else 28, 12), 8, 90)),
+                         gancho=int(np.clip(round(rng.normal(5, 2)), 0, 10)),
+                         rosto=bool(rng.random() < (0.35 if setor == "automotivo" else 0.7)),
+                         texto_tela=bool(rng.random() < 0.5),
+                         energia=int(np.clip(round(rng.normal(5, 2.2)), 0, 10)))
+                titulo, ef_titulo = _titulo(rng, setor)
+                sinal = (nivel + tendencia[dia // 30] + ef_titulo
+                         + EFEITOS["gancho"] * (p["gancho"] - 5) + EFEITOS["rosto"][setor] * p["rosto"]
+                         + EFEITOS["texto_tela"] * p["texto_tela"] + EFEITOS["energia"] * (p["energia"] - 5)
+                         + EFEITOS["duracao_10s"] * (p["duracao_s"] - 30) / 10
+                         + EFEITOS["horario_nobre"] * (18 <= hora <= 22))
+                local = inicio + pd.Timedelta(days=int(dia), hours=hora, minutes=int(rng.integers(0, 60)))
+                linhas.append(dict(video_id=f"{canal}_{k:03d}", canal_id=canal, setor=setor,
+                                   inscritos=int(np.exp(log_insc + tendencia[-1])),  # snapshot da coleta
+                                   published_at=local.tz_convert("UTC"), titulo=titulo, **p,
+                                   hora=hora, dia_semana=local.dayofweek, sinal_verdadeiro=sinal,
+                                   curtidas=round(float(np.expm1(max(sinal + rng.normal(0, 0.5), 0))))))
+    df = pd.DataFrame(linhas).sort_values("published_at", ignore_index=True)
+    df["y"] = np.log1p(df["curtidas"])
+    return df
+```
+
+Três detalhes do gerador que importam para as próximas aulas:
+
+- `published_at` sai em **UTC**, como na YouTube Data API; `hora` e `dia_semana` estão no horário de São Paulo;
+- `inscritos` é o valor **no momento da coleta**, como o seu coletor do módulo 1 obtém. Ele "sabe" um pouco do crescimento futuro do canal, e a [aula 3.5](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-do-canal-e-do-tempo) trata disso;
+- `sinal_verdadeiro` é o valor sem ruído. Ele só existe porque os dados são sintéticos: serve para medir o quanto um modelo se aproxima da verdade, e **nunca** pode ser feature.
+
+Agora, a árvore. O split é temporal: treino até 31/12/2025, teste a partir de 01/01/2026.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.tree import DecisionTreeRegressor, export_text
+from sklearn.metrics import mean_absolute_error
+from shorts_sinteticos import gerar_shorts
+
+df = gerar_shorts()
+df["log_inscritos"] = np.log(df["inscritos"])
+df = pd.concat([df, pd.get_dummies(df["setor"], prefix="setor", dtype=int)], axis=1)
+FEATURES = ["log_inscritos", "setor_beleza", "setor_moda", "setor_automotivo", "duracao_s",
+            "gancho", "rosto", "texto_tela", "energia", "hora", "dia_semana"]
+
+corte = pd.Timestamp("2026-01-01", tz="UTC")          # split temporal (módulo 2)
+treino, teste = df[df["published_at"] < corte], df[df["published_at"] >= corte]
+print(f"treino: {len(treino)} posts | teste: {len(teste)} posts")
+
+arvore = DecisionTreeRegressor(max_depth=3, min_samples_leaf=30, random_state=0)
+arvore.fit(treino[FEATURES], treino["y"])
+print(export_text(arvore, feature_names=FEATURES, decimals=2))
+
+mae = lambda m: mean_absolute_error(teste["y"], m)
+print(f"MAE baseline (média do treino): {mae(np.full(len(teste), treino['y'].mean())):.3f}")
+print(f"MAE árvore profundidade 3:      {mae(arvore.predict(teste[FEATURES])):.3f}")
+print(f"MAE do 'oráculo' (sinal real):  {mae(teste['sinal_verdadeiro']):.3f}")
+```
+
+```text
+treino: 2034 posts | teste: 573 posts
+|--- log_inscritos <= 11.63
+|   |--- log_inscritos <= 10.35
+|   |   |--- log_inscritos <= 7.81
+|   |   |   |--- value: [3.17]
+|   |   |--- log_inscritos >  7.81
+|   |   |   |--- value: [4.40]
+|   |--- log_inscritos >  10.35
+|   |   |--- log_inscritos <= 11.18
+|   |   |   |--- value: [5.32]
+|   |   |--- log_inscritos >  11.18
+|   |   |   |--- value: [5.79]
+|--- log_inscritos >  11.63
+|   |--- log_inscritos <= 13.86
+|   |   |--- log_inscritos <= 11.98
+|   |   |   |--- value: [6.46]
+|   |   |--- log_inscritos >  11.98
+|   |   |   |--- value: [6.99]
+|   |--- log_inscritos >  13.86
+|   |   |--- gancho <= 4.50
+|   |   |   |--- value: [8.01]
+|   |   |--- gancho >  4.50
+|   |   |   |--- value: [8.57]
+
+MAE baseline (média do treino): 1.440
+MAE árvore profundidade 3:      0.681
+MAE do 'oráculo' (sinal real):  0.389
+```
+
+A saída resume o problema inteiro do projeto:
+
+- **O tamanho do canal domina.** Seis dos sete splits são em `log_inscritos`. Com 3 perguntas, a árvore prefere separar canais grandes de pequenos, e o conteúdo (o gancho) só aparece no último nível, num ramo com poucos canais. É o que a literatura diz sobre dados reais: o nível de curtidas é dominado pelo canal.
+- **O teto não é zero.** O "oráculo" que conhece o sinal verdadeiro ainda erra 0,389 em média, porque o ruído do gerador tem desvio 0,5 e, para um ruído normal, o MAE esperado é $$0{,}5\sqrt{2/\pi} \approx 0{,}40$$. Nenhum modelo vai abaixo disso. Nos seus dados reais você não conhece esse piso, mas ele existe.
+- **Há espaço entre 0,68 e 0,39.** Parte dele é a tendência de cada canal, que nenhuma feature desta tabela enxerga. As features de histórico da aula 3.5 atacam exatamente esse buraco.
+
+A tabela de profundidades da seção anterior e o experimento de instabilidade saem destes dois trechos, que continuam o anterior:
+
+```python
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import mean_absolute_error as mae
+
+print("prof. | folhas | MAE treino | MAE teste")
+for prof in [1, 2, 3, 4, 6, 8, 12, None]:
+    m = DecisionTreeRegressor(max_depth=prof, random_state=0).fit(treino[FEATURES], treino["y"])
+    print(f"{str(prof):>5} | {m.get_n_leaves():>6} | {mae(treino['y'], m.predict(treino[FEATURES])):>10.3f}"
+          f" | {mae(teste['y'], m.predict(teste[FEATURES])):>9.3f}")
+
+print("\nmin_samples_leaf (sem limite de profundidade)")
+for msl in [1, 5, 20, 50, 100, 200]:
+    m = DecisionTreeRegressor(min_samples_leaf=msl, random_state=0).fit(treino[FEATURES], treino["y"])
+    print(f"{msl:>5} | {m.get_n_leaves():>6} | {mae(treino['y'], m.predict(treino[FEATURES])):>10.3f}"
+          f" | {mae(teste['y'], m.predict(teste[FEATURES])):>9.3f}")
+```
+
+```python
+from collections import Counter
+
+# Os Shorts A e B da Lumina (beleza, 180 mil inscritos), com os atributos que o módulo 4 extrai
+lumina = pd.DataFrame({
+    "log_inscritos": np.log(180_000), "setor_beleza": 1, "setor_moda": 0, "setor_automotivo": 0,
+    "duracao_s": [55, 22], "gancho": [3, 8], "rosto": [1, 1], "texto_tela": [0, 1],
+    "energia": [3, 7], "hora": [14, 19], "dia_semana": [1, 3]}, index=["A", "B"])[FEATURES]
+
+rng = np.random.default_rng(0)
+raizes, prev_a, prev_b, prev_teste = Counter(), [], [], []
+for _ in range(50):                                    # 50 reamostragens do treino
+    amostra = treino.sample(len(treino), replace=True, random_state=rng.integers(1e9))
+    m = DecisionTreeRegressor(max_depth=6, min_samples_leaf=20).fit(amostra[FEATURES], amostra["y"])
+    raizes[f"{FEATURES[m.tree_.feature[0]]} <= {m.tree_.threshold[0]:.2f}"] += 1
+    a, b = m.predict(lumina)
+    prev_a.append(a); prev_b.append(b); prev_teste.append(m.predict(teste[FEATURES]))
+
+print("raiz mais comum:", raizes.most_common(3))
+print(f"A: média {np.mean(prev_a):.2f}, desvio {np.std(prev_a):.2f}")
+print(f"B: média {np.mean(prev_b):.2f}, desvio {np.std(prev_b):.2f}")
+dif = np.array(prev_b) - np.array(prev_a)
+print(f"B - A: média {dif.mean():.2f}, mín {dif.min():.2f}, máx {dif.max():.2f}, "
+      f"empates (mesma folha) {np.mean(np.isclose(dif, 0)):.0%}")
+print(f"desvio médio entre árvores no teste: {np.std(prev_teste, axis=0).mean():.2f}")
+```
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+No gerador sintético, a diferença **verdadeira** entre os Shorts B e A, somando gancho, texto na tela, energia, duração e horário, é de **1,09 em log**, ou seja, B rende cerca de 3 vezes mais curtidas que A. Sabemos disso porque os efeitos estão escritos no código.
+
+O que uma árvore única diz sobre esse par?
+
+- Na média das 50 árvores, B supera A por 0,73: a direção está certa, mas o efeito é subestimado. O conteúdo aparece em splits profundos, depois que o tamanho do canal já consumiu as primeiras perguntas.
+- Uma árvore específica pode dizer qualquer coisa entre **empate** (0,00, quando A e B caem na mesma folha) e 1,33. Se o seu agente respondesse à Lumina com uma árvore só, a resposta dependeria de qual reamostragem você usou para treinar.
+- A previsão é em degraus: mudar o horário de B de 19h para 17h pode não mudar nada ou pode mudar tudo, conforme um limiar esteja ou não entre esses valores.
+
+Conclusão: a árvore única é ótima para **entender** a base (o `export_text` é um bom primeiro diagnóstico), mas é um instrumento ruim para comparar criativos do mesmo canal. Esse papel é do ensemble.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas com árvores]
+1. **Deixar a árvore crescer sem limite.** Erro de treino zero não é mérito, é decoreba. Sempre limite a profundidade ou o tamanho mínimo das folhas.
+2. **Escolher hiperparâmetros olhando o teste.** Use validação temporal; o teste é para o relatório final.
+3. **Tratar a importância de uma árvore única como verdade.** Com a raiz trocando entre reamostragens, a ordem de importância das features também troca. Explicabilidade séria fica para o SHAP, no módulo 5, sobre o ensemble.
+4. **Esperar extrapolação.** Um canal maior que todos do treino recebe a previsão do maior canal visto. Registre o intervalo de valores do treino e sinalize quando um caso cair fora dele.
+5. **Perder tempo padronizando features para a árvore.** Padronizar, aplicar log ou min-max não muda a partição. Aplique essas transformações quando elas ajudarem você a ler o modelo ou quando outro modelo precisar delas.
+6. **Usar colunas que só existem por causa da simulação.** `sinal_verdadeiro` serve para diagnóstico; se ela entrar em `FEATURES`, você está treinando com a resposta.
+:::
+
+<Quiz
+  id="m3-a1"
+  perguntas={[
+    {
+      pergunta: 'Um nó tem y = [4, 5, 9, 10]. Qual split tem o **maior** ganho de SSE?',
+      opcoes: [
+        {texto: 'Separar [4] de [5, 9, 10].', explicacao: 'O lado direito ainda mistura 5 com 9 e 10: SSE do filho direito = 14, ganho = 26 − 0 − 14 = 12.'},
+        {texto: 'Separar [4, 5] de [9, 10].', correta: true, explicacao: 'SSE do pai = 26; cada filho tem SSE 0,5; ganho = 26 − 0,5 − 0,5 = 25. Separa os dois grupos naturais.'},
+        {texto: 'Separar [4, 5, 9] de [10].', explicacao: 'O lado esquerdo mistura 4 e 5 com 9: SSE = 14, ganho = 12.'},
+        {texto: 'Todos têm o mesmo ganho, porque o SSE do pai é o mesmo.', explicacao: 'O SSE do pai é o mesmo, mas o dos filhos muda conforme o split. É justamente isso que a árvore compara.'},
+      ],
+    },
+    {
+      pergunta: 'Você treina uma árvore com `inscritos` e outra, idêntica, com `log(inscritos)`. O que acontece?',
+      opcoes: [
+        {texto: 'A versão com log fica melhor, porque a distribuição fica menos assimétrica.', explicacao: 'Isso vale para modelos lineares. Para a árvore, só a ordem dos valores importa.'},
+        {texto: 'Os posts de treino caem nas mesmas folhas; só os limiares aparecem em escalas diferentes.', correta: true, explicacao: 'Transformações monotônicas preservam a ordem, então a partição é a mesma. Testamos na aula: previsões idênticas.'},
+        {texto: 'A versão sem log não funciona, porque árvores exigem features padronizadas.', explicacao: 'Árvores não exigem padronização; redes neurais e modelos lineares regularizados é que costumam exigir.'},
+      ],
+    },
+    {
+      pergunta: 'No gerador, o efeito de aparecer um rosto é +0,35 em beleza e +0,05 em automotivo. Como uma árvore representa isso?',
+      opcoes: [
+        {texto: 'Não representa: é preciso criar a coluna rosto × setor antes.', explicacao: 'Isso seria necessário numa regressão linear, não numa árvore.'},
+        {texto: 'Com um split em setor e, dentro do ramo de beleza, um split em rosto.', correta: true, explicacao: 'Splits encadeados em ramos diferentes são exatamente uma interação: o efeito de uma feature depende do valor de outra.'},
+        {texto: 'Com um único split em rosto, válido para todos os setores.', explicacao: 'Um split único dá o mesmo efeito para todos os setores e perde a interação.'},
+      ],
+    },
+    {
+      pergunta: 'Por que uma árvore única é um instrumento ruim para decidir entre os Shorts A e B da Lumina? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Porque pequenas mudanças no treino mudam os splits, e a diferença prevista entre A e B varia muito.', correta: true, explicacao: 'No experimento, B − A foi de 0,00 a 1,33 entre reamostragens.'},
+        {texto: 'Porque A e B podem cair na mesma folha e receber exatamente a mesma previsão.', correta: true, explicacao: 'A previsão é constante por partes; aconteceu em 4% das árvores do experimento.'},
+        {texto: 'Porque árvores não aceitam features de conteúdo, só do canal.', explicacao: 'Aceitam qualquer feature. O problema é que o canal domina os primeiros splits.'},
+        {texto: 'Porque o tamanho do canal consome as primeiras perguntas e o efeito do conteúdo fica subestimado.', correta: true, explicacao: 'Na média, a árvore estimou 0,73 contra 1,09 de diferença verdadeira.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: confira o ganho da raiz na mão]
+1. Treine a `DecisionTreeRegressor(max_depth=3, min_samples_leaf=30, random_state=0)` da seção "Na prática".
+2. Leia a feature e o limiar da raiz em `arvore.tree_.feature[0]` e `arvore.tree_.threshold[0]`.
+3. Calcule o ganho de SSE desse split **na mão**, com a fórmula da aula.
+4. Confira com os atributos internos da árvore: `tree_.impurity` guarda o MSE de cada nó e `tree_.n_node_samples` o número de posts, então SSE = MSE × n.
+5. Bônus: repita a varredura de `max_depth` usando como validação o segundo semestre de 2025 (treinando até 30/06/2025). A melhor profundidade é a mesma que o teste sugeria?
+:::
+
+<details>
+<summary>Ver a solução dos passos 1 a 4</summary>
+
+```python
+t = DecisionTreeRegressor(max_depth=3, min_samples_leaf=30, random_state=0)
+t.fit(treino[FEATURES], treino["y"])
+f, lim = FEATURES[t.tree_.feature[0]], t.tree_.threshold[0]
+y = treino["y"].to_numpy()
+esq = treino[f].to_numpy() <= lim
+sse = lambda v: ((v - v.mean()) ** 2).sum()
+print(f"raiz: {f} <= {lim:.3f}; ganho na mão = {sse(y) - sse(y[esq]) - sse(y[~esq]):.2f}")
+
+imp, n = t.tree_.impurity, t.tree_.n_node_samples
+l, r = t.tree_.children_left[0], t.tree_.children_right[0]
+print(f"ganho pelo tree_ = {imp[0] * n[0] - imp[l] * n[l] - imp[r] * n[r]:.2f}")
+```
+
+```text
+raiz: log_inscritos <= 11.634; ganho na mão = 2090.24
+ganho pelo tree_ = 2090.24
+```
+
+Os dois números batem: o scikit-learn faz exatamente a conta da aula. No bônus, lembre de separar a validação **dentro** do período de treino, sem tocar em 2026.
+
+</details>
+
+---
+
+## Resumo
+
+- Uma **árvore de regressão** divide o espaço das features em retângulos com perguntas de sim/não e prevê a **média** do alvo em cada folha (a constante ótima para a perda quadrática).
+- Cada split é escolhido de forma gulosa pelo maior **ganho de SSE**, ou seja, pela maior redução de variância ponderada.
+- **Profundidade** e **min_samples_leaf** controlam a complexidade; sem limite, a árvore decora o treino.
+- Árvores capturam **não-linearidade e interações** sozinhas, ignoram a escala das features e aceitam valores ausentes, mas **não extrapolam** e aproximam efeitos suaves com degraus.
+- Uma árvore única tem **alta variância**: splits e previsões mudam com pequenas perturbações do treino. Ensembles resolvem isso.
+
+## Referências
+
+- Breiman, Friedman, Olshen e Stone. *Classification and Regression Trees* (CART). Wadsworth, 1984. O livro que formalizou as árvores de regressão com critério de erro quadrático.
+- Hastie, Tibshirani e Friedman. [*The Elements of Statistical Learning*](https://hastie.su.domains/ElemStatLearn/), 2ª ed., 2009, seção 9.2 (árvores de regressão). PDF gratuito no site dos autores.
+- Grinsztajn, Oyallon e Varoquaux. [*Why do tree-based models still outperform deep learning on tabular data?*](https://arxiv.org/abs/2207.08815) NeurIPS Datasets and Benchmarks, 2022.
+- Documentação do scikit-learn: [Decision Trees](https://scikit-learn.org/stable/modules/tree.html) (formulação matemática, suporte a valores ausentes e poda por custo-complexidade) e [`export_text`](https://scikit-learn.org/stable/modules/generated/sklearn.tree.export_text.html).
+
+**Próxima aula:** [Bagging vs. boosting](/aulas/ml-preditivo-e-agentes/gradient-boosting/bagging-vs-boosting): duas formas de combinar árvores instáveis num modelo estável, e como elas se saem na mesma base.

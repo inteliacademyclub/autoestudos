@@ -1,0 +1,568 @@
+---
+sidebar_position: 4
+sidebar_label: 'LightGBM, CatBoost e XGBoost na prática'
+title: 'LightGBM, CatBoost e XGBoost na prática'
+description: 'O que LightGBM, CatBoost e XGBoost fazem de diferente, os hiperparâmetros que importam, categóricas sem vazamento, perda Huber, restrições monotônicas e busca com Optuna em walk-forward.'
+tags: [ml-preditivo, gradient-boosting, lightgbm, catboost, xgboost, optuna]
+---
+
+# LightGBM, CatBoost e XGBoost na Prática: Três Motores, Uma Validação Honesta
+
+<LessonMeta
+  tempo="60 min"
+  semana={2}
+  etapa="modelo"
+  objetivos={[
+    'Explicar as diferenças práticas entre LightGBM (histograma, folha a folha), XGBoost (nível a nível, regularização) e CatBoost (categóricas ordenadas, árvores simétricas)',
+    'Treinar as três bibliotecas com early stopping numa validação temporal e reajustar no treino completo',
+    'Decidir quando usar canal e setor como categóricas e aplicar restrições monotônicas',
+    'Configurar a perda Huber em cada biblioteca, incluindo a armadilha do ponto de partida no CatBoost',
+    'Buscar hiperparâmetros com Optuna em walk-forward e interpretar o ganho com ceticismo',
+  ]}
+  prerequisitos={[
+    {label: 'Gradient boosting passo a passo', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo'},
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+    {label: 'Experimentos rastreáveis com MLflow', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis'},
+  ]}
+/>
+
+Na aula anterior, você escreveu gradient boosting em vinte linhas. As bibliotecas que você vai usar no projeto implementam o mesmo laço, mas cada uma tomou decisões de engenharia diferentes: como procurar splits, como crescer a árvore, como tratar categorias, como regularizar. Essas decisões mudam a velocidade, os padrões e, às vezes, o resultado.
+
+O objetivo desta aula não é eleger uma campeã. Na base sintética, uma delas vai vencer as outras com folga, e você vai descobrir que o motivo é uma opção de uma linha que tem tudo a ver com tempo. Você também vai ver um exemplo de que a "melhor" configuração depende da pergunta: um modelo que decora canais conhecidos vai mal quando o canal é novo, e esse é justamente o caso dos clientes da Galaxies.
+
+:::info[A ideia central]
+LightGBM, XGBoost e CatBoost são implementações de gradient boosting com árvores. As diferenças que importam no projeto são:
+- **como a árvore cresce** (folha a folha, nível a nível ou simétrica), que define qual hiperparâmetro controla a complexidade;
+- **como categóricas viram números**, que pode introduzir ou evitar vazamento;
+- **quais perdas e restrições** estão prontas (Huber, quantil, monotonicidade).
+
+Em todas, o número de árvores se escolhe com **early stopping numa validação temporal**, e o resto se ajusta com uma busca em **walk-forward**.
+:::
+
+---
+
+## O que as três fazem de diferente
+
+**LightGBM** (Ke et al., 2017) foi desenhado para velocidade. Antes de treinar, ele discretiza cada feature em no máximo `max_bin` faixas (255 por padrão) e procura splits sobre esses **histogramas**, e não sobre os valores ordenados. Isso reduz muito o custo por split. A outra marca registrada é o crescimento **folha a folha** (*leaf-wise*): a cada passo, ele divide a folha com maior ganho, onde quer que ela esteja. A árvore pode ficar funda de um lado só, e por isso o controle principal de complexidade é `num_leaves` (padrão 31), não a profundidade. O artigo também propõe duas técnicas de amostragem e agrupamento (GOSS e EFB) que ajudam em bases grandes e esparsas; na escala do projeto, elas não fazem diferença.
+
+**XGBoost** (Chen e Guestrin, 2016) popularizou o boosting em competições. Ele cresce a árvore **nível a nível** (`grow_policy="depthwise"`, padrão), com `max_depth=6` por padrão, e escreve a regularização **dentro do objetivo**: uma penalidade por número de folhas (`gamma`) e penalidades L1/L2 nos valores das folhas (`alpha`, `lambda`). Desde a versão 2, o método padrão de construção (`tree_method`) também é por histograma.
+
+**CatBoost** (Prokhorenkova et al., 2018) resolveu um problema que as outras duas tratavam mal: **features categóricas**. A forma mais comum de transformar uma categoria em número é o *target encoding*: trocar "beleza" pela média do alvo dos posts de beleza. Só que, se essa média inclui o próprio post, o modelo está vendo o alvo dentro da feature: é vazamento. O CatBoost usa *ordered target statistics*: ordena as linhas (aleatoriamente ou, com `has_time=True`, pela ordem em que aparecem) e calcula a estatística de cada linha usando **só as linhas anteriores**. O artigo também propõe o *ordered boosting*, a mesma ideia aplicada aos resíduos; na versão 1.2.10, numa base do tamanho da nossa, o padrão escolhido foi `boosting_type="Plain"` (confira com `modelo.get_all_params()`). Por fim, o CatBoost usa **árvores simétricas** (*oblivious*): todos os nós de um mesmo nível fazem a mesma pergunta. É uma restrição forte, que regulariza e torna a previsão muito rápida.
+
+<Sketch name="m3/tres-arvores" alt="Três painéis. XGBoost, nível a nível: a raiz pergunta inscritos, o segundo nível pergunta gancho e hora, e há quatro folhas; a ordem dos splits é 1, 2, 3 da esquerda para a direita; controle principal max_depth. LightGBM, folha a folha: a raiz pergunta inscritos, o split 2 acontece só no lado direito com gancho, e o split 3 de novo só no lado direito com hora, formando uma árvore desequilibrada; controle principal num_leaves. CatBoost, simétrica: a raiz pergunta inscritos e os dois nós do segundo nível fazem a mesma pergunta, gancho menor ou igual a 5; controle depth." caption="Mesma ideia, três formas de crescer a árvore. Os números mostram a ordem dos splits." />
+
+---
+
+## Os hiperparâmetros que importam
+
+Os nomes mudam de biblioteca para biblioteca, mas os conceitos são os mesmos. Esta tabela é o seu mapa:
+
+| Conceito | LightGBM | XGBoost | CatBoost | Por onde começar |
+| :--- | :--- | :--- | :--- | :--- |
+| Taxa de aprendizado | `learning_rate` | `learning_rate` | `learning_rate` | 0,05; fixe e deixe o early stopping escolher as árvores |
+| Número de árvores | `num_boost_round` | `n_estimators` | `iterations` | alto (3.000 a 5.000) com early stopping |
+| Tamanho da árvore | `num_leaves` (e `max_depth`) | `max_depth` | `depth` | 7 a 63 folhas; profundidade 4 a 8 |
+| Mínimo por folha | `min_data_in_leaf` | `min_child_weight` | `min_data_in_leaf` (só em `Depthwise`/`Lossguide`) | 20 a 100 em bases de milhares |
+| Sorteio de colunas | `feature_fraction` | `colsample_bytree` | `rsm` | 0,7 a 1,0 |
+| Sorteio de linhas | `bagging_fraction` + `bagging_freq` | `subsample` | `subsample` | 0,7 a 1,0 |
+| Regularização | `lambda_l1`, `lambda_l2` | `alpha`, `lambda`, `gamma` | `l2_leaf_reg` | L2 entre 1 e 10 |
+| Early stopping | `callbacks=[lgb.early_stopping(n)]` | `early_stopping_rounds` no construtor | `early_stopping_rounds` no `fit` | 50 a 200 rodadas de paciência |
+| Categóricas | coluna `category` do pandas | `enable_categorical=True` | `cat_features=[...]` | veja a seção de categóricas |
+| Huber | `objective="huber"`, `alpha=δ` | `objective="reg:pseudohubererror"`, `huber_slope=δ` | `loss_function="Huber:delta=δ"` | δ perto de 1 em escala log |
+| Monotonicidade | `monotone_constraints` (lista) | `monotone_constraints` (dicionário) | `monotone_constraints` (dicionário) | só onde a direção é certa |
+
+Duas regras práticas valem para as três. Primeiro, **no LightGBM, `num_leaves` manda**: uma árvore folha a folha com 31 folhas pode ter profundidade bem maior que 5, então limitar só `max_depth` não controla a complexidade. Segundo, **o sorteio de linhas no LightGBM só liga com `bagging_freq > 0`**: `bagging_fraction=0.8` sozinho não faz nada.
+
+---
+
+## Na prática: as três na mesma base
+
+O fluxo é o mesmo nas três: separar uma validação temporal dentro do período de treino, deixar o early stopping escolher o número de árvores nela e **reajustar** no treino completo (treino + validação) com esse número. Reajustar importa: sem isso, o modelo final não vê os seis meses mais recentes, justamente os mais parecidos com o futuro. Nos nossos testes, pular o reajuste piorou o MAE de teste das três bibliotecas em 0,05 a 0,08.
+
+O preparo usa o gerador da [aula 3.1](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao). Repare que `setor` agora é uma coluna `category` do pandas: as três bibliotecas tratam categóricas nativamente, sem one-hot.
+
+```python
+import time
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.metrics import mean_absolute_error as mae
+from shorts_sinteticos import gerar_shorts
+
+df = gerar_shorts()
+df["log_inscritos"] = np.log(df["inscritos"])
+df["setor"] = df["setor"].astype("category")                 # categórica nativa: sem one-hot
+df[["rosto", "texto_tela"]] = df[["rosto", "texto_tela"]].astype(int)
+FEATURES = ["log_inscritos", "setor", "duracao_s", "gancho", "rosto", "texto_tela",
+            "energia", "hora", "dia_semana"]
+t_val, t_teste = pd.Timestamp("2025-07-01", tz="UTC"), pd.Timestamp("2026-01-01", tz="UTC")
+tr = df[df["published_at"] < t_val]                                               # ajuste
+val = df[(df["published_at"] >= t_val) & (df["published_at"] < t_teste)]          # early stopping
+treino = df[df["published_at"] < t_teste]                                         # refit = tr + val
+teste = df[df["published_at"] >= t_teste]
+res = {}
+```
+
+**LightGBM**, com a API nativa (`lgb.train`) e os callbacks de early stopping e de log:
+
+```python
+import lightgbm as lgb
+
+t0 = time.perf_counter()
+params = {"objective": "regression", "learning_rate": 0.05, "num_leaves": 15, "min_data_in_leaf": 20,
+          "feature_fraction": 0.9, "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 1.0,
+          "verbosity": -1, "seed": 0}
+d_tr = lgb.Dataset(tr[FEATURES], tr["y"])
+d_val = lgb.Dataset(val[FEATURES], val["y"], reference=d_tr)
+busca = lgb.train(params, d_tr, num_boost_round=5000, valid_sets=[d_val], valid_names=["val"],
+                  callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
+                             lgb.log_evaluation(period=0)])
+n_lgb = busca.best_iteration                                   # escolhido na validação temporal
+lgbm = lgb.train(params, lgb.Dataset(treino[FEATURES], treino["y"]), num_boost_round=n_lgb)
+res["LightGBM"] = (lgbm.predict(teste[FEATURES]), n_lgb, time.perf_counter() - t0)
+```
+
+**CatBoost**, com a categórica indicada por nome e `has_time=True`, que manda respeitar a ordem das linhas (o gerador já devolve os posts ordenados por data):
+
+```python
+from catboost import CatBoostRegressor
+
+t0 = time.perf_counter()
+cfg = dict(learning_rate=0.05, depth=6, loss_function="RMSE", has_time=True, random_seed=0, verbose=0)
+busca = CatBoostRegressor(iterations=5000, **cfg)
+busca.fit(tr[FEATURES], tr["y"], cat_features=["setor"], eval_set=(val[FEATURES], val["y"]),
+          early_stopping_rounds=100)
+n_cat = busca.get_best_iteration() + 1                         # índice começa em 0
+cat = CatBoostRegressor(iterations=n_cat, **cfg).fit(treino[FEATURES], treino["y"], cat_features=["setor"])
+res["CatBoost"] = (cat.predict(teste[FEATURES]), n_cat, time.perf_counter() - t0)
+```
+
+**XGBoost**, lembrando que desde a versão 2 o `early_stopping_rounds` vai no **construtor**, não no `fit`:
+
+```python
+import xgboost as xgb
+
+t0 = time.perf_counter()
+cfg = dict(learning_rate=0.05, max_depth=4, subsample=0.8, colsample_bytree=0.9, reg_lambda=1.0,
+           tree_method="hist", enable_categorical=True, random_state=0)
+busca = xgb.XGBRegressor(n_estimators=5000, early_stopping_rounds=100, **cfg)   # no construtor (XGBoost >= 2)
+busca.fit(tr[FEATURES], tr["y"], eval_set=[(val[FEATURES], val["y"])], verbose=False)
+n_xgb = busca.best_iteration + 1
+xgbm = xgb.XGBRegressor(n_estimators=n_xgb, **cfg).fit(treino[FEATURES], treino["y"])
+res["XGBoost"] = (xgbm.predict(teste[FEATURES]), n_xgb, time.perf_counter() - t0)
+
+print(f"{'modelo':<9} {'árvores':>7} {'MAE teste':>10} {'Spearman':>9} {'segundos':>9}")
+for nome, (p, n, s) in res.items():
+    print(f"{nome:<9} {n:>7} {mae(teste['y'], p):>10.3f} {spearmanr(teste['y'], p).statistic:>9.3f} {s:>9.2f}")
+```
+
+```text
+modelo    árvores  MAE teste  Spearman  segundos
+LightGBM      182      0.590     0.918      0.84
+CatBoost      493      0.554     0.920      2.36
+XGBoost       221      0.587     0.916      0.75
+```
+
+LightGBM e XGBoost empatam, na faixa do `GradientBoostingRegressor` das aulas anteriores. O CatBoost ganha por 0,035, e um bootstrap pareado nos posts de teste deu intervalo de 95% de −0,048 a −0,023 para a diferença contra o LightGBM: dessa vez, não é ruído. (Os tempos variam de máquina para máquina e de execução para execução; todos ficam na casa de 1 a 2 segundos.)
+
+De onde vem a vantagem? A próxima seção mostra que ela vem de uma única opção.
+
+---
+
+## Categóricas: setor sim, canal com cuidado
+
+O trecho abaixo treina o CatBoost com e sem `has_time`, e com `setor` como categórica ou como one-hot:
+
+```python
+# has_time: com ele, a estatística da categórica de cada linha usa só linhas ANTERIORES no tempo
+setor_dummies = lambda d: pd.concat([d[[f for f in FEATURES if f != "setor"]],
+                                     pd.get_dummies(d["setor"], prefix="setor", dtype=int)], axis=1)
+for nome, cats, X in [("setor categórica", ["setor"], lambda d: d[FEATURES]),
+                      ("setor one-hot", None, setor_dummies)]:
+    r = []
+    for has_time in [True, False]:
+        m = CatBoostRegressor(iterations=450, learning_rate=0.05, depth=6, has_time=has_time,
+                              random_seed=0, verbose=0).fit(X(treino), treino["y"], cat_features=cats)
+        r.append(mae(teste["y"], m.predict(X(teste))))
+    print(f"{nome:<17} MAE com has_time: {r[0]:.3f} | sem: {r[1]:.3f}")
+```
+
+```text
+setor categórica  MAE com has_time: 0.556 | sem: 0.590
+setor one-hot     MAE com has_time: 0.596 | sem: 0.596
+```
+
+Com `setor` em one-hot, `has_time` não muda nada. Com `setor` categórica, muda tudo. A explicação mais provável: com `has_time=True`, a estatística de "beleza" em cada linha é a média do alvo dos posts de beleza **anteriores**, uma média que caminha no tempo e acompanha a tendência do setor. O modelo aprende a usar esse sinal, e no teste recebe a estatística mais recente. Sem `has_time`, a ordem é aleatória e esse sinal temporal vira ruído. Repetimos com três sementes e o efeito se manteve (0,551 a 0,558 com, 0,582 a 0,598 sem). Na sua base real, o tamanho do ganho vai ser outro, mas a regra vale: **com dados ordenados no tempo, use `has_time=True` e ordene as linhas por `published_at` antes do `fit`**.
+
+E o **canal**? Transformar `canal_id` em categórica é tentador: com target encoding, ela vira "o nível típico deste canal", a feature mais forte possível. O problema aparece quando o canal é novo. O trecho abaixo compara os dois cenários de validação do [módulo 2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal): o temporal, em que os canais do teste já apareceram no treino, e um em que 12 dos 60 canais só existem no teste.
+
+```python
+df["canal_id"] = df["canal_id"].astype("category")
+rng = np.random.default_rng(0)
+novos = set(rng.choice(df["canal_id"].unique(), size=12, replace=False))   # 12 de 60 canais nunca vistos
+cenarios = {
+    "temporal (mesmos canais)": (df["published_at"] < t_teste, df["published_at"] >= t_teste),
+    "canais novos no teste": ((df["published_at"] < t_teste) & ~df["canal_id"].isin(novos),
+                              (df["published_at"] >= t_teste) & df["canal_id"].isin(novos)),
+}
+print(f"{'cenário':<26} {'sem canal_id':>13} {'com canal_id':>13}")
+for nome, (m_tr, m_te) in cenarios.items():
+    a, b = df[m_tr], df[m_te]
+    maes = []
+    for feats, cats in [(FEATURES, ["setor"]), (FEATURES + ["canal_id"], ["setor", "canal_id"])]:
+        m = CatBoostRegressor(iterations=500, learning_rate=0.05, depth=6, has_time=True,
+                              random_seed=0, verbose=0).fit(a[feats], a["y"], cat_features=cats)
+        maes.append(mae(b["y"], m.predict(b[feats])))
+    print(f"{nome:<26} {maes[0]:>13.3f} {maes[1]:>13.3f}")
+```
+
+```text
+cenário                     sem canal_id  com canal_id
+temporal (mesmos canais)           0.555         0.546
+canais novos no teste              0.704         0.932
+```
+
+Com canais conhecidos, `canal_id` ajuda um pouco (0,555 → 0,546). Com canais novos, ele **destrói** o modelo (0,704 → 0,932): o modelo aprendeu a confiar no "RG" do canal, e para um canal desconhecido essa feature cai num valor padrão, sem informação. Conclusão para o projeto: **setor como categórica, sim; canal como categórica, não**. O nível do canal deve entrar por features de histórico calculadas sem vazamento, que funcionam igual para qualquer canal com alguns posts. Esse é o assunto da [próxima aula](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-do-canal-e-do-tempo).
+
+---
+
+## Perda Huber, e a armadilha do ponto de partida
+
+O vencedor da trilha de vídeo do SMP Challenge 2025 (MVP, arXiv:2507.00950) usou CatBoost com perda Huber, e a [aula 3.3](/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo) mostrou por que ela protege contra virais. No CatBoost, a sintaxe é `loss_function="Huber:delta=1.0"`. Só que há uma pegadinha:
+
+```python
+huber = dict(learning_rate=0.05, depth=6, loss_function="Huber:delta=1.0", has_time=True,
+             random_seed=0, verbose=0)
+centro = float(tr["y"].median())      # a Huber do CatBoost não aceita boost_from_average
+for nome, c in [("sem centralizar", 0.0), ("centralizado", centro)]:
+    busca = CatBoostRegressor(iterations=5000, **huber)
+    busca.fit(tr[FEATURES], tr["y"] - c, cat_features=["setor"],
+              eval_set=(val[FEATURES], val["y"] - c), early_stopping_rounds=100)
+    n = busca.get_best_iteration() + 1
+    m = CatBoostRegressor(iterations=n, **huber).fit(treino[FEATURES], treino["y"] - c, cat_features=["setor"])
+    print(f"Huber {nome:<16} árvores {n:>4}  MAE teste {mae(teste['y'], m.predict(teste[FEATURES]) + c):.3f}")
+```
+
+```text
+Huber sem centralizar  árvores  631  MAE teste 0.609
+Huber centralizado     árvores  485  MAE teste 0.553
+```
+
+Para RMSE, o CatBoost começa da média do alvo (`boost_from_average=True`). Para Huber, na versão 1.2.10, essa opção não existe (a biblioteca recusa o parâmetro e lista as perdas que o aceitam), então o modelo começa do **zero**. Com o alvo em torno de 5,5 e o gradiente da Huber limitado a $$\pm\delta$$, as primeiras centenas de árvores são gastas só para chegar ao nível médio. Subtrair a mediana do treino antes e somá-la de volta depois resolve: o MAE cai de 0,609 para 0,553. Moral que vale para qualquer biblioteca: **com perdas robustas, confira de onde o modelo parte**.
+
+---
+
+## Restrições monotônicas
+
+Algumas relações têm direção conhecida. Com todo o resto igual, um canal com mais inscritos não deveria ter previsão **menor**. Sem restrição, nada garante isso:
+
+```python
+mono = {"monotone_constraints": [1 if f == "log_inscritos" else 0 for f in FEATURES],
+        "monotone_constraints_method": "advanced"}          # +1: a previsão só pode subir com inscritos
+grade = np.linspace(treino["log_inscritos"].min(), treino["log_inscritos"].max(), 50)
+for nome, extra in [("sem restrição", {}), ("monotônica", mono)]:
+    m = lgb.train({**params, **extra}, lgb.Dataset(treino[FEATURES], treino["y"]), num_boost_round=200)
+    desce = 0
+    for _, linha in teste.sample(200, random_state=0).iterrows():        # varia só log_inscritos
+        X = pd.DataFrame([linha[FEATURES]] * len(grade)).astype(treino[FEATURES].dtypes.to_dict())
+        X["log_inscritos"] = grade
+        desce += np.any(np.diff(m.predict(X)) < -1e-9)
+    print(f"{nome:<14} curvas que descem em algum ponto: {desce / 200:.0%}")
+
+for nome, (m_tr, m_te) in cenarios.items():            # os dois cenários do trecho do canal_id
+    r = [mae(df.loc[m_te, "y"], lgb.train({**params, **extra}, lgb.Dataset(df.loc[m_tr, FEATURES], df.loc[m_tr, "y"]),
+                                          num_boost_round=200).predict(df.loc[m_te, FEATURES]))
+         for extra in [{}, mono]]
+    print(f"{nome:<26} MAE sem restrição: {r[0]:.3f} | monotônica: {r[1]:.3f}")
+```
+
+```text
+sem restrição  curvas que descem em algum ponto: 100%
+monotônica     curvas que descem em algum ponto: 0%
+temporal (mesmos canais)   MAE sem restrição: 0.591 | monotônica: 0.626
+canais novos no teste      MAE sem restrição: 0.768 | monotônica: 0.670
+```
+
+Todas as 200 curvas do modelo livre descem em algum trecho. Por quê? Com só 60 canais, faixas estreitas de `log_inscritos` identificam canais específicos, e o modelo usa essas faixas para decorar o nível de cada um, inclusive quando um canal maior tem nível menor. É o mesmo "RG do canal" do `canal_id`, só que disfarçado.
+
+O resultado dos dois cenários é a lição: a restrição **piora** o MAE quando os canais do teste são conhecidos (0,591 → 0,626), porque impede a decoreba, e **melhora bastante** quando os canais são novos (0,768 → 0,670), porque a decoreba não serve para eles. Qual cenário é o seu? Se o agente vai atender marcas cujo canal não está na sua base, é o segundo. Use restrições monotônicas só onde a direção é defensável (inscritos, número de posts anteriores) e nunca em features de conteúdo cujo efeito você quer descobrir.
+
+---
+
+## Busca de hiperparâmetros com Optuna em walk-forward
+
+Com a learning rate fixa e o número de árvores escolhido por early stopping, sobram os hiperparâmetros de forma: tamanho da árvore, mínimo por folha, sorteios e regularização. O Optuna explora esse espaço com um amostrador bayesiano (TPE). O ponto crítico é **o que a função objetivo mede**: aqui, o MAE médio em quatro janelas de <Termo id="walk-forward">walk-forward</Termo> dentro do período de treino. O teste de 2026 não participa.
+
+```python
+import lightgbm as lgb
+import optuna
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+DOBRAS = [("2025-01-01", "2025-04-01"), ("2025-04-01", "2025-07-01"),      # walk-forward: 4 janelas
+          ("2025-07-01", "2025-10-01"), ("2025-10-01", "2026-01-01")]      # de 3 meses, DENTRO do treino
+
+
+def walk_forward(params, dados):
+    maes, iters = [], []
+    for ini, fim in DOBRAS:
+        ini, fim = pd.Timestamp(ini, tz="UTC"), pd.Timestamp(fim, tz="UTC")
+        a = dados[dados["published_at"] < ini]                              # tudo antes da janela
+        b = dados[(dados["published_at"] >= ini) & (dados["published_at"] < fim)]
+        d_a = lgb.Dataset(a[FEATURES], a["y"])
+        d_b = lgb.Dataset(b[FEATURES], b["y"], reference=d_a)
+        m = lgb.train(params, d_a, num_boost_round=5000, valid_sets=[d_b],
+                      callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
+        maes.append(mae(b["y"], m.predict(b[FEATURES], num_iteration=m.best_iteration)))
+        iters.append(m.best_iteration)
+    return float(np.mean(maes)), int(np.mean(iters))
+
+
+def objetivo(trial):
+    params = {"objective": "regression", "learning_rate": 0.05, "verbosity": -1, "seed": 0, "num_threads": 1,
+              "num_leaves": trial.suggest_int("num_leaves", 4, 64, log=True),
+              "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 5, 200, log=True),
+              "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+              "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0), "bagging_freq": 1,
+              "lambda_l1": trial.suggest_float("lambda_l1", 1e-3, 10.0, log=True),
+              "lambda_l2": trial.suggest_float("lambda_l2", 1e-3, 10.0, log=True)}
+    erro, n_arvores = walk_forward(params, treino)
+    trial.set_user_attr("n_arvores", n_arvores)     # guardado para o refit final
+    return erro
+
+
+estudo = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=0))
+estudo.optimize(objetivo, n_trials=40)
+print(f"melhor MAE walk-forward: {estudo.best_value:.3f}")
+print({k: round(v, 3) if isinstance(v, float) else v for k, v in estudo.best_params.items()})
+```
+
+```text
+melhor MAE walk-forward: 0.492
+{'num_leaves': 4, 'min_data_in_leaf': 5, 'feature_fraction': 0.853, 'bagging_fraction': 0.967, 'lambda_l1': 0.027, 'lambda_l2': 0.015}
+```
+
+Agora, o modelo final com os melhores parâmetros, comparado com os padrões do LightGBM no mesmo protocolo:
+
+```python
+padrao = {"objective": "regression", "learning_rate": 0.05, "verbosity": -1, "seed": 0, "num_threads": 1}
+erro_padrao, n_padrao = walk_forward(padrao, treino)
+melhores = {**padrao, **estudo.best_params, "bagging_freq": 1}
+n_melhor = estudo.best_trial.user_attrs["n_arvores"]
+print(f"{'config':<9} {'MAE walk-forward':>16} {'árvores':>8} {'MAE teste 2026':>15}")
+for nome, p, erro, n in [("padrão", padrao, erro_padrao, n_padrao), ("Optuna", melhores, estudo.best_value, n_melhor)]:
+    final = lgb.train(p, lgb.Dataset(treino[FEATURES], treino["y"]), num_boost_round=n)
+    print(f"{nome:<9} {erro:>16.3f} {n:>8} {mae(teste['y'], final.predict(teste[FEATURES])):>15.3f}")
+```
+
+```text
+config    MAE walk-forward  árvores  MAE teste 2026
+padrão               0.527      125           0.588
+Optuna               0.492      762           0.579
+```
+
+Leia esses números com ceticismo, porque eles ensinam três coisas:
+
+1. **O ganho no walk-forward (0,035) encolheu para 0,009 no teste.** Parte disso é otimismo de seleção: com 40 tentativas, a melhor sempre parece um pouco melhor do que é. Outra parte vem do protocolo: o early stopping de cada dobra olha a mesma janela usada para medir o erro. O teste intocado é o juiz.
+2. **O Optuna escolheu árvores minúsculas** (4 folhas) e muitas delas (762). Em dados ruidosos e com efeitos quase aditivos, como os do gerador, árvores rasas funcionam bem. Na sua base real, com interações entre conteúdo e canal, o resultado pode ser outro.
+3. **Features valem mais que busca.** Nove centésimos de MAE separam as três bibliotecas e a busca de hiperparâmetros; a aula 3.5 ganha quase dez vezes isso com features de histórico.
+
+Um detalhe de desempenho: numa base de poucos milhares de linhas, o paralelismo do LightGBM custa mais do que rende. Na máquina em que testamos, a mesma busca levou 6,5 minutos com o padrão de threads e 23 segundos com `num_threads=1`.
+
+---
+
+## Tabela comparativa
+
+| | LightGBM | XGBoost | CatBoost |
+| :--- | :--- | :--- | :--- |
+| **Crescimento da árvore** | folha a folha | nível a nível (padrão) | simétrica (padrão) |
+| **Controle principal** | `num_leaves` | `max_depth` | `depth` |
+| **Categóricas** | nativas (partição por estatística do gradiente) | nativas com `enable_categorical` | *ordered target statistics*; `has_time` para dados temporais |
+| **Early stopping** | callback `lgb.early_stopping` | `early_stopping_rounds` no construtor | `early_stopping_rounds` no `fit` |
+| **Huber** | `objective="huber"` | `reg:pseudohubererror` | `Huber:delta=δ` (centralize o alvo) |
+| **Quantis** | `objective="quantile"`, `alpha` | `reg:quantileerror`, `quantile_alpha` | `Quantile:alpha=` ou `MultiQuantile` |
+| **Nesta base (teste 2026)** | 0,590 | 0,587 | 0,554 |
+| **Ponto forte** | velocidade, ecossistema, padrão de fato | maturidade, regularização explícita | categóricas sem vazamento, bons padrões |
+
+Para o projeto, uma recomendação razoável é **CatBoost como modelo principal**, pelo tratamento de categóricas e por ter vencido o SMP 2025 com Huber, e **LightGBM como segunda opção** para iterar rápido nas features. Não gaste a semana 2 comparando as três: escolha uma, fixe a validação e invista nas features.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+As três bibliotecas concordam sobre a Lumina. Com os modelos da seção "Na prática":
+
+```text
+LightGBM  A = 6.87  B = 7.61  B - A = 0.75
+CatBoost  A = 6.67  B = 7.47  B - A = 0.79
+XGBoost   A = 6.83  B = 7.64  B - A = 0.81
+```
+
+<details>
+<summary>Ver o código</summary>
+
+```python
+lumina = pd.DataFrame({"log_inscritos": np.log(180_000), "setor": "beleza", "duracao_s": [55, 22],
+                       "gancho": [3, 8], "rosto": [1, 1], "texto_tela": [0, 1], "energia": [3, 7],
+                       "hora": [14, 19], "dia_semana": [1, 3]}, index=["A", "B"])
+lumina["setor"] = pd.Categorical(lumina["setor"], categories=df["setor"].cat.categories)
+for nome, m in [("LightGBM", lgbm), ("CatBoost", cat), ("XGBoost", xgbm)]:
+    a, b = m.predict(lumina[FEATURES])
+    print(f"{nome:<9} A = {a:.2f}  B = {b:.2f}  B - A = {b - a:.2f}")
+```
+
+</details>
+
+Os níveis de A e B mudam de uma biblioteca para outra (6,67 a 6,87 para A), mas a diferença B − A fica entre 0,75 e 0,81. Todas continuam abaixo da diferença verdadeira do gerador (1,09): o que falta não é algoritmo, é informação sobre o canal, que chega na próxima aula.
+
+Dois cuidados específicos para a Lumina:
+
+- **Não use `canal_id` como feature.** Se a Lumina não estiver na sua base (e provavelmente não estará), o modelo cairia no cenário "canal novo", onde essa feature piorou o MAE de 0,704 para 0,932.
+- **Considere a restrição monotônica em `log_inscritos`.** Ela garante que a previsão da Lumina não caia só porque 180 mil inscritos caiu numa faixa ocupada por um canal fraco da sua base.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas com as bibliotecas]
+1. **Treinar até a validação e esquecer o refit.** O modelo final perde os meses mais recentes. Escolha o número de árvores na validação e reajuste com treino + validação.
+2. **Limitar só `max_depth` no LightGBM.** O controle principal é `num_leaves`; e `bagging_fraction` não faz nada sem `bagging_freq > 0`.
+3. **Passar `early_stopping_rounds` no `fit` do XGBoost 2 ou 3.** O parâmetro foi para o construtor.
+4. **Usar `canal_id` como categórica** quando o agente vai prever para canais fora da base.
+5. **Esquecer `has_time=True` no CatBoost** com dados temporais, ou passar as linhas fora de ordem.
+6. **Usar Huber no CatBoost sem centralizar o alvo.** O modelo começa do zero e gasta centenas de árvores para chegar ao nível médio.
+7. **Acreditar no MAE do Optuna.** O valor da melhor tentativa é otimista; só o teste intocado diz o ganho real.
+:::
+
+<Quiz
+  id="m3-a4"
+  perguntas={[
+    {
+      pergunta: 'Seu LightGBM está com overfitting. Você baixa `max_depth` de 8 para 6 e nada muda. O que provavelmente está acontecendo?',
+      opcoes: [
+        {texto: 'O LightGBM ignora `max_depth`.', explicacao: 'Ele respeita `max_depth`, mas cresce folha a folha; a complexidade é limitada principalmente por `num_leaves`.'},
+        {texto: 'Com crescimento folha a folha, `num_leaves` limita a complexidade; reduza `num_leaves` ou aumente `min_data_in_leaf`.', correta: true, explicacao: 'Uma árvore com 31 folhas pode caber em profundidade 6 ou 8. É o número de folhas que manda.'},
+        {texto: 'É preciso aumentar a learning rate.', explicacao: 'Learning rate maior tende a piorar o overfitting por árvore, não a resolver.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o target encoding "ingênuo" (média do alvo da categoria calculada em todo o treino) vaza?',
+      opcoes: [
+        {texto: 'Porque usa o alvo do próprio exemplo (e de exemplos futuros) na feature desse exemplo.', correta: true, explicacao: 'O modelo vê um pedaço do alvo dentro da feature. O CatBoost evita isso calculando a estatística só com linhas anteriores.'},
+        {texto: 'Porque categorias não podem virar números.', explicacao: 'Podem; o problema é com qual informação o número é calculado.'},
+        {texto: 'Porque a média é sensível a outliers.', explicacao: 'Isso é um problema de robustez, não de vazamento.'},
+      ],
+    },
+    {
+      pergunta: 'O agente vai prever Shorts de marcas que não estão na sua base. Quais escolhas fazem sentido? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Remover `canal_id` das features.', correta: true, explicacao: 'Para canais novos, a feature não tem informação; no experimento, piorou o MAE de 0,704 para 0,932.'},
+        {texto: 'Aplicar restrição monotônica crescente em `log_inscritos`.', correta: true, explicacao: 'Impede o modelo de usar faixas de inscritos como identificador de canal; com canais novos, o MAE caiu de 0,768 para 0,670.'},
+        {texto: 'Validar com um split que deixe canais inteiros fora do treino.', correta: true, explicacao: 'É o cenário que simula o uso real; o split só temporal seria otimista.'},
+        {texto: 'Aumentar `num_leaves` para o modelo decorar melhor cada canal.', explicacao: 'Decorar canais é exatamente o que não generaliza para canais novos.'},
+      ],
+    },
+    {
+      pergunta: 'Seu CatBoost com `loss_function="Huber:delta=1.0"` precisou de muito mais árvores e ficou pior que o RMSE. Qual a causa mais provável?',
+      opcoes: [
+        {texto: 'Huber é sempre pior que RMSE.', explicacao: 'Com o alvo centralizado, a Huber empatou com o RMSE (0,553 contra 0,554) e protege contra virais.'},
+        {texto: 'O modelo começou do zero, porque a Huber não aceita `boost_from_average`; centralize o alvo.', correta: true, explicacao: 'Com gradientes limitados a ±δ, chegar ao nível médio (cerca de 5,5) consome centenas de árvores.'},
+        {texto: 'O delta de 1,0 é pequeno demais para qualquer base.', explicacao: 'δ ≈ 1 é razoável em escala log; o problema aqui é o ponto de partida.'},
+      ],
+    },
+    {
+      pergunta: 'A melhor tentativa do Optuna teve MAE 0,492 no walk-forward, contra 0,527 dos padrões. No teste, 0,579 contra 0,588. Como relatar?',
+      opcoes: [
+        {texto: '"A busca melhorou o MAE em 0,035."', explicacao: 'Esse é o número otimista, medido no mesmo protocolo usado para escolher.'},
+        {texto: '"A busca melhorou o MAE de teste em 0,009; o ganho no walk-forward era inflado por seleção."', correta: true, explicacao: 'O teste intocado é o que vale para relatar. E vale checar se 0,009 é significativo com um bootstrap pareado.'},
+        {texto: '"A busca não serve para nada."', explicacao: 'Ela ajudou um pouco e revelou algo útil: árvores rasas funcionam bem nesta base.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: Optuna para o CatBoost]
+Adapte a busca para o CatBoost:
+
+1. Escreva `walk_forward_cat(cfg)` com as mesmas `DOBRAS`, usando `eval_set` e `early_stopping_rounds=100`.
+2. No objetivo, busque `depth` (3 a 8), `l2_leaf_reg` (0,5 a 20, escala log) e `random_strength` (0,1 a 5, escala log), com `learning_rate=0.05` e `has_time=True` fixos.
+3. Rode 15 tentativas, reajuste no treino completo com o número médio de árvores e meça no teste de 2026.
+4. Compare com o LightGBM afinado (0,579). A diferença justifica trocar de biblioteca?
+:::
+
+<details>
+<summary>Ver a solução</summary>
+
+```python
+def walk_forward_cat(cfg):
+    maes, iters = [], []
+    for ini, fim in DOBRAS:
+        ini, fim = pd.Timestamp(ini, tz="UTC"), pd.Timestamp(fim, tz="UTC")
+        a = treino[treino["published_at"] < ini]
+        b = treino[(treino["published_at"] >= ini) & (treino["published_at"] < fim)]
+        m = CatBoostRegressor(iterations=3000, **cfg).fit(
+            a[FEATURES], a["y"], cat_features=["setor"], eval_set=(b[FEATURES], b["y"]),
+            early_stopping_rounds=100)
+        maes.append(mae(b["y"], m.predict(b[FEATURES])))       # usa a melhor iteração (use_best_model)
+        iters.append(m.get_best_iteration() + 1)
+    return float(np.mean(maes)), int(np.mean(iters))
+
+
+def objetivo_cat(trial):
+    cfg = dict(learning_rate=0.05, has_time=True, random_seed=0, verbose=0, thread_count=1,
+               depth=trial.suggest_int("depth", 3, 8),
+               l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 0.5, 20.0, log=True),
+               random_strength=trial.suggest_float("random_strength", 0.1, 5.0, log=True))
+    erro, n_arvores = walk_forward_cat(cfg)
+    trial.set_user_attr("n_arvores", n_arvores)
+    return erro
+
+
+estudo_cat = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=0))
+estudo_cat.optimize(objetivo_cat, n_trials=15)
+melhor = dict(learning_rate=0.05, has_time=True, random_seed=0, verbose=0, **estudo_cat.best_params)
+final = CatBoostRegressor(iterations=estudo_cat.best_trial.user_attrs["n_arvores"], **melhor)
+final.fit(treino[FEATURES], treino["y"], cat_features=["setor"])
+print(f"CatBoost | MAE walk-forward {estudo_cat.best_value:.3f} | MAE teste {mae(teste['y'], final.predict(teste[FEATURES])):.3f}")
+print({k: round(v, 3) if isinstance(v, float) else v for k, v in estudo_cat.best_params.items()})
+```
+
+```text
+CatBoost | MAE walk-forward 0.487 | MAE teste 0.541
+{'depth': 3, 'l2_leaf_reg': 0.731, 'random_strength': 1.329}
+```
+
+O CatBoost afinado chega a 0,541 no teste, contra 0,579 do LightGBM afinado. Mais uma vez, a busca preferiu árvores rasas (profundidade 3). A diferença de 0,038 é da mesma ordem da vantagem que o `has_time` deu ao CatBoost; antes de trocar de biblioteca, confirme com um bootstrap pareado e lembre que, com as features de histórico da aula 3.5, a vantagem pode encolher (o sinal temporal que o CatBoost extraiu do `setor` passa a vir de features explícitas).
+
+</details>
+
+---
+
+## Resumo
+
+- **LightGBM** usa histogramas e cresce **folha a folha** (controle: `num_leaves`); **XGBoost** cresce **nível a nível** com regularização no objetivo (controle: `max_depth`); **CatBoost** usa **árvores simétricas** e *ordered target statistics* para categóricas (controle: `depth`).
+- O fluxo é sempre: **early stopping** numa validação temporal, depois **refit** em treino + validação com o número de árvores escolhido.
+- **Setor como categórica, canal não**: `canal_id` ajuda com canais conhecidos e destrói o modelo com canais novos. No CatBoost, use **`has_time=True`** com linhas ordenadas no tempo.
+- **Huber** existe nas três; no CatBoost, **centralize o alvo**. **Restrições monotônicas** trocam decoreba por generalização.
+- **Optuna em walk-forward** ajuda pouco e mede com otimismo; o teste intocado é o juiz. Features valem mais que busca.
+
+## Referências
+
+- Ke et al. [*LightGBM: A Highly Efficient Gradient Boosting Decision Tree*](https://papers.nips.cc/paper_files/paper/2017/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html). NeurIPS, 2017.
+- Chen e Guestrin. [*XGBoost: A Scalable Tree Boosting System*](https://arxiv.org/abs/1603.02754). KDD, 2016.
+- Prokhorenkova, Gusev, Vorobev, Dorogush e Gulin. [*CatBoost: unbiased boosting with categorical features*](https://arxiv.org/abs/1706.09516). NeurIPS, 2018.
+- Ye et al. [*MVP: Winning Solution to SMP Challenge 2025 Video Track*](https://arxiv.org/abs/2507.00950). arXiv:2507.00950, 2025.
+- Documentação do LightGBM: [Parameters](https://lightgbm.readthedocs.io/en/stable/Parameters.html) e [Parameters Tuning](https://lightgbm.readthedocs.io/en/stable/Parameters-Tuning.html).
+- Documentação do XGBoost: [XGBoost Parameters](https://xgboost.readthedocs.io/en/stable/parameter.html) e [Monotonic Constraints](https://xgboost.readthedocs.io/en/stable/tutorials/monotonic.html).
+- Documentação do CatBoost: [parâmetros de treino](https://catboost.ai/docs/en/references/training-parameters/) e [funções de perda de regressão](https://catboost.ai/docs/en/concepts/loss-functions-regression).
+- Documentação do Optuna: [Optuna](https://optuna.readthedocs.io/en/stable/).
+
+**Próxima aula:** [Features do canal e do tempo](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-do-canal-e-do-tempo): histórico do canal sem vazamento, joins "as-of", horário e calendário, e o maior ganho de MAE do módulo.

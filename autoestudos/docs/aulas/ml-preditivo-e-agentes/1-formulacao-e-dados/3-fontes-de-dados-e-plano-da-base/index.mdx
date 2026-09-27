@@ -1,0 +1,270 @@
+---
+sidebar_position: 3
+sidebar_label: 'Fontes de dados e o plano da sua base'
+title: 'Fontes de dados e o plano da sua base'
+description: 'O que a YouTube Data API, o SMTPD, o SMP-Video e o MicroLens-100K representam (e o que não representam), e como planejar tamanho, custo de cota e cronograma da sua base.'
+tags: [ml-preditivo, dados, youtube-api]
+---
+
+# Fontes de Dados e o Plano da Sua Base: Por que Começar a Coletar Hoje
+
+<LessonMeta
+  tempo="35 min"
+  semana={1}
+  etapa="dados"
+  objetivos={[
+    'Descrever o que cada fonte de dados representa e, principalmente, o que ela não representa',
+    'Decidir o papel de cada fonte no projeto: base principal ou apoio',
+    'Definir as metas da sua base (Shorts, canais, setores, idade mínima) e justificar cada uma',
+    'Estimar o custo de cota de uma coleta completa e montar um cronograma de quatro semanas',
+  ]}
+  prerequisitos={[
+    {label: 'Anatomia de um problema supervisionado', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/anatomia-de-um-problema-supervisionado'},
+  ]}
+/>
+
+A primeira pergunta de quem começa um projeto de ML costuma ser "cadê o dataset?". Neste case, a resposta é desconfortável: **não existe um dataset pronto** de Shorts de moda, beleza e automotivo com curtidas maduras, e a liga não vai entregar um. Cada aluno monta a própria base.
+
+A tentação é procurar algo grande no Hugging Face e seguir em frente. E existe algo grande: o SMTPD tem 282 mil vídeos do YouTube com popularidade diária por 30 dias. Parece muito melhor do que os 8 mil Shorts que você vai conseguir coletar. Só que a duração média dos vídeos do SMTPD é de cerca de 30 minutos. Um modelo treinado ali aprende a prever a popularidade de vídeos longos, de canais e idiomas variados, numa época anterior às mudanças de contagem de 2025 e 2026. É outro problema.
+
+Esta aula separa as fontes que você **pode** usar das que você **deve** usar, e transforma a coleta num plano com números, custo e datas.
+
+:::info[A ideia central]
+Sua base de treino e teste vem da **YouTube Data API**, coletada por você, com data de coleta em cada linha. SMTPD, SMP-Video e MicroLens-100K são **fontes de apoio**: servem para aquecer ideias, comparar com a literatura e ensaiar o pipeline multimodal, mas não substituem Shorts reais no seu recorte. E como a <Termo id="cota">cota da API</Termo> é diária e não acumula, cada dia sem coletar é cota perdida.
+:::
+
+---
+
+## O que cada fonte representa (e o que não representa)
+
+Toda base responde a uma pergunta implícita: *"de que população estes exemplos são uma amostra?"*. Um modelo só é confiável dentro dessa população. Por isso, a coluna mais importante da tabela abaixo é a última.
+
+| Fonte | O que tem | Acesso e licença | Representa | **Não** representa |
+| :--- | :--- | :--- | :--- | :--- |
+| **YouTube Data API v3** | Metadados (título, descrição, tags, duração, data), estatísticas públicas (views, curtidas, comentários) e dados do canal | Chave gratuita no Google Cloud; [Developer Policies](https://developers.google.com/youtube/terms/developer-policies) | Os canais que **você** escolheu, no momento da coleta | Retenção, impressões, CTR e compartilhamentos (dados do YouTube Studio, visíveis só para o dono do canal); estatísticas do dia da publicação |
+| **SMTPD** (CVPR 2025) | 282 mil vídeos do YouTube em mais de 90 idiomas, com popularidade diária nos primeiros 30 dias | Código no GitHub [zhuwei321/SMTPD](https://github.com/zhuwei321/SMTPD); dados em links do Google Drive citados no README | Dinâmica temporal da popularidade de vídeos do YouTube em geral | Shorts (duração média de cerca de 30 min), marcas, seus setores, o regime de contagem pós-março de 2025 (o artigo saiu em março de 2025) |
+| **SMP-Video** (SMP Challenge) | Cerca de 6 mil vídeos curtos e 4,5 mil usuários, anonimizados, com rótulo de popularidade | Hugging Face [`smpchallenge/SMP-Video`](https://huggingface.co/datasets/smpchallenge/SMP-Video), gated, sob a *SMP Challenge Community License* | Um benchmark com métricas e soluções vencedoras publicadas | Seus canais: por ser anonimizado, não dá para buscar o histórico de cada canal na API |
+| **MicroLens-100K** | 19.738 microvídeos com mídia bruta (vídeo, áudio, capa, título), views e curtidas por vídeo, 100 mil usuários | [GitHub westlake-repl/MicroLens](https://github.com/westlake-repl/MicroLens), download em recsys.westlake.edu.cn | Material multimodal para testar extração de features de vídeo | YouTube, marcas e português; os vídeos-semente foram filtrados por **mais de 10 mil curtidas**, então a base é enviesada para o que já fez sucesso |
+
+<Sketch name="m1/fontes-de-dados" alt="Diagrama: a YouTube Data API, a sua base, alimenta obrigatoriamente o modelo final (treino, validação temporal e teste). Três fontes de apoio ficam embaixo: SMTPD (282 mil vídeos do YouTube, majoritariamente long-form) para aquecimento; SMP-Video (cerca de 6 mil vídeos curtos anonimizados) para comparar com a literatura; MicroLens-100K (19.738 microvídeos com mídia bruta) para ensaiar o pipeline multimodal. Setas tracejadas em vermelho indicam que as fontes de apoio não substituem a base." caption="Uma fonte principal, três de apoio. O número que você apresenta vem da sua base." />
+
+Três detalhes merecem atenção.
+
+**A API mostra uma foto, não um filme.** Quando você pede as estatísticas de um vídeo, recebe os números **de hoje**. Não existe endpoint para "curtidas no dia 30". Se você quiser a trajetória, precisa tirar fotos repetidas (snapshots), e é por isso que o coletor da [aula 1.5](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor) grava uma linha por vídeo por dia de coleta.
+
+**O que a API não tem.** Métricas como retenção, impressões e taxa de clique existem, mas vivem no YouTube Studio (e, em parte, na YouTube Analytics API) e exigem ser o dono do canal ou ter autorização dele. As marcas clientes da Galaxies têm esses dados dos próprios canais; você, não. Isso limita o que o seu modelo pode aprender e deve aparecer no seu data card.
+
+**Viés de seleção das bases prontas.** O MicroLens filtrou vídeos-semente com mais de 10 mil curtidas. Um modelo treinado ali nunca viu um fracasso. É o mesmo problema que você vai enfrentar ao escolher canais: a [próxima aula](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/curadoria-de-canais) trata dele.
+
+---
+
+## Como usar as fontes de apoio sem se enganar
+
+As fontes de apoio são úteis, desde que cada uma tenha um papel claro e **nenhuma encoste no seu conjunto de teste**:
+
+- **SMTPD, para aquecer.** Nos primeiros dias, enquanto sua coleta amadurece, dá para testar o pipeline de alvo em escala log, as features de histórico do canal e as features de texto num volume grande. O aprendizado que se transfere é de **método** ("o alvo relativo ajuda?"), não de parâmetros.
+- **SMP-Video, para calibrar expectativas.** Os vencedores do SMP Challenge publicam métricas e arquiteturas. Se sua abordagem for muito pior ou muito melhor do que a deles num problema parecido, investigue. O acesso é gated e a licença é própria; leia antes de aceitar.
+- **MicroLens-100K, para ensaiar a camada multimodal.** Ele distribui mídia bruta para pesquisa, então você pode desenvolver extração de frames, cortes e embeddings sem baixar nada do YouTube. As aulas [Obtendo a mídia](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia) e [Documentação, ética e termos de uso](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos) discutem por que baixar vídeos do YouTube é uma área cinzenta.
+
+Se em algum momento você **treinar** com dados de uma fonte de apoio (por exemplo, pré-treinar e depois ajustar na sua base), trate isso como um experimento: compare com e sem, no mesmo teste temporal da sua base. É a <Termo id="ablacao">ablação</Termo> que prova se ajudou.
+
+---
+
+## O plano da base: metas e porquês
+
+Um plano de base cabe em meia página e responde a cinco perguntas. As metas abaixo são as recomendadas pela trilha para o case; ajuste com justificativa, não por conveniência.
+
+| Meta | Valor recomendado | Por quê |
+| :--- | :--- | :--- |
+| **Volume** | 5 a 15 mil Shorts rotulados | Com menos de 5 mil, o teste temporal (os 15 a 20% mais recentes) fica com menos de mil Shorts espalhados por dezenas de canais, e as métricas oscilam muito de um corte para outro. Acima de 15 mil, o gargalo passa a ser a extração multimodal, não o modelo. |
+| **Canais** | 60 ou mais | O alvo relativo compara cada post com o passado do **próprio canal**; com poucos canais, o modelo aprende "quem é quem" e não "o que funciona". Também permite validar em canais nunca vistos. |
+| **Setores** | Pelo menos 2 dos 3 (moda, beleza, automotivo) | Permite testar se os efeitos de conteúdo mudam por setor, como rosto em beleza vs. automotivo. |
+| **Idade mínima** | 30 dias no momento do snapshot usado como rótulo | Curtidas de um Short de 3 dias ainda estão crescendo; comparar com um de 300 dias mistura maturidades. Detalhes em [O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente). |
+| **Data de coleta** | Em **toda** linha (`collected_at`) | Sem ela, não dá para calcular idade, separar regimes de contagem, cumprir a regra de refresh de 30 dias nem reproduzir a base. |
+
+Uma conta rápida mostra que as metas conversam entre si. Com 60 canais e uma média de 150 Shorts maduros por canal, você chega a 9 mil Shorts, no meio da faixa. Canais que publicam pouco (menos de 30 Shorts no histórico) contribuem pouco para o alvo relativo e são candidatos a exclusão na curadoria.
+
+---
+
+## Quanto custa em cota
+
+A YouTube Data API tem uma cota padrão de **10.000 unidades por dia** no bucket geral, zerada à meia-noite do horário do Pacífico. Os três métodos que o coletor usa custam **1 unidade por chamada**, e cada chamada traz até 50 itens. O `search.list` tem um bucket próprio, de **100 chamadas por dia** desde 01/06/2026, e com filtro de canal devolve no máximo 500 vídeos. Por isso o caminho principal é a playlist de uploads, não a busca.
+
+O trecho abaixo estima o custo de uma coleta completa:
+
+```python
+import math
+from datetime import date, timedelta
+
+COTA_DIARIA = 10_000     # unidades/dia (cota padrão, bucket geral)
+IDADE_MINIMA = 30        # dias: só vira exemplo rotulado com >= 30 dias
+
+def custo_coleta(n_canais: int, uploads_por_canal: int) -> dict:
+    """Unidades gastas numa coleta completa via playlist de uploads."""
+    resolver = n_canais                                     # channels.list(forHandle): 1 por handle
+    paginas = n_canais * math.ceil(uploads_por_canal / 50)  # playlistItems.list: 50 por página
+    detalhes = math.ceil(n_canais * uploads_por_canal / 50) # videos.list: 50 IDs por chamada
+    total = resolver + paginas + detalhes
+    return {"resolver": resolver, "paginas": paginas, "detalhes": detalhes,
+            "total": total, "pct_cota": round(100 * total / COTA_DIARIA, 1)}
+
+def data_de_corte(coleta: date) -> date:
+    """Último dia de publicação aceito numa coleta feita em `coleta`."""
+    return coleta - timedelta(days=IDADE_MINIMA)
+
+plano = {"beleza": 25, "moda": 20, "automotivo": 20}   # canais por setor
+n = sum(plano.values())
+print(f"{n} canais em {len(plano)} setores")
+print(custo_coleta(n, uploads_por_canal=300))
+
+for coleta in [date(2026, 9, 28), date(2026, 10, 12), date(2026, 10, 19)]:
+    print(f"coleta em {coleta}: vídeos publicados até {data_de_corte(coleta)}")
+```
+
+```text
+65 canais em 3 setores
+{'resolver': 65, 'paginas': 390, 'detalhes': 390, 'total': 845, 'pct_cota': 8.4}
+coleta em 2026-09-28: vídeos publicados até 2026-08-29
+coleta em 2026-10-12: vídeos publicados até 2026-09-12
+coleta em 2026-10-19: vídeos publicados até 2026-09-19
+```
+
+Uma coleta completa de 65 canais com 300 uploads cada custa **menos de 10% da cota diária**. A cota não é o gargalo do volume; é o gargalo do **tempo**: ela só zera uma vez por dia, e snapshots só podem ser tirados no dia em que você roda o coletor. Note também que a playlist de uploads traz vídeos longos e Shorts misturados, e você paga para listar os dois. Na aula 1.5, o componente interativo de cota compara as estratégias lado a lado.
+
+:::tip[Um método novo, com bucket próprio]
+Em 03/06/2026, a API ganhou o [`videos.batchGetStats`](https://developers.google.com/youtube/v3/docs/videos/batchGetStats), que devolve estatísticas, duração e data de publicação de vídeos por ID, com **bucket próprio** de 10.000 unidades/dia. Para re-coletar snapshots de vídeos que você já conhece, ele poupa o bucket geral. O coletor da trilha usa `videos.list` porque precisa também de título, descrição e tags; vale testar o `batchGetStats` para os refreshes diários.
+:::
+
+---
+
+## Cronograma: a cota é diária, comece no dia 1
+
+O projeto vai de 23/09 a 23/10/2026. Hoje é 27/09. A regra dos 30 dias tem uma consequência que pega muita gente de surpresa: um Short publicado em 10/10 **nunca** vai entrar na sua base de treino, porque não terá 30 dias até a entrega. Tudo o que você vai rotular **já foi publicado**: com a última coleta de rótulos por volta de 19/10, o corte de publicação é 19/09.
+
+<Sketch name="m1/cronograma-da-base" alt="Cronograma de quatro semanas: semana 1 (23 a 29/09) curadoria e primeira coleta completa; semana 2 (30/09 a 06/10) coleta incremental diária e snapshots; semana 3 (07 a 13/10) congelar a base de treino com Shorts de 30 dias ou mais; semana 4 (14 a 23/10) última coleta de rótulos, agente, MCP e README. Uma fileira de 31 pontos representa uma coleta por dia de cota. Notas: a regra do rótulo (coleta em 28/09 rotula vídeos publicados até 29/08; coleta em 19/10, até 19/09) e a cota que zera à meia-noite do Pacífico, 04h em Brasília até 01/11/2026." caption="A coleta roda todo dia; o que muda de uma semana para a outra é o que você faz com ela." />
+
+O que isso significa na prática:
+
+1. **Hoje:** criar o projeto no Google Cloud, ativar a YouTube Data API v3, gerar a chave e guardar em `YOUTUBE_API_KEY`. Leva 15 minutos.
+2. **Até o fim da semana 1:** planilha de curadoria com 60+ canais e a primeira coleta completa. Essa coleta já rotula tudo o que foi publicado até o fim de agosto.
+3. **Semanas 2 e 3:** rodar o coletor uma vez por dia. Cada execução descobre Shorts novos e tira um snapshot dos Shorts jovens. Em 7 a 13/10, você congela a versão de treino e segue coletando para o teste final.
+4. **Semana 4:** uma última coleta de rótulos por volta de 19/10 (vídeos publicados até 19/09) e mais nada de dados: o foco vira agente, MCP e README.
+
+A cota zera à meia-noite do Pacífico, que corresponde às **04h de Brasília** até 01/11/2026 e às 05h depois disso, quando termina o horário de verão nos EUA. Se o coletor rodar às 03h e às 05h, você usou dois dias de cota numa mesma madrugada.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A Lumina é fictícia: ela **não** vai aparecer na sua coleta. O que a sua base precisa ter é gente parecida com ela, para que o modelo tenha o que dizer sobre A e B:
+
+- **Canais de beleza de porte médio** (dezenas a centenas de milhares de inscritos), incluindo marcas oficiais, e não só criadores gigantes.
+- **Variedade de formato**: tutoriais longos (perto de 1 minuto, como o Short A) e antes/depois curtos (perto de 20 s, como o B). Se todos os Shorts de beleza da sua base tiverem entre 15 e 30 s, o modelo não aprende nada sobre 55 s.
+- **Variedade de horário**: publicações à tarde em dias úteis e à noite. O A está planejado para terça 14h e o B para quinta 19h; o modelo só pode opinar sobre essa diferença se viu os dois contextos.
+- **Um segundo setor**, como o automotivo da Garagem 22, para verificar se o que funciona em beleza (rosto, texto na tela) funciona igual em outro público.
+
+O SMTPD não resolve nada disso: ele não tem Shorts de marcas de maquiagem. Serve para você testar, na semana 1, se o seu código de alvo e de features funciona.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Trocar a sua base por uma base pronta maior.** Volume não compensa população errada. Um modelo excelente em vídeos longos de 2024 não diz nada sobre Shorts de beleza em 2026.
+2. **Misturar fonte de apoio no teste.** O teste é sempre o período mais recente da **sua** base. Qualquer outra coisa mede outra pergunta.
+3. **Começar a coletar na semana 3.** A cota não acumula e os rótulos precisam de 30 dias. Duas semanas perdidas não voltam.
+4. **Esquecer a data de coleta.** Sem `collected_at`, a base não tem idade, regime nem prazo de refresh.
+5. **Aceitar a licença sem ler.** SMP-Video é gated, com licença própria; os termos do YouTube também têm regras de armazenamento. A [aula 1.8](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos) volta a isso.
+:::
+
+<Quiz
+  id="m1-a3"
+  perguntas={[
+    {
+      pergunta: 'Por que o SMTPD, com 282 mil vídeos, não substitui uma base própria de Shorts de marcas?',
+      opcoes: [
+        {texto: 'Porque 282 mil vídeos é pouco para treinar gradient boosting.', explicacao: 'O volume é mais do que suficiente. O problema é a população, não o tamanho.'},
+        {texto: 'Porque os vídeos são majoritariamente long-form, de canais e idiomas variados, e anteriores às mudanças de contagem de 2025.', correta: true, explicacao: 'O modelo só é confiável dentro da população que os dados representam, e o SMTPD representa outra.'},
+        {texto: 'Porque o SMTPD não tem dados de popularidade.', explicacao: 'Tem, e com granularidade diária por 30 dias. Isso o torna útil como apoio, não como base principal.'},
+      ],
+    },
+    {
+      pergunta: 'Qual é o papel mais adequado para o MicroLens-100K neste projeto?',
+      opcoes: [
+        {texto: 'Conjunto de teste, porque tem mídia bruta.', explicacao: 'O teste precisa ser o período mais recente da sua base; o MicroLens nem é do YouTube.'},
+        {texto: 'Ensaiar a extração de features de vídeo antes de ter os seus vídeos processados.', correta: true, explicacao: 'Ele distribui mídia bruta para pesquisa, o que permite desenvolver o pipeline multimodal.'},
+        {texto: 'Treinar o modelo final, porque seus vídeos são curtos como os Shorts.', explicacao: 'Plataforma, idioma e critério de seleção (vídeos-semente com mais de 10 mil curtidas) são diferentes.'},
+      ],
+    },
+    {
+      pergunta: 'Você coleta hoje, 27/09/2026. Qual destes Shorts pode entrar como exemplo rotulado nessa coleta?',
+      opcoes: [
+        {texto: 'Um Short publicado em 15/09/2026.', explicacao: 'Ele tem 12 dias. As curtidas ainda estão amadurecendo; ele pode ser rotulado numa coleta a partir de 15/10.'},
+        {texto: 'Um Short publicado em 20/08/2026.', correta: true, explicacao: 'Tem 38 dias na data da coleta, acima do mínimo de 30.'},
+        {texto: 'Qualquer Short, desde que você anote a data de coleta.', explicacao: 'A data de coleta é necessária, mas não basta: o rótulo precisa ter pelo menos 30 dias de maturação.'},
+      ],
+    },
+    {
+      pergunta: 'Uma coleta completa de 65 canais com 300 uploads cada custa cerca de 845 unidades. O que isso diz sobre o planejamento?',
+      opcoes: [
+        {texto: 'Que a cota não é o gargalo de volume; o gargalo é o tempo, porque a cota e os snapshots são diários.', correta: true, explicacao: 'Menos de 10% da cota diária cobre a coleta completa; o que não dá para comprimir são os dias.'},
+        {texto: 'Que dá para coletar tudo em um dia e parar.', explicacao: 'A primeira coleta sim, mas os Shorts jovens precisam de snapshots até passarem dos 30 dias.'},
+        {texto: 'Que vale usar search.list para economizar.', explicacao: 'O search.list tem um bucket de só 100 chamadas/dia e, com filtro de canal, devolve no máximo 500 vídeos.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: escreva o plano da sua base]
+Crie um arquivo `PLANO_DA_BASE.md` no seu repositório com:
+
+1. **Metas**: volume de Shorts, número de canais por setor, idade mínima do rótulo.
+2. **Fontes**: a principal e as de apoio que você pretende usar, cada uma com uma frase sobre o papel dela e o que ela **não** representa.
+3. **Custo**: rode `custo_coleta` com os seus números e anote o resultado.
+4. **Cronograma**: datas da primeira coleta completa, do congelamento da base de treino e da última coleta de rótulos, com a data de corte de publicação correspondente a cada uma.
+5. **Riscos**: dois riscos que podem fazer você não bater a meta, e o que fará se acontecerem.
+:::
+
+<details>
+<summary>Ver um exemplo de plano</summary>
+
+> **Metas:** 8 a 10 mil Shorts rotulados; 70 canais (30 beleza, 20 moda, 20 automotivo); rótulo = primeiro snapshot com 30 ou mais dias.
+>
+> **Fontes:** YouTube Data API (base de treino e teste). SMTPD só na semana 1, para validar o código de alvo em log e das features de canal; não representa Shorts nem marcas. MicroLens-100K para desenvolver a extração de frames; não é YouTube e só tem vídeos-semente populares.
+>
+> **Custo:** 70 canais × 300 uploads ≈ 910 unidades na coleta completa; refresh diário dos Shorts jovens abaixo de 100 unidades.
+>
+> **Cronograma:** coleta completa em 28/09 (corte de publicação: 29/08); coletas diárias às 05h de Brasília; congelamento da base de treino em 12/10 (corte: 12/09); última coleta de rótulos em 19/10 (corte: 19/09).
+>
+> **Riscos:** (1) canais de moda publicam poucos Shorts: abrir para mais 10 canais até 02/10; (2) muitos canais escondem curtidas: excluir na curadoria e registrar no data card.
+
+</details>
+
+---
+
+## Resumo
+
+- A **YouTube Data API** é a sua base principal; as estatísticas são uma **foto do dia da coleta**, e retenção, impressões e CTR não estão disponíveis.
+- **SMTPD** (majoritariamente long-form), **SMP-Video** (anonimizado, gated) e **MicroLens-100K** (outra plataforma, vídeos-semente populares) são **apoio**, nunca teste.
+- Metas da trilha: **5 a 15 mil Shorts**, **60+ canais**, **2+ setores**, rótulo com **30+ dias** e **`collected_at`** em toda linha.
+- Uma coleta completa custa **menos de 10% da cota diária**; o gargalo é o **tempo**, porque a cota e os snapshots são diários.
+- Comece a coletar **no dia 1**: tudo o que você vai rotular já foi publicado (corte por volta de 19/09).
+
+## Referências
+
+- Google. [YouTube Data API: visão geral e cota](https://developers.google.com/youtube/v3/getting-started), [Quota Calculator](https://developers.google.com/youtube/v3/determine_quota_cost) e [Revision History](https://developers.google.com/youtube/v3/revision_history) (entradas de 01/06/2026 e 03/06/2026).
+- Google. [`search.list`](https://developers.google.com/youtube/v3/docs/search/list): bucket próprio e limite de 500 vídeos com `channelId`.
+- Xu et al. [*SMTPD: A New Benchmark for Temporal Prediction of Social Media Popularity*](https://arxiv.org/abs/2503.04446). CVPR, 2025. Código: [github.com/zhuwei321/SMTPD](https://github.com/zhuwei321/SMTPD).
+- SMP Challenge. [SMP-Video no Hugging Face](https://huggingface.co/datasets/smpchallenge/SMP-Video) e [site do desafio](https://smp-challenge.com/).
+- Ni et al. [*A Content-Driven Micro-Video Recommendation Dataset at Scale*](https://arxiv.org/abs/2309.15379) (MicroLens). arXiv:2309.15379. Repositório: [github.com/westlake-repl/MicroLens](https://github.com/westlake-repl/MicroLens).
+- Hub do projeto: [Monte sua base](/projetos/galaxies/monte-sua-base) e [Roadmap](/projetos/galaxies/roadmap).
+
+**Próxima aula:** [Curadoria de canais](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/curadoria-de-canais): como escolher os 60+ canais sem cair no viés de sobrevivência e sem gastar a cota de busca.
