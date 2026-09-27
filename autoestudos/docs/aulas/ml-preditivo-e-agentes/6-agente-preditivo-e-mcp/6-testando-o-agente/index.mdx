@@ -1,0 +1,638 @@
+---
+sidebar_position: 6
+sidebar_label: 'Testando e avaliando o agente'
+title: 'Testando e avaliando o agente'
+description: 'A pirâmide de testes do agente preditivo: unidade, contrato, a invariante "número do agente = número do modelo", golden set de-para, avaliação de trajetória e fidelidade, e inspeção com MLflow tracing.'
+tags: [ml-preditivo, galaxies, agente, testes, avaliacao]
+---
+
+# Testando e Avaliando o Agente: O Número Precisa Chegar Intacto
+
+<LessonMeta
+  tempo="55 min"
+  semana={4}
+  etapa="agente"
+  objetivos={[
+    'Organizar os testes do agente numa pirâmide: unidade, contrato, invariante, golden set e trajetória',
+    'Escrever o teste da invariante crítica: o número entregue pelo agente é o número do modelo',
+    'Montar um golden set "de-para" com criativos de canais fora do treino e métricas reais',
+    'Avaliar trajetória e fidelidade do agente ReAct e inspecionar execuções com MLflow tracing',
+  ]}
+  prerequisitos={[
+    {label: 'MCP do zero', to: '/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero'},
+    {label: 'Avaliação de agentes e tool calling', to: '/aulas/eval-driven-development/avaliacao-de-agentes-e-tool-calling'},
+    {label: 'Criação e curadoria de golden datasets', to: '/aulas/eval-driven-development/criacao-e-curadoria-de-golden-datasets'},
+  ]}
+/>
+
+Imagine a demo. O modelo foi avaliado com cuidado, o servidor MCP responde, e o agente diz, com toda a segurança: *"o Short B deve render cerca de 4.500 curtidas"*. A tool devolveu 4.237. O LLM arredondou "para facilitar". Na semana seguinte, alguém do time muda o `features_de_tempo_e_legenda` para usar UTC "porque é mais correto", e o número muda para todos os criativos, sem que nenhuma métrica do modelo acuse nada: o modelo continua o mesmo, só a entrada dele mudou.
+
+Nenhum desses dois problemas aparece nas métricas de ML. O Spearman, o par-a-par e a cobertura medem o **modelo**. O que quebrou foi o **caminho** entre o modelo e quem lê a resposta. Um agente preditivo precisa de testes para esse caminho, e o mais importante deles cabe numa frase: **o número que o agente entrega é o número que o modelo calculou**.
+
+:::info[A ideia central]
+Os testes do agente formam uma **pirâmide**. Na base, muitos testes rápidos e sem LLM: **unidade** e **contrato**. No meio, a **invariante crítica** (grafo, função, MCP e ReAct devolvem o mesmo número que o LightGBM calcula por fora) e o **golden set "de-para"** (previsão vs. curtidas reais em canais fora do treino). No topo, poucos testes caros, com LLM real: **trajetória** (as tools certas, na ordem certa) e **fidelidade** (o texto só cita números das tools). O **MLflow tracing** atravessa tudo e deixa cada execução inspecionável.
+:::
+
+---
+
+## A pirâmide
+
+<Sketch name="m6/piramide-testes" alt="Pirâmide com cinco camadas, de baixo para cima: 1 unidade (schemas recusam o que devem, hora local, features, métricas, roteamento do grafo); 2 contrato (todo pedido válido gera PredictionResponse válida, low menor ou igual a pred menor ou igual a high, versão do modelo, features_used); 3 invariante (número do agente igual ao número do modelo: grafo, função, MCP e ReAct devolvem o mesmo valor); 4 golden set de-para (previsão versus real em canais fora do treino); 5 trajetória e fidelidade (tools certas? texto fiel?). À esquerda, uma seta para cima: mais lento, mais caro, mais perto do usuário. À direita, embaixo: milissegundos, sem LLM, roda em todo commit; em cima: com LLM real, roda antes da entrega ou da demo. Embaixo, transversal: MLflow tracing registra cada nó, com entrada, saída e tempo." caption="Muitos testes baratos embaixo; poucos testes caros, com LLM, em cima." />
+
+A pirâmide tem uma regra prática: **tudo o que pode ser testado sem LLM deve ser testado sem LLM**. O que exige LLM (a escolha da tool, a redação) fica no topo, roda menos vezes e é tratado como avaliação, com taxa de acerto, e não como teste de passa ou falha.
+
+O arquivo que prepara tudo é o `conftest.py`. Ele define o diretório de artefatos **antes** de importar o pacote (lembre que `carregar_modelo` lê o caminho na importação), treina o modelo sintético uma vez e oferece os pedidos da Lumina como *fixtures*:
+
+```python
+# tests/conftest.py
+import os
+from pathlib import Path
+
+ARTEFATOS = Path(__file__).parent / "artefatos_teste"
+os.environ["GALAXIES_ARTEFATOS"] = str(ARTEFATOS)  # ANTES de importar galaxies_tool
+
+import pytest  # noqa: E402
+
+from galaxies_tool.schemas import PredictionRequest  # noqa: E402
+
+
+def pytest_sessionstart(session):
+    """Treina o modelo sintético uma vez (≈30 s); as execuções seguintes reusam o disco."""
+    if not (ARTEFATOS / "modelo.joblib").exists():
+        from galaxies_tool.comparaveis import adicionar_rel_vizinhos
+        from galaxies_tool.modelo import treinar_e_salvar
+        from galaxies_tool.sintetico import gerar_base
+        treinar_e_salvar(adicionar_rel_vizinhos(gerar_base()), str(ARTEFATOS))
+
+
+@pytest.fixture
+def pedido_a() -> PredictionRequest:
+    return PredictionRequest(creative="lumina_a.mp4", sector="beleza",
+                             caption="Pele natural em 5 passos #maquiagem #tutorial",
+                             planned_datetime="2026-09-29T14:00:00-03:00",
+                             channel_id="UC_lumina_beauty")
+
+
+@pytest.fixture
+def pedido_b() -> PredictionRequest:
+    return PredictionRequest(creative="lumina_b.mp4", sector="beleza",
+                             caption="1 produto, 20 segundos #antesedepois #maquiagem",
+                             planned_datetime="2026-10-01T19:00:00-03:00",
+                             channel_id="UC_lumina_beauty")
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"  # testes async (cliente MCP) rodam com o plugin do anyio
+```
+
+Duas peças completam a configuração: um `tests/__init__.py` vazio (para os testes importarem `tests.golden`) e esta seção no `pyproject.toml`, que coloca a raiz do projeto no caminho de importação e silencia um aviso de depreciação do SHAP que não é nosso:
+
+```toml
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = ["ignore::PendingDeprecationWarning:shap.*"]
+```
+
+Na primeira execução, o `pytest_sessionstart` treina o modelo sintético (cerca de 30 s); depois, os 36 testes rodam em poucos segundos.
+
+---
+
+## Camada 1: unidade
+
+Testes de unidade verificam peças isoladas. No agente preditivo, as peças que mais quebram em silêncio são o contrato e as *features*. Um exemplo de cada:
+
+```python
+# tests/test_schemas.py — unidade: o contrato recusa o que precisa recusar
+import pytest
+from pydantic import ValidationError
+
+from galaxies_tool.modelo import features_de_tempo_e_legenda
+from galaxies_tool.schemas import PredictionRequest, PredictionResponse
+
+BASE = dict(creative="lumina_b.mp4", planned_datetime="2026-10-01T19:00:00-03:00",
+            channel_id="UC_lumina_beauty", sector="beleza")
+
+
+@pytest.mark.parametrize("mudanca, trecho", [
+    ({"planned_datetime": "2026-10-01T19:00:00"}, "timezone"),  # sem fuso
+    ({"sector": "games"}, "moda"),                               # setor fora do recorte
+    ({"channel_id": None}, "channel_id ou channel_stats"),       # sem canal
+    ({"curtidas_ontem": 10}, "Extra inputs"),                    # campo que vaza
+])
+def test_pedido_invalido_e_recusado(mudanca, trecho):
+    with pytest.raises(ValidationError, match=trecho):
+        PredictionRequest(**(BASE | mudanca))
+
+
+@pytest.mark.parametrize("criativo, tipo", [
+    ("lumina_b.mp4", "video"), ("https://youtu.be/abc", "video"),
+    ("capa.PNG", "imagem"), ("Tutorial calmo de 55 s sobre pele natural", "texto")])
+def test_tipo_do_criativo(criativo, tipo):
+    assert PredictionRequest(**(BASE | {"creative": criativo})).tipo_criativo() == tipo
+
+
+def test_resposta_com_intervalo_incoerente_e_recusada():
+    with pytest.raises(ValidationError, match="intervalo incoerente"):
+        PredictionResponse(
+            predicted_metric=100, interval_low=150, interval_high=300, relative_to_channel=1.0,
+            confidence_flag={"baixa_confianca": False}, top_drivers=[], comparables=[],
+            explanation={"resumo": "", "fatores": [], "ressalvas": []},
+            features_used={}, model_version="x")
+
+
+def test_hora_e_a_local_e_nao_a_utc():
+    # 22h em UTC = 19h em São Paulo: a feature "hora" tem de ser 19
+    f = features_de_tempo_e_legenda(PredictionRequest(**(BASE | {
+        "planned_datetime": "2026-10-01T22:00:00Z"})).planned_datetime, "", "beleza")
+    assert f["hora"] == 19
+```
+
+O último teste é o que salvaria a segunda história da abertura: 22h em UTC é 19h em São Paulo, e a *feature* `hora` precisa ser 19. Se alguém "corrigir" a função para UTC, esse teste falha antes de qualquer previsão errada chegar à persona. Os testes do roteamento do grafo, com passos falsos, também são desta camada; eles foram mostrados na [aula 6.2](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/langgraph-em-2026).
+
+---
+
+## Camada 2: contrato
+
+O teste de contrato não pergunta se a previsão está certa. Pergunta se ela **tem o formato prometido** para qualquer pedido válido: vídeo ou texto, canal na base ou canal novo, madrugada ou horário nobre.
+
+```python
+# tests/test_contrato.py — contrato: QUALQUER pedido válido gera uma resposta válida
+import pytest
+
+from galaxies_tool.api import prever_criativo
+from galaxies_tool.modelo import carregar_modelo
+from galaxies_tool.schemas import PredictionRequest, PredictionResponse
+
+PEDIDOS = [
+    dict(creative="lumina_a.mp4", channel_id="UC_lumina_beauty", sector="beleza"),
+    dict(creative="garagem22_pov.mp4", channel_id="UC_garagem22", sector="automotivo"),
+    dict(creative="Roteiro: antes/depois de 20 s com texto grande", sector="beleza",
+         channel_stats={"subscribers": 5_000, "recent_likes": [40, 55, 38]}),  # texto + canal novo
+    dict(creative="lumina_b.mp4", sector="beleza",
+         channel_stats={"subscribers": 180_000, "recent_likes": [2300] * 12}),
+]
+
+
+@pytest.mark.parametrize("hora", ["03:00", "12:00", "19:00", "23:30"])
+@pytest.mark.parametrize("extra", PEDIDOS)
+def test_resposta_respeita_o_contrato(extra, hora):
+    pedido = PredictionRequest(planned_datetime=f"2026-10-01T{hora}:00-03:00", **extra)
+    r = prever_criativo(pedido)
+    PredictionResponse.model_validate(r.model_dump(mode="json"))  # ida e volta pelo JSON
+    assert 0 <= r.interval_low <= r.predicted_metric <= r.interval_high
+    assert r.model_version == carregar_modelo().versao
+    assert set(carregar_modelo().features) <= set(r.features_used)
+    assert r.explanation.resumo and len(r.top_drivers) <= 5
+    assert {f.fator for f in r.explanation.fatores} <= {d.feature for d in r.top_drivers}
+
+
+def test_texto_e_canal_pequeno_ligam_o_sinal_de_baixa_confianca():
+    pedido = PredictionRequest(planned_datetime="2026-10-01T19:00:00-03:00", **PEDIDOS[2])
+    flag = prever_criativo(pedido).confidence_flag
+    assert flag.baixa_confianca
+    assert {"canal_novo", "extracao_falhou"} <= {m.codigo for m in flag.motivos}
+```
+
+O `@pytest.mark.parametrize` empilhado gera 16 combinações (4 pedidos x 4 horários). A ida e volta pelo JSON (`model_dump` seguido de `model_validate`) pega um erro comum: um campo que funciona como objeto Python, mas não sobrevive à serialização que o MCP faz. A última verificação amarra a explicação aos fatores: todo `fator` citado em `explanation` precisa estar em `top_drivers`.
+
+Se você tiver o `hypothesis` instalado, pode trocar a grade fixa por pedidos gerados aleatoriamente; a lógica é a mesma.
+
+---
+
+## Camada 3: a invariante crítica
+
+Este é o teste que o briefing pede nas entrelinhas, quando diz que o LLM "nunca chuta o número". Ele recalcula a previsão **por fora**, direto no LightGBM, a partir das `features_used` da resposta, e compara com o que cada porta devolveu:
+
+```python
+# tests/test_invariante.py — o número que o agente entrega É o número do modelo
+import json
+import re
+
+import numpy as np
+import pandas as pd
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, ToolMessage
+
+from galaxies_tool.agente import construir_agente, construir_grafo
+from galaxies_tool.api import prever_criativo
+from galaxies_tool.modelo import carregar_modelo
+
+
+def numero_do_modelo(features: dict) -> float:
+    """Recalcula por fora, direto no LightGBM: sem tools, sem grafo, sem LLM."""
+    b = carregar_modelo()
+    X = pd.DataFrame([features]).reindex(columns=b.features).astype(float)
+    return round(float(np.expm1(features["log_mediana_canal"] + b.modelos["q50"].predict(X)[0])))
+
+
+def test_grafo_e_funcao_entregam_o_numero_do_modelo(pedido_a, pedido_b):
+    grafo = construir_grafo()
+    for pedido in (pedido_a, pedido_b):
+        r = grafo.invoke({"pedido": pedido.model_dump(mode="json")})["resposta"]
+        assert r["predicted_metric"] == numero_do_modelo(r["features_used"])
+        assert r == prever_criativo(pedido).model_dump(mode="json")  # 2 portas, 1 número
+
+
+class FakeComTools(GenericFakeChatModel):
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+def numeros(texto: str) -> list[float]:  # "4.237" -> 4237.0 ; "0,884" -> 0.884
+    achados = re.findall(r"\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:,\d+)?", texto)
+    return [float(n.replace(".", "").replace(",", ".")) for n in achados]
+
+
+def valores(obj) -> list[float]:
+    if isinstance(obj, dict):
+        return [v for x in obj.values() for v in valores(x)]
+    if isinstance(obj, list):
+        return [v for x in obj for v in valores(x)]
+    return [float(obj)] if isinstance(obj, (int, float)) else []
+
+
+def test_agente_so_cita_numeros_que_vieram_das_tools(pedido_a, pedido_b):
+    pedidos = {"A": pedido_a.model_dump(mode="json"), "B": pedido_b.model_dump(mode="json")}
+    roteiro = iter([  # com LLM real (requer chave), este mesmo teste vira uma avaliação
+        AIMessage("", tool_calls=[{"name": "comparar_criativos",
+                                   "args": {"criativos": pedidos}, "id": "c1"}]),
+        AIMessage("Impulsione o B: 4.237 curtidas (80%: 1.655 a 9.180) contra 1.477 do A. "
+                  "P(B > A) = 0,884.")])
+    msgs = construir_agente(FakeComTools(messages=roteiro)).invoke(
+        {"messages": [{"role": "user", "content": "A ou B?"}]})["messages"]
+    saidas = [json.loads(m.content) for m in msgs if isinstance(m, ToolMessage)]
+    permitidos = set(valores(saidas)) | {80.0}  # "80%" é o nível do intervalo
+    citados = numeros(msgs[-1].content)
+    assert citados and all(any(abs(c - p) < 0.5 for p in permitidos) for c in citados)
+    b = next(r for r in saidas[0]["ranking"] if r["criativo"] == "B")
+    assert b["predicted_metric"] == numero_do_modelo(prever_criativo(pedido_b).features_used)
+```
+
+Três portas são verificadas aqui, e a quarta em outro arquivo:
+
+1. **Grafo = modelo.** O `predicted_metric` do grafo é igual ao `expm1(nível do canal + q50)` calculado sem nenhuma tool.
+2. **Grafo = função.** A resposta inteira do grafo é igual à de `prever_criativo`. Se alguém colocar lógica num nó, o teste quebra.
+3. **ReAct só cita números das tools.** O texto final do agente é varrido por números (no formato brasileiro: "4.237" é quatro mil duzentos e trinta e sete, "0,884" é zero vírgula oitocentos e oitenta e quatro), e cada um precisa existir nas saídas das tools. Com o LLM falso, o teste verifica o encanamento; com um LLM real, o mesmo teste vira avaliação.
+4. **MCP = função.** Está no `tests/test_mcp.py` da [aula 6.5](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero): a resposta que atravessou o protocolo é igual à da função pura.
+
+Repare que `numero_do_modelo` usa o `q50` cru, sem o `np.sort` que evita o *quantile crossing*. Se um dia os quantis cruzarem para algum criativo, este teste vai acusar a diferença. Isso é intencional: é um caso que você quer ver.
+
+---
+
+## Camada 4: o golden set "de-para"
+
+As camadas anteriores garantem que o número **chega intacto**. Nenhuma delas diz se o número **é bom**. Para isso, o briefing pede uma demonstração em criativos de teste com métrica real conhecida, o "de-para": previsto de um lado, real do outro.
+
+O golden set precisa seguir três regras:
+
+- **Canais fora do treino.** Criativos de canais que o modelo nunca viu testam a generalização de verdade, inclusive o caminho `channel_stats`.
+- **Posts maduros.** Publicados há pelo menos 30 dias, com as curtidas coletadas depois disso.
+- **Congelado.** O arquivo é versionado e não muda para "melhorar o resultado". Se você ajustar o modelo olhando para ele, ele vira conjunto de treino. A aula de [curadoria de golden datasets](/aulas/eval-driven-development/criacao-e-curadoria-de-golden-datasets) discute isso em detalhe.
+
+```python
+# tests/golden.py — golden set "de-para": criativos de canais FORA do treino, com curtidas reais
+import json
+from pathlib import Path
+
+from galaxies_tool.modelo import historico_recente
+from galaxies_tool.sintetico import ATRIBUTOS, gerar_base
+
+ARQUIVO = Path(__file__).parent / "golden.jsonl"
+
+
+def montar_golden_sintetico(por_canal: int = 3) -> None:
+    """No projeto real: ~30 Shorts de canais que NÃO estão na base, publicados há 30+ dias,
+    com as curtidas coletadas. Aqui, canais sintéticos novos (seed e prefixo diferentes)."""
+    novos = gerar_base(n_por_setor=4, seed=99, prefixo="UC_novo")
+    with ARQUIVO.open("w") as f:
+        for canal, posts in novos.groupby("channel_id"):
+            for i in range(len(posts) - por_canal, len(posts)):  # os últimos posts do canal
+                post = posts.iloc[i]
+                hist = historico_recente(posts.iloc[:i], post["published_at"])
+                pedido = {"creative": post["media_ref"], "caption": post["caption"],
+                          "planned_datetime": post["published_at"].isoformat(),
+                          "sector": post["sector"], "channel_stats": {
+                              "subscribers": post["channel_stats_at_collection"]["subscribers"],
+                              "recent_likes": hist.astype(int).tolist()}}
+                atributos = {k: (None if post[k] != post[k] else post[k]) for k in ATRIBUTOS}
+                f.write(json.dumps({"id": post["post_id"], "pedido": pedido,
+                                    "atributos": atributos | {"embedding": post["emb"]},
+                                    "curtidas_reais": int(post["metric_target"])}) + "\n")
+
+
+def carregar_golden() -> list[dict]:
+    if not ARQUIVO.exists():
+        montar_golden_sintetico()
+    return [json.loads(linha) for linha in ARQUIVO.open()]
+```
+
+O golden set guarda também os atributos já extraídos. Assim, o teste não depende do VLM: o extrator vira um dicionário (`cache.__getitem__`), e o que se avalia é o modelo e o caminho até ele.
+
+```python
+# tests/test_golden.py — de-para: previsão vs. curtidas reais em canais fora do treino
+import numpy as np
+from scipy.stats import spearmanr
+
+from galaxies_tool.api import prever_criativo
+from galaxies_tool.schemas import PredictionRequest
+from tests.golden import carregar_golden
+
+
+def test_golden_set_de_para():
+    golden = carregar_golden()
+    cache = {g["pedido"]["creative"]: g["atributos"] for g in golden}
+    extrator = cache.__getitem__  # stub: atributos já extraídos pelo pipeline do módulo 4
+    linhas = []
+    for g in golden:
+        r = prever_criativo(PredictionRequest.model_validate(g["pedido"]), extrator=extrator)
+        linhas.append((g["id"].rsplit("_", 1)[0], r.predicted_metric, r.interval_low,
+                       r.interval_high, g["curtidas_reais"]))
+    canal, prev, low, high, real = map(np.array, zip(*linhas))
+    cobertura = np.mean((real >= low) & (real <= high))
+    pares = [(i, j) for i in range(len(real)) for j in range(i + 1, len(real))
+             if canal[i] == canal[j]]  # pares do MESMO canal
+    par_a_par = np.mean([np.sign(prev[i] - prev[j]) == np.sign(real[i] - real[j])
+                         for i, j in pares])
+    print(f"\nn={len(real)} spearman={spearmanr(prev, real)[0]:.2f} "
+          f"par-a-par={par_a_par:.2f} cobertura80={cobertura:.2f}")
+    assert spearmanr(prev, real)[0] > 0.6  # nível: o canal domina
+    assert 0.6 <= cobertura <= 0.97        # intervalo nem mentiroso nem inútil
+    assert par_a_par >= 0.5                # ordenação dentro do canal: pelo menos o acaso
+```
+
+```text
+n=36 spearman=0.84 par-a-par=0.64 cobertura80=0.89
+1 passed
+```
+
+Os limiares do teste são deliberadamente folgados. Eles não medem se o modelo é ótimo; medem se ele **não quebrou**: Spearman acima de 0,6 (o nível do canal domina), cobertura entre 60% e 97% (um intervalo que cobre 100% é inútil, e um que cobre 50% mente) e par-a-par pelo menos no acaso. As métricas de verdade estão na avaliação temporal do [módulo 2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao); o golden set é o alarme.
+
+---
+
+## Camada 5: trajetória e fidelidade
+
+No topo da pirâmide, o comportamento do LLM. A [aula de avaliação de agentes](/aulas/eval-driven-development/avaliacao-de-agentes-e-tool-calling) do módulo EDD separa duas perguntas, e as duas se aplicam aqui:
+
+- **Trajetória:** para cada pergunta, o agente chamou as tools esperadas, na ordem esperada? *"Quanto o B vai render?"* pede `prever_criativo`; *"A ou B?"* pede `comparar_criativos`, porque só ela calcula P(B > A).
+- **Fidelidade:** todo número do texto final saiu de uma tool?
+
+```python
+# rodar_avaliacao.py — trajetória e fidelidade do agente ReAct num conjunto de perguntas
+import json
+
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, ToolMessage
+
+from galaxies_tool.agente import construir_agente
+from tests.test_invariante import numeros, valores
+
+A = {"creative": "lumina_a.mp4", "caption": "Pele natural em 5 passos #maquiagem #tutorial",
+     "planned_datetime": "2026-09-29T14:00:00-03:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}
+B = {"creative": "lumina_b.mp4", "caption": "1 produto, 20 segundos #antesedepois #maquiagem",
+     "planned_datetime": "2026-10-01T19:00:00-03:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}
+CASOS = [  # pergunta, trajetória esperada
+    ("Quantas curtidas o Short B deve ter?", ["prever_criativo"]),
+    ("A ou B: qual eu impulsiono?", ["comparar_criativos"]),
+]
+
+
+class FakeComTools(GenericFakeChatModel):
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+def chamada(nome, args):
+    return AIMessage("", tool_calls=[{"name": nome, "args": args, "id": nome}])
+
+
+ROTEIROS = [  # o que um LLM "responderia"; o 2º erra a trajetória de propósito
+    [chamada("prever_criativo", B), AIMessage("B: 4.237 curtidas (80%: 1.655 a 9.180).")],
+    [chamada("prever_criativo", A), chamada("prever_criativo", B),
+     AIMessage("B rende mais: 4.237 contra 1.477 do A.")],
+]
+
+
+def avaliar(fabrica_de_agente, casos):
+    for i, (pergunta, esperada) in enumerate(casos):
+        msgs = fabrica_de_agente(i).invoke({"messages": [{"role": "user", "content": pergunta}]})
+        trajetoria = [t["name"] for m in msgs["messages"] for t in getattr(m, "tool_calls", [])]
+        saidas = [json.loads(m.content) for m in msgs["messages"] if isinstance(m, ToolMessage)]
+        permitidos = set(valores(saidas)) | {80.0}
+        fiel = all(any(abs(n - p) < 0.5 for p in permitidos)
+                   for n in numeros(msgs["messages"][-1].content))
+        print(f"{pergunta:<38} trajetória={'ok' if trajetoria == esperada else trajetoria}"
+              f"  fidelidade={'ok' if fiel else 'FALHOU'}")
+
+
+avaliar(lambda i: construir_agente(FakeComTools(messages=iter(ROTEIROS[i]))), CASOS)
+# com LLM real (requer GOOGLE_API_KEY):
+# avaliar(lambda i: construir_agente("google_genai:gemini-3.5-flash-lite"), CASOS)
+```
+
+```text
+Quantas curtidas o Short B deve ter?   trajetória=ok  fidelidade=ok
+A ou B: qual eu impulsiono?            trajetória=['prever_criativo', 'prever_criativo']  fidelidade=ok
+```
+
+O segundo roteiro erra de propósito: chama `prever_criativo` duas vezes e compara os números "de cabeça". O texto é fiel (4.237 e 1.477 vieram das tools), mas a trajetória está errada, porque a resposta não trouxe a probabilidade de B superar A nem considerou a sobreposição dos intervalos. É exatamente o tipo de erro que só a avaliação de trajetória pega.
+
+Com o LLM real, o mesmo `avaliar` roda sobre 20 a 30 perguntas variadas (e algumas armadilhas: canal fora da base, data sem fuso, pergunta sobre algo que o modelo não prevê, como views). Reporte duas taxas no README: **trajetória correta** e **fidelidade**. Para a fidelidade da explicação em linguagem natural, o validador e o LLM-as-a-judge da [aula 5.7](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa) completam o quadro.
+
+---
+
+## Inspeção: MLflow tracing
+
+O briefing pede que "quem olha veja os atributos que entraram, a previsão e a evidência". Na resposta, isso está em `features_used`, `top_drivers` e `comparables`. No processo, a ferramenta é o *tracing*: cada execução do grafo vira um *trace*, com um *span* por nó, e cada *span* guarda entrada, saída e duração.
+
+O MLflow 3.16 instrumenta LangChain e LangGraph com uma linha, `mlflow.langchain.autolog()`:
+
+```python
+# rastrear.py — cada execução do grafo vira um trace inspecionável no MLflow
+import mlflow
+
+from galaxies_tool.agente import construir_grafo
+from galaxies_tool.api import aquecer
+from galaxies_tool.schemas import PredictionRequest
+
+mlflow.set_tracking_uri("sqlite:///mlflow.db")
+mlflow.set_experiment("galaxies-agente")
+mlflow.langchain.autolog()  # instrumenta LangChain/LangGraph: 1 span por nó
+
+aquecer()
+pedido = PredictionRequest(creative="lumina_b.mp4", sector="beleza",
+                           caption="1 produto, 20 segundos #antesedepois #maquiagem",
+                           planned_datetime="2026-10-01T19:00:00-03:00",
+                           channel_id="UC_lumina_beauty")
+resposta = construir_grafo().invoke({"pedido": pedido.model_dump(mode="json")})["resposta"]
+
+mlflow.flush_trace_async_logging()
+trace = mlflow.get_trace(mlflow.get_last_active_trace_id())
+for span in trace.data.spans:
+    print(f"{span.name:<18} {(span.end_time_ns - span.start_time_ns) / 1e6:7.1f} ms")
+print(trace.info.state, resposta["predicted_metric"])
+```
+
+```text
+previsao_galaxies     19.6 ms
+__start__              0.8 ms
+rota_inicial           0.3 ms
+extrair                0.8 ms
+contexto               8.0 ms
+prever                 3.0 ms
+explicar               2.1 ms
+responder              0.6 ms
+OK 4237.0
+```
+
+Para ver os *traces* na interface, rode `mlflow ui --backend-store-uri sqlite:///mlflow.db` e abra a aba de *traces* do experimento `galaxies-agente`. Dois detalhes: o registro é assíncrono, por isso o script chama `mlflow.flush_trace_async_logging()` antes de ler o *trace*; e, sem `set_tracking_uri`, o MLflow 3 grava num banco SQLite local, o que é suficiente para o projeto. O mesmo `autolog` registra as chamadas do agente ReAct, inclusive as mensagens do LLM, quando houver um real.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A Lumina ainda não publicou A nem B, então eles não podem estar no golden set: não há curtidas reais. O que o golden set faz é dar à Galaxies uma resposta para a pergunta *"e quando vocês acertaram?"*. Três criativos de canais fora do treino, escolhidos **antes** de ver o resultado (um por setor):
+
+| Criativo | Previsto | Intervalo de 80% | Real | Dentro? |
+| :--- | ---: | :---: | ---: | :---: |
+| `UC_novo_moda_00_007` | 1.623 | 685 a 4.933 | 1.924 | sim |
+| `UC_novo_beleza_00_015` | 45 | 22 a 134 | 31 | sim |
+| `UC_novo_automotivo_00_017` | 882 | 376 a 1.736 | 1.566 | sim |
+
+A tabela vem do script `demo_de_para.py` da [próxima aula](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/demo-e-readme). Três acertos em três não provam nada sozinhos, e é por isso que o golden set tem 36 criativos e reporta cobertura (89%) e par-a-par (64%). Na demo, mostre os três e diga os números do conjunto inteiro.
+
+Para A vs. B, o que os testes garantem é outra coisa: que o **4.237** e o **P(B > A) = 0,884** que a persona vai citar são exatamente os que o modelo calculou, em qualquer porta.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Só testar o modelo.** Métricas de ML não pegam o LLM arredondando nem uma *feature* que mudou de fuso. Teste o caminho.
+2. **Testar tudo com LLM real.** Lento, caro e instável. Na base da pirâmide, nada de LLM.
+3. **Golden set com canais do treino.** Mede memória, não generalização. Use canais que o modelo nunca viu.
+4. **Ajustar o modelo olhando o golden set.** Ele vira treino e perde o valor. Congele o arquivo.
+5. **Limiares apertados demais no golden set.** Um teste que falha a cada retreino é desligado na semana seguinte. Ele é um alarme, não a métrica principal.
+6. **Não rastrear.** Sem *trace*, a pergunta "por que este criativo deu 4.237?" não tem resposta reproduzível.
+:::
+
+<Quiz
+  id="m6-a6"
+  perguntas={[
+    {
+      pergunta: 'O agente respondeu "cerca de 4.500 curtidas" e a tool devolveu 4.237. Qual teste pega esse problema?',
+      opcoes: [
+        {texto: 'O teste de contrato, que valida o `PredictionResponse`.', explicacao: 'A resposta da tool está correta e válida; o problema está no texto do LLM.'},
+        {texto: 'O teste de fidelidade: todo número do texto final precisa existir nas saídas das tools.', correta: true, explicacao: 'Exato: 4.500 não está em nenhuma saída, então o teste falha.'},
+        {texto: 'O golden set de-para.', explicacao: 'Ele mede o modelo contra o real, não o texto do LLM contra a tool.'},
+      ],
+    },
+    {
+      pergunta: 'Por que `numero_do_modelo` recalcula a previsão direto no LightGBM, em vez de chamar `tools.prever`?',
+      opcoes: [
+        {texto: 'Porque o LightGBM é mais rápido que a tool.', explicacao: 'A diferença de tempo é irrelevante; o motivo é independência.'},
+        {texto: 'Porque um teste que usa o mesmo código que ele testa não detecta erro nesse código.', correta: true, explicacao: 'Isso. A referência precisa vir por um caminho independente.'},
+        {texto: 'Porque a tool não é determinística.', explicacao: 'A tool é determinística; o ponto é ter uma referência que não dependa dela.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destes criativos pode entrar no golden set?',
+      opcoes: [
+        {texto: 'Um Short da Lumina publicado ontem.', explicacao: 'Imaturo: as curtidas ainda estão subindo, e o canal está no treino.'},
+        {texto: 'Um Short de um canal fora do treino, publicado há 45 dias, com as curtidas coletadas.', correta: true, explicacao: 'Canal nunca visto e post maduro: é um de-para honesto.'},
+        {texto: 'O Short B da Lumina, com a previsão do próprio modelo como "real".', explicacao: 'Sem métrica real, não há de-para. Isso só testaria o modelo contra ele mesmo.'},
+      ],
+    },
+    {
+      pergunta: 'Para a pergunta "A ou B?", o agente chamou `prever_criativo` duas vezes, e o texto final só cita números vindos das tools. Como classificar?',
+      opcoes: [
+        {texto: 'Correto: fiel e com os números certos.', explicacao: 'Fidelidade não basta: faltou a tool que calcula P(B > A).'},
+        {texto: 'Fidelidade ok, trajetória errada: deveria ter chamado `comparar_criativos`.', correta: true, explicacao: 'Exato. Trajetória e fidelidade são medidas separadas.'},
+        {texto: 'Infiel, porque comparou números de chamadas diferentes.', explicacao: 'Os números vieram das tools; o problema é a escolha da tool.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: um teste de regressão por versão]
+Escreva `tests/test_regressao.py`: na primeira execução, ele salva as previsões do golden set junto com a `model_version` num arquivo JSON (a "foto"). Nas execuções seguintes, **se a versão for a mesma**, todas as previsões precisam ser idênticas às da foto. Se a versão mudou, o teste passa (o retreino é legítimo). Depois, prove que o teste funciona: altere um número da foto à mão e rode de novo.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+# tests/test_regressao.py — mesma versão do modelo, mesmas previsões
+import json
+from pathlib import Path
+
+from galaxies_tool.api import prever_criativo
+from galaxies_tool.modelo import carregar_modelo
+from galaxies_tool.schemas import PredictionRequest
+from tests.golden import carregar_golden
+
+FOTO = Path(__file__).parent / "foto_previsoes.json"
+
+
+def previsoes_atuais() -> dict[str, float]:
+    golden = carregar_golden()
+    cache = {g["pedido"]["creative"]: g["atributos"] for g in golden}
+    return {g["id"]: prever_criativo(PredictionRequest.model_validate(g["pedido"]),
+                                     extrator=cache.__getitem__).predicted_metric
+            for g in golden}
+
+
+def test_previsoes_so_mudam_com_a_versao():
+    atual = {"versao": carregar_modelo().versao, "previsoes": previsoes_atuais()}
+    if not FOTO.exists():  # primeira execução: tira a "foto"
+        FOTO.write_text(json.dumps(atual, indent=1))
+        return
+    foto = json.loads(FOTO.read_text())
+    if foto["versao"] == atual["versao"]:
+        mudaram = {k for k in foto["previsoes"] if foto["previsoes"][k] != atual["previsoes"][k]}
+        assert not mudaram, f"mesma versão do modelo, previsões diferentes: {sorted(mudaram)}"
+```
+
+Rodando três vezes (foto, conferência, e conferência depois de alterar um valor da foto):
+
+```text
+1 passed
+1 passed
+E   AssertionError: mesma versão do modelo, previsões diferentes: ['UC_novo_automotivo_00_017']
+1 failed
+```
+
+Esse teste pega exatamente a segunda história da abertura: a *feature* mudou, o modelo não, e as previsões mudaram sem mudança de versão.
+
+</details>
+
+---
+
+## Resumo
+
+- Organize os testes numa **pirâmide**: muitos testes sem LLM embaixo (**unidade**, **contrato**) e poucos com LLM em cima (**trajetória**, **fidelidade**).
+- A **invariante crítica**: grafo, função, MCP e ReAct devolvem o **mesmo número** que o LightGBM calcula por fora.
+- O **golden set "de-para"** usa canais **fora do treino**, posts maduros e fica **congelado**; é um alarme com limiares folgados.
+- **Trajetória** e **fidelidade** são medidas separadas; reporte as duas taxas.
+- **MLflow tracing** (`mlflow.langchain.autolog()`) registra cada nó, com entrada, saída e tempo, para inspeção.
+
+## Referências
+
+- MLflow. [Tracing](https://mlflow.org/docs/latest/genai/tracing/) e [integração com LangGraph](https://mlflow.org/docs/latest/genai/tracing/integrations/listing/langgraph).
+- LangGraph. [Testes de grafos](https://docs.langchain.com/oss/python/langgraph/test).
+- FastMCP. [Testando servidores](https://gofastmcp.com/servers/testing).
+- pytest. [Parametrização](https://docs.pytest.org/en/stable/how-to/parametrize.html) e o [plugin do AnyIO](https://anyio.readthedocs.io/en/stable/testing.html).
+- Módulo EDD: [avaliação de agentes e tool calling](/aulas/eval-driven-development/avaliacao-de-agentes-e-tool-calling), [golden datasets](/aulas/eval-driven-development/criacao-e-curadoria-de-golden-datasets) e [métricas determinísticas](/aulas/eval-driven-development/metricas-deterministicas-e-heuristicas).
+
+**Próxima aula:** [Demo e README que convencem](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/demo-e-readme): o roteiro de 7 minutos, o README pedido no briefing e o checklist de entrega.

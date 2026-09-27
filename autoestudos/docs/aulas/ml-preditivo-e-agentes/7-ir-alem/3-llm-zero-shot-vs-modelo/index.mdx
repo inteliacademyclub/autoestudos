@@ -1,0 +1,603 @@
+---
+sidebar_position: 3
+sidebar_label: 'LLM zero-shot vs. modelo treinado'
+title: 'LLM zero-shot vs. modelo treinado'
+description: 'Como montar um experimento justo entre um LLM sem treino e o seu modelo de gradient boosting: mesmos pares, mesma informação, vazamento pelo pré-treino, variância entre execuções e combinação.'
+tags: [ml-preditivo, ir-alem, avaliacao, llm]
+---
+
+# LLM Zero-Shot vs. Modelo Treinado: Como Montar um Duelo Justo
+
+<LessonMeta
+  tempo="50 min"
+  semana="4+"
+  etapa={['avaliacao', 'modelo']}
+  opcional
+  objetivos={[
+    'Desenhar um experimento que compare um LLM zero-shot e um modelo treinado nos mesmos pares, com a mesma informação de entrada',
+    'Converter as saídas das duas abordagens em P(A > B) e medi-las com acurácia par-a-par, Spearman, variância, custo e latência',
+    'Evitar o vazamento pelo pré-treino filtrando o teste pela data de corte do LLM',
+    'Corrigir o viés de posição do LLM e combinar as duas previsões com stacking sem tocar no teste',
+  ]}
+  prerequisitos={[
+    {label: 'Do LLM ao modelo preditivo', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/do-llm-ao-modelo-preditivo'},
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+    {label: 'Métricas de erro e de ordenação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao'},
+    {label: 'LLM-as-a-judge e G-Eval', to: '/aulas/eval-driven-development/llm-as-a-judge-e-g-eval'},
+  ]}
+/>
+
+Na primeira aula da trilha, a regra foi clara: o LLM orquestra e explica, e o número vem do modelo treinado. Aí alguém do seu grupo encontra um paper de 2025 em que um LLM, **sem nenhum treino**, acertou 82% das previsões de popularidade de 13.639 vídeos, contra 80% de uma rede neural supervisionada. A pergunta aparece na hora: "então para que treinar LightGBM? Pergunta pro Gemini e pronto."
+
+A resposta honesta é "depende, e dá para medir". Só que essa comparação é das mais fáceis de fazer errado: basta testar o LLM em vídeos que ele já viu no pré-treino, rodá-lo uma vez só ou dar a um dos lados uma informação que o outro não tem, e aparece um vencedor que não existe.
+
+Nesta aula você monta um *harness* (arcabouço de avaliação) que coloca as duas abordagens na mesma pergunta, nos mesmos pares e com a mesma régua, e que no fim testa se a **combinação** das duas supera cada uma sozinha.
+
+:::info[A ideia central]
+Um duelo só é justo quando as duas abordagens respondem à **mesma pergunta**, sobre os **mesmos casos**, com a **mesma informação de entrada**, medidas pela **mesma régua**, e quando nenhuma delas pode ter visto a resposta. Para o LLM, essa última condição tem nome: os casos de teste precisam ser **posteriores ao corte de conhecimento** do modelo.
+:::
+
+---
+
+## O que o paper mostrou (e o que ele não mostra)
+
+<PaperCard
+  titulo="Large Language Models Are Natural Video Popularity Predictors"
+  referencia="Kayal, Mettes, Dehmamy e Park. Findings of ACL, 2025"
+  link="https://aclanthology.org/2025.findings-acl.597/"
+  resumo="Converte os frames dos vídeos em texto com um VLM e entrega ao LLM o título, as descrições dos frames e as legendas. O LLM prevê a intensidade do engajamento (views) e o alcance geográfico (em quantos países o vídeo entrou em alta)."
+  numeros={['13.639 vídeos populares', 'LLM zero-shot: 82%', 'rede supervisionada: 80%', 'combinação: 85,5%']}
+  usar={[
+    'Um LLM que recebe o vídeo convertido em texto é um preditor legítimo, não um chute.',
+    'A combinação supera as duas partes: os dois tipos de modelo carregam informação complementar.',
+  ]}
+  criticar={[
+    'A base é de vídeos populares e a tarefa é de classificação, não pares de Shorts do mesmo canal. O número não se transfere para o seu projeto.',
+    'Ao replicar com outro LLM, confira se os vídeos de teste são posteriores ao corte de conhecimento dele.',
+  ]}
+/>
+
+O paper é um ótimo motivo para rodar o experimento, não um motivo para pulá-lo. A sua base, a sua tarefa, o seu LLM e o seu período são outros. E repare que o resultado mais forte do paper não é "o LLM venceu", e sim "a **combinação** venceu os dois". É exatamente isso que você vai testar no fim da aula.
+
+---
+
+## As quatro regras de um duelo justo
+
+<Sketch name="m7/duelo-justo" alt="Diagrama do experimento. No topo, a linha do tempo: treino do GBM até junho de 2025, validação de julho a dezembro de 2025 e teste de janeiro a junho de 2026, com uma linha vermelha tracejada marcando o corte de conhecimento do LLM entre treino e validação. Do teste saem pares A e B do mesmo canal, publicados depois do corte, que viram a mesma entrada (descrição textual mais metadados) para as duas abordagens: o LLM zero-shot, perguntado em duas ordens e k vezes, e o GBM treinado, que calcula Phi da diferença das previsões dividida por sigma raiz de dois. As duas produzem P(A maior que B), avaliada pela mesma régua: acurácia par-a-par, Spearman intra-canal, desvio entre execuções, custo e latência por par e intervalo de confiança por bootstrap de canais. Notas: vazamento pelo pré-treino se o Short saiu antes do corte; bônus de stacking treinado na validação." caption="O experimento inteiro: mesmos pares, mesma entrada, mesma régua, e teste depois do corte do LLM." />
+
+1. **Mesmo conjunto de teste temporal.** As duas abordagens são avaliadas nos mesmos pares, tirados da mesma janela futura (<Termo id="split-temporal">split temporal</Termo>). Comparar o 82% do paper com os 64% do seu modelo não diz nada.
+2. **Mesmo formato de pergunta.** A decisão da marca é "A ou B?", então as duas respondem $$P(A > B)$$ para pares de Shorts **do mesmo canal**. Pedir ao LLM um número absoluto de curtidas mede outra coisa: se ele adivinha o tamanho do canal. Pares intra-canal isolam o efeito do conteúdo, a mesma lógica do <Termo id="alvo-relativo">alvo relativo ao canal</Termo>.
+3. **Mesma informação de entrada.** O LLM recebe uma descrição textual do criativo mais os metadados (canal, duração, horário). O GBM recebe as colunas extraídas dessa mesma descrição pela rubrica do VLM. Se um lado tem o histórico do canal e o outro não, você está comparando informação, não métodos. Mas mesma informação não quer dizer mesmo uso: o LLM pode aproveitar nuances do texto livre que a rubrica descartou. Isso é legítimo, e é justamente o que o experimento deve revelar.
+4. **Mesma régua, incluindo as colunas que costumam sumir.** <Termo id="pairwise">Acurácia par-a-par</Termo> e <Termo id="spearman">Spearman</Termo>, mais três números que só existem do lado do LLM: o **desvio entre execuções**, o **custo** e a **latência** por par. E, para declarar um vencedor, um intervalo de confiança da diferença.
+
+---
+
+## Transformando cada abordagem em P(A > B)
+
+**Do lado do GBM.** O modelo prevê $$\hat{y}$$ em escala log, e você mede o erro típico $$\sigma$$ na validação. Se os erros forem aproximadamente normais e independentes, a diferença entre os dois valores reais tem desvio $$\sigma\sqrt{2}$$, e:
+
+$$
+P(A > B) \approx \Phi\left(\frac{\hat{y}_A - \hat{y}_B}{\sigma\sqrt{2}}\right)
+$$
+
+em que $$\Phi$$ é a distribuição acumulada da normal padrão. É uma aproximação: erros de Shorts do mesmo canal costumam ser correlacionados, o que encolhe o desvio da diferença. Para decidir A ou B, só importa o sinal de $$\hat{y}_A - \hat{y}_B$$; a probabilidade serve para o combinador e para comunicar confiança.
+
+**Do lado do LLM.** Você pede uma saída estruturada com a escolha e $$P(A > B)$$. Dois cuidados, os mesmos da aula de [LLM-as-a-judge](/aulas/eval-driven-development/llm-as-a-judge-e-g-eval):
+
+- **Viés de posição.** LLMs que julgam pares tendem a favorecer uma das posições, um viés documentado por Zheng et al. (2023). A correção barata é perguntar nas duas ordens e fazer a média: $$p = \tfrac{1}{2}\left(p_{AB} + 1 - p_{BA}\right)$$.
+- **Variância entre execuções.** O mesmo prompt pode render respostas diferentes. Rode $$k$$ vezes, reporte média e desvio, e use a média das $$k$$ probabilidades como previsão.
+
+**Do par ao ranking.** Para o Spearman, cada Short ganha uma nota: a média da sua probabilidade de vencer contra os colegas de canal (uma contagem de Borda). O Spearman é calculado dentro de cada canal, entre a nota e as curtidas reais, e depois tirada a média entre canais.
+
+---
+
+## Vazamento pelo pré-treino
+
+Um LLM treinado com dados da web até uma data de corte pode ter visto a página do vídeo com o contador de curtidas, uma matéria sobre "o Short que viralizou" ou os números do canal num agregador. Se o seu teste tem Shorts publicados antes desse corte, o LLM pode estar **lembrando** em vez de prever. É o problema de contaminação que a comunidade de NLP estuda em benchmarks (Sainz et al., 2023), e aqui ele é o equivalente do <Termo id="leakage">vazamento de dados</Termo>.
+
+Três regras práticas:
+
+- **Descubra o corte de conhecimento** do modelo exato que você vai usar (está no *model card*) e avalie só pares em que **os dois** Shorts saíram depois dele, com alguma folga.
+- **Desligue qualquer ferramenta de busca.** Se o LLM tiver *grounding* com busca na web habilitado, ele pode simplesmente consultar as curtidas do vídeo.
+- **Não mande URL nem ID do vídeo** no prompt. Título, legenda e descrição são conteúdo legítimo; o link é uma chave para a resposta.
+
+Um diagnóstico útil é comparar a acurácia do LLM antes e depois do corte. Uma queda grande, que o modelo treinado não sofre na mesma janela, é um alarme. Não é prova: o mundo também muda (<Termo id="drift">drift</Termo>), e por isso a regra é filtrar pela data, não "medir e descontar".
+
+---
+
+## Na prática (código)
+
+:::info[Ambiente]
+O código usa o ambiente do módulo, definido na aula [Pipeline agnóstico](/aulas/ml-preditivo-e-agentes/ir-alem/pipeline-agnostico). As etapas 1 a 6 rodam em sequência na mesma sessão (script ou notebook) e **não precisam de chave de API**: o "LLM" é uma função que imita um. Só a etapa 7, o ponto de troca para um LLM de verdade, precisa de `uv add "langchain[google-genai]"` (resolveu para `langchain-google-genai==4.4.0`) e de uma `GOOGLE_API_KEY`.
+:::
+
+**Etapa 1: uma base sintética com o que o LLM enxerga.** Os efeitos são os mesmos do simulador das aulas (gancho, rosto por setor, texto na tela, energia, duração, horário nobre), mais um efeito de **tema** que só aparece no texto livre da descrição. A rubrica do VLM vira colunas grossas (gancho fraco/comum/forte, música calma/neutra/animada), e o tema não vira coluna. Guarde esse detalhe.
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+ROSTO = {"beleza": 0.35, "moda": 0.15, "automotivo": 0.05}   # efeito de rosto por setor
+TEMA = {"trend do momento": 0.30, "sazonal": 0.0, "genérico": -0.10}  # só aparece no texto
+INICIO = pd.Timestamp("2024-01-01")
+
+def efeito_conteudo(p):
+    """Efeitos verdadeiros em escala log (os do simulador das aulas + o tema)."""
+    return (0.09 * (p["gancho"] - 5) + ROSTO[p["setor"]] * p["rosto"]
+            + 0.15 * p["texto_tela"] + 0.05 * (p["energia"] - 5)
+            - 0.05 * (p["duracao_s"] - 30) / 10 + 0.12 * (18 <= p["hora"] <= 22)
+            + TEMA[p["tema"]])
+
+linhas = []
+for c in range(36):
+    setor = list(ROSTO)[c % 3]
+    inscritos = int(np.exp(np.clip(rng.normal(11.3, 1.5), 7.5, 16)))
+    nivel = 0.85 * np.log(inscritos) - 4.2 + rng.normal(0, 0.55)
+    tendencia = np.cumsum(rng.normal(0, 0.09, 32))            # passeio aleatório mensal
+    for dia in np.sort(rng.integers(0, 900, rng.integers(35, 60))):
+        p = {"canal": f"c{c:02d}", "setor": setor, "inscritos": inscritos,
+             "publicado_em": INICIO + pd.Timedelta(days=int(dia)),
+             "hora": int(rng.integers(18, 23) if rng.random() < 0.4 else rng.integers(7, 24)),
+             "duracao_s": int(np.clip(rng.normal(38 if setor == "automotivo" else 28, 12), 8, 90)),
+             "gancho": int(np.clip(round(rng.normal(5, 2)), 0, 10)),
+             "rosto": bool(rng.random() < (0.35 if setor == "automotivo" else 0.7)),
+             "texto_tela": bool(rng.random() < 0.5),
+             "energia": int(np.clip(round(rng.normal(5, 2.2)), 0, 10)),
+             "tema": rng.choice(list(TEMA), p=[0.2, 0.3, 0.5])}
+        p["log_curtidas"] = nivel + tendencia[dia // 30] + efeito_conteudo(p) + rng.normal(0, 0.5)
+        linhas.append(p)
+
+df = pd.DataFrame(linhas).sort_values("publicado_em", ignore_index=True)
+df["id"] = [f"v{i:04d}" for i in range(len(df))]
+# a rubrica do VLM (módulo 4) vira colunas grossas; o texto livre do tema não vira coluna
+df["gancho_n"] = np.select([df.gancho >= 7, df.gancho <= 3], [2, 0], 1)
+df["musica_n"] = np.select([df.energia >= 6, df.energia <= 4], [2, 0], 1)
+df["mediana_prev"] = df.groupby("canal").log_curtidas.transform(
+    lambda s: s.shift(1).expanding().median())                 # só posts anteriores
+df = df[df.groupby("canal").cumcount() >= 5].copy()
+
+def descrever(p):
+    """O que o LLM recebe: descrição textual + metadados. Nada pós-publicação."""
+    gancho = ["abre com o logo da marca", "abertura comum", "gancho forte nos 2 primeiros s"]
+    musica = ["música calma", "música neutra", "música animada"]
+    return (f"ID {p.id} | canal {p.canal} ({p.setor}, {p.inscritos / 1e3:.0f} mil inscritos, mediana "
+            f"histórica {np.expm1(p.mediana_prev):.0f} curtidas) | {p.duracao_s} s, "
+            f"publicação às {p.hora}h | {gancho[p.gancho_n]}; "
+            f"{'rosto em cena' if p.rosto else 'sem rosto'}; "
+            f"{'texto grande na tela' if p.texto_tela else 'sem texto na tela'}; "
+            f"{musica[p.musica_n]} | tema: {p.tema}.")
+
+df["descricao"] = [descrever(p) for p in df.itertuples()]
+print(len(df), "Shorts de", df.publicado_em.min().date(), "a", df.publicado_em.max().date())
+print(df.descricao.iloc[-1])
+```
+
+```text
+1533 Shorts de 2024-02-04 a 2026-06-18
+ID v1712 | canal c16 (moda, 574 mil inscritos, mediana histórica 577 curtidas) | 31 s, publicação às 14h | gancho forte nos 2 primeiros s; rosto em cena; texto grande na tela; música calma | tema: genérico.
+```
+
+O `ID` está na descrição **de propósito**: é por ele que o LLM simulado da etapa 3 vai "reconhecer" vídeos que viu no pré-treino. No mundo real, o reconhecimento vem do título, do canal e do contexto, e a regra é não mandar ID nem URL.
+
+**Etapa 2: split temporal, GBM e pares intra-canal.** O treino vai até o corte do LLM, a validação cobre o segundo semestre de 2025 (serve para medir $$\sigma$$ e, depois, treinar o combinador) e o teste é o primeiro semestre de 2026.
+
+```python
+from itertools import combinations
+import lightgbm as lgb
+from scipy.stats import norm
+
+CUTOFF_LLM = pd.Timestamp("2025-06-30")   # corte de conhecimento do LLM (veja o model card)
+X_COLS = ["gancho_n", "musica_n", "rosto", "texto_tela", "duracao_s", "hora", "setor"]
+df["setor"] = df.setor.astype("category")
+df["y_rel"] = df.log_curtidas - df.mediana_prev            # alvo relativo ao canal
+
+treino = df[df.publicado_em <= CUTOFF_LLM]
+valid = df[(df.publicado_em > CUTOFF_LLM) & (df.publicado_em < "2026-01-01")]
+teste = df[df.publicado_em >= "2026-01-01"]
+
+gbm = lgb.LGBMRegressor(n_estimators=400, learning_rate=0.03, num_leaves=3,
+                        min_child_samples=50, verbose=-1, random_state=0)
+gbm.fit(treino[X_COLS], treino.y_rel)
+sigma = np.std(valid.y_rel - gbm.predict(valid[X_COLS]))  # erro típico, fora do treino
+
+def pares_intra_canal(parte):
+    """Todos os pares (A, B) do mesmo canal. Rótulo: 1 se A teve mais curtidas."""
+    linhas = []
+    for _, g in parte.groupby("canal"):
+        for a, b in combinations(g.index, 2):
+            linhas.append((a, b, int(g.at[a, "log_curtidas"] > g.at[b, "log_curtidas"])))
+    return pd.DataFrame(linhas, columns=["a", "b", "a_venceu"])
+
+def prob_gbm(pares, parte, seed=0):  # seed ignorada: o GBM é determinístico
+    """P(A > B) = Φ((ŷA − ŷB) / (σ√2)), com ŷ em log de curtidas."""
+    yhat = pd.Series(gbm.predict(parte[X_COLS]), index=parte.index) + parte.mediana_prev
+    dif = yhat[pares.a].to_numpy() - yhat[pares.b].to_numpy()
+    return norm.cdf(dif / (sigma * np.sqrt(2)))
+
+pares_valid, pares_teste = pares_intra_canal(valid), pares_intra_canal(teste)
+print(f"treino={len(treino)} valid={len(valid)} teste={len(teste)} Shorts | sigma={sigma:.2f}")
+print(f"pares intra-canal: valid={len(pares_valid)} teste={len(pares_teste)}")
+```
+
+```text
+treino=902 valid=337 teste=294 Shorts | sigma=0.60
+pares intra-canal: valid=1540 teste=1132
+```
+
+**Etapa 3: o LLM simulado.** Esta função finge ser um LLM que só lê texto. Ela tem defeitos escolhidos a dedo para o harness ter o que encontrar: supervaloriza música animada, ignora duração e horário, prefere a opção que aparece primeiro, varia entre chamadas e "lembra" o resultado de 60% dos Shorts publicados antes do corte. **Os números que ela produz não dizem nada sobre LLMs reais.** O que importa é o harness, que é o mesmo para o LLM de verdade.
+
+```python
+import re
+
+# O que o LLM "viu" no pré-treino: 60% dos Shorts publicados antes do corte.
+_mem = df[(df.publicado_em <= CUTOFF_LLM) & (np.random.default_rng(1).random(len(df)) < 0.6)]
+MEMORIA = dict(zip(_mem.id, _mem.log_curtidas))
+
+def llm_mock(desc_a: str, desc_b: str, seed: int) -> dict:
+    """Finge ser um LLM que só lê texto. Tem 'intuição' razoável sobre gancho,
+    texto e tema, supervaloriza música animada, ignora duração e horário,
+    tem viés de posição (prefere A), ruído entre chamadas e memória do pré-treino."""
+    rng = np.random.default_rng(seed)
+    id_a, id_b = (re.search(r"ID (\w+)", d).group(1) for d in (desc_a, desc_b))
+    if id_a in MEMORIA and id_b in MEMORIA:                      # "lembra" o resultado
+        return {"prob_a_melhor": 0.9 if MEMORIA[id_a] > MEMORIA[id_b] else 0.1}
+
+    def intuicao(d):
+        return (0.25 * ("gancho forte" in d) - 0.20 * ("logo da marca" in d)
+                + 0.15 * ("texto grande" in d) + 0.10 * ("rosto em cena" in d)
+                + 0.30 * ("música animada" in d) - 0.10 * ("música calma" in d)
+                + 0.30 * ("trend do momento" in d) - 0.10 * ("genérico" in d))
+
+    logit = 3 * (intuicao(desc_a) - intuicao(desc_b)) + 0.4 + rng.normal(0, 0.8)
+    return {"prob_a_melhor": float(1 / (1 + np.exp(-logit)))}
+
+def prob_llm(pares, parte, seed=0, trocar_ordem=True, llm=llm_mock):
+    """P(A > B) segundo o LLM. Com trocar_ordem, pergunta (A,B) e (B,A) e faz a média."""
+    desc = parte.descricao
+    out = []
+    for i, (a, b) in enumerate(zip(pares.a, pares.b)):
+        p = llm(desc[a], desc[b], seed=seed * 100_000 + 2 * i)["prob_a_melhor"]
+        if trocar_ordem:
+            p_inv = llm(desc[b], desc[a], seed=seed * 100_000 + 2 * i + 1)["prob_a_melhor"]
+            p = (p + 1 - p_inv) / 2
+        out.append(p)
+    return np.array(out)
+```
+
+**Etapa 4: o harness.** Uma função, `avaliar`, que recebe qualquer coisa que devolva $$P(A > B)$$, roda $$k$$ vezes nos mesmos pares e devolve a mesma linha de métricas para todo mundo.
+
+```python
+import time
+from scipy.stats import spearmanr
+
+def spearman_intra_canal(p, pares, parte):
+    """Nota de cada Short = média de P(vencer) contra os colegas de canal (Borda).
+    Devolve o Spearman médio, por canal, entre a nota e as curtidas reais."""
+    nota = pd.concat([pd.Series(p, index=pares.a),
+                      pd.Series(1 - p, index=pares.b)]).groupby(level=0).mean()
+    rhos = [spearmanr(nota[g.index], g.log_curtidas).statistic
+            for _, g in parte[parte.index.isin(nota.index)].groupby("canal") if len(g) >= 4]
+    return float(np.nanmean(rhos))
+
+def avaliar(nome, fn_prob, pares, parte, k=1, **kw):
+    """Roda fn_prob k vezes (sementes diferentes) nos MESMOS pares e agrega."""
+    accs, probs, t0 = [], [], time.perf_counter()
+    for s in range(k):
+        p = fn_prob(pares, parte, seed=s, **kw)
+        probs.append(p)
+        accs.append(np.mean((p > 0.5) == pares.a_venceu.to_numpy()))
+    ms = 1000 * (time.perf_counter() - t0) / (k * len(pares))
+    p_media = np.mean(probs, axis=0)
+    return {"abordagem": nome, "acc_par": np.mean(accs), "dp_runs": np.std(accs),
+            "spearman": spearman_intra_canal(p_media, pares, parte),
+            "prop_escolhe_A": np.mean(np.concatenate(probs) > 0.5), "ms_par": ms}, p_media
+
+res_gbm, p_gbm_teste = avaliar("GBM", prob_gbm, pares_teste, teste)
+res_llm1, _ = avaliar("LLM, 1 ordem", prob_llm, pares_teste, teste, k=5, trocar_ordem=False)
+res_llm2, p_llm_teste = avaliar("LLM, 2 ordens", prob_llm, pares_teste, teste, k=5)
+tabela = pd.DataFrame([res_gbm, res_llm1, res_llm2]).set_index("abordagem")
+print(tabela.round(3).to_string())
+print(f"fração real de pares em que A venceu: {pares_teste.a_venceu.mean():.3f}")
+```
+
+```text
+               acc_par  dp_runs  spearman  prop_escolhe_A  ms_par
+abordagem
+GBM              0.633    0.000     0.379           0.536   0.004
+LLM, 1 ordem     0.640    0.008     0.448           0.611   0.034
+LLM, 2 ordens    0.656    0.010     0.435           0.502   0.150
+fração real de pares em que A venceu: 0.531
+```
+
+Leia a tabela coluna por coluna:
+
+- **`prop_escolhe_A`** denuncia o viés de posição. Perguntando numa ordem só, o LLM escolhe A em 61% dos pares, quando A venceu em 53%. Com as duas ordens, a escolha volta a ~50% e a acurácia sobe de 0,640 para 0,656.
+- **`dp_runs`** é o desvio entre as 5 execuções: cerca de 1 ponto percentual, o suficiente para inverter um placar apertado. Com um LLM real, meça em vez de supor.
+- **`ms_par`** do GBM é real: microssegundos por par (o valor exato muda de máquina para máquina). O do LLM simulado não significa nada, porque é uma função local. Com a API, o mesmo cronômetro mede as duas chamadas por par, e a conta de custo é direta: 1.132 pares × 2 ordens × 5 execuções = 11.320 chamadas.
+
+**Etapa 5: o teste de contaminação.** Mesmo LLM, mesma pergunta, duas janelas: antes e depois do corte.
+
+```python
+# Mesmo LLM, mesma pergunta, duas janelas: antes e depois do corte de conhecimento.
+antes = df[(df.publicado_em > "2025-01-01") & (df.publicado_em <= CUTOFF_LLM)]
+for nome, parte in [("antes do corte (jan–jun/25)", antes), ("depois do corte (jul–dez/25)", valid)]:
+    pares = pares_intra_canal(parte)
+    p = prob_llm(pares, parte)
+    print(f"LLM {nome}: acc_par = {np.mean((p > 0.5) == pares.a_venceu.to_numpy()):.3f}"
+          f"  ({len(pares)} pares)")
+
+def filtrar_pos_corte(pares, parte, corte=CUTOFF_LLM):
+    """Mantém só pares em que os DOIS Shorts saíram depois do corte do LLM."""
+    ok = parte.publicado_em > corte
+    return pares[ok[pares.a].to_numpy() & ok[pares.b].to_numpy()].reset_index(drop=True)
+
+print("pares de teste após o filtro:", len(filtrar_pos_corte(pares_teste, teste)))
+```
+
+```text
+LLM antes do corte (jan–jun/25): acc_par = 0.744  (1548 pares)
+LLM depois do corte (jul–dez/25): acc_par = 0.629  (1540 pares)
+pares de teste após o filtro: 1132
+```
+
+Mais de 11 pontos de diferença entre dois semestres vizinhos: avaliado em 2025 inteiro, o LLM pareceria bem melhor do que é. Aqui o filtro não remove nenhum par de teste, porque o split já nasceu depois do corte, mas deixe a função no pipeline: ela protege você no dia em que trocar de modelo ou de janela.
+
+**Etapa 6: combinação e intervalo de confiança.** O combinador é uma regressão logística sobre os *logits* das duas probabilidades, a forma mais simples de *stacking*. Ele aprende os pesos na validação, que também é posterior ao corte, e é avaliado uma única vez no teste. Para saber se uma diferença é real, o <Termo id="bootstrap">bootstrap</Termo> reamostra **canais**, não pares: pares do mesmo canal compartilham Shorts e não são independentes.
+
+```python
+from sklearn.linear_model import LogisticRegression
+from scipy.special import logit
+
+def feats(p_gbm, p_llm):
+    eps = 1e-3
+    return np.column_stack([logit(np.clip(p_gbm, eps, 1 - eps)), logit(np.clip(p_llm, eps, 1 - eps))])
+
+# 1) o combinador aprende os pesos na VALIDAÇÃO (depois do corte, antes do teste)
+p_gbm_valid = prob_gbm(pares_valid, valid)
+p_llm_valid = np.mean([prob_llm(pares_valid, valid, seed=s) for s in range(5)], axis=0)
+stack = LogisticRegression().fit(feats(p_gbm_valid, p_llm_valid), pares_valid.a_venceu)
+print("pesos (gbm, llm):", stack.coef_.round(2), "intercepto:", stack.intercept_.round(2))
+
+# 2) e é avaliado uma única vez no teste
+p_stack_teste = stack.predict_proba(feats(p_gbm_teste, p_llm_teste))[:, 1]
+y = pares_teste.a_venceu.to_numpy()
+acertos = {"GBM": (p_gbm_teste > 0.5) == y, "LLM": (p_llm_teste > 0.5) == y,
+           "GBM + LLM": (p_stack_teste > 0.5) == y}
+for nome, a in acertos.items():
+    print(f"{nome:10s} acc_par = {a.mean():.3f}")
+
+# 3) a diferença é real? bootstrap por CANAL (pares do mesmo canal não são independentes)
+canal_do_par = teste.canal[pares_teste.a].to_numpy()
+canais = np.unique(canal_do_par)
+rng = np.random.default_rng(0)
+difs = {"LLM − GBM": [], "GBM+LLM − GBM": []}
+for _ in range(2000):
+    idx = np.concatenate([np.flatnonzero(canal_do_par == c)
+                          for c in rng.choice(canais, len(canais))])
+    difs["LLM − GBM"].append(acertos["LLM"][idx].mean() - acertos["GBM"][idx].mean())
+    difs["GBM+LLM − GBM"].append(acertos["GBM + LLM"][idx].mean() - acertos["GBM"][idx].mean())
+for nome, d in difs.items():
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    print(f"{nome:14s} IC95% = [{lo:+.3f}, {hi:+.3f}]")
+```
+
+```text
+pesos (gbm, llm): [[0.22 0.57]] intercepto: [-0.01]
+GBM        acc_par = 0.633
+LLM        acc_par = 0.663
+GBM + LLM  acc_par = 0.680
+LLM − GBM      IC95% = [-0.008, +0.069]
+GBM+LLM − GBM  IC95% = [+0.012, +0.083]
+```
+
+Três leituras. A média das 5 execuções do LLM (0,663) acerta mais do que uma execução típica (0,656): agregar execuções também reduz ruído. O LLM está numericamente à frente do GBM, mas o intervalo da diferença inclui o zero, então o relatório honesto é "empate técnico". E a combinação supera o GBM com intervalo inteiramente positivo, o mesmo padrão do paper.
+
+Por que o LLM simulado encosta no GBM? Porque ele lê o **tema** no texto livre, e o GBM não tem essa coluna. Quando o LLM vence, a pergunta produtiva é "**o que ele está usando que o meu modelo não usa?**", e o exercício no fim da aula responde isso. Com outras sementes, os números mudam, mas o padrão se repete.
+
+**Etapa 7: o ponto de troca para um LLM real.** A função abaixo tem a mesma assinatura do `llm_mock`, então basta passar `llm=llm_real` para o harness.
+
+```python
+# requer GOOGLE_API_KEY e: uv add "langchain[google-genai]"
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain.chat_models import init_chat_model
+from langchain_core.callbacks import UsageMetadataCallbackHandler
+
+class Comparacao(BaseModel):
+    """Resposta estruturada para um par de Shorts do mesmo canal."""
+    justificativa: str = Field(description="2 a 3 frases citando atributos do criativo")
+    mais_curtidas: Literal["A", "B"]
+    prob_a_melhor: float = Field(ge=0, le=1, description="P(A ter mais curtidas que B)")
+
+PROMPT = """Você avalia YouTube Shorts ANTES da publicação.
+Os dois vídeos abaixo são do mesmo canal. Qual terá mais curtidas em 30 dias?
+Use apenas as informações dadas.
+
+Vídeo A: {a}
+Vídeo B: {b}"""
+
+# o prefixo "google_genai:" importa: sem ele, o langchain 1.4 infere Vertex AI
+modelo = init_chat_model("google_genai:gemini-3.5-flash-lite")
+juiz = modelo.with_structured_output(Comparacao, include_raw=True)
+uso = UsageMetadataCallbackHandler()   # soma tokens de entrada e saída de todas as chamadas
+
+def llm_real(desc_a: str, desc_b: str, seed: int) -> dict:
+    """Mesma assinatura do llm_mock. A seed não é repassada: a API decide a amostragem."""
+    r = juiz.invoke(PROMPT.format(a=desc_a, b=desc_b), config={"callbacks": [uso]})
+    if r["parsing_error"] is not None:          # conte as falhas, não as esconda
+        return {"prob_a_melhor": 0.5, "falhou": True}
+    return {"prob_a_melhor": r["parsed"].prob_a_melhor}
+
+# comece pequeno: 50 pares × 2 ordens × k=3 = 300 chamadas
+descr_sem_id = teste.assign(descricao=teste.descricao.str.replace(r"^ID \w+ \| ", "", regex=True))
+amostra = filtrar_pos_corte(pares_teste, teste).sample(50, random_state=0)
+res, _ = avaliar("LLM real", prob_llm, amostra, descr_sem_id, k=3, llm=llm_real)
+print(res)
+print(uso.usage_metadata)   # tokens por modelo: multiplique pelo preço da página do provedor
+```
+
+Este trecho precisa de chave. Sem ela, foi validado com `langchain==1.4.2`, `langchain-core==1.6.5` e `langchain-google-genai==4.4.0`: o modelo, o `with_structured_output(..., include_raw=True)` e o `UsageMetadataCallbackHandler` são construídos, e a chamada chega à API e é recusada por chave inválida. Duas observações:
+
+- Sem o prefixo `google_genai:`, o `init_chat_model` infere `google_vertexai` para nomes que começam com `gemini` e emite um aviso de descontinuação.
+- No free tier da Gemini API, os dados enviados podem ser usados pelo Google e lidos por revisores humanos. Não mande criativos de clientes por esse caminho.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Os dois Shorts da Lumina ainda não foram publicados, então não há risco de o LLM "lembrar" deles. Descrevendo os dois com a mesma função e perguntando às duas abordagens (continuação do código acima):
+
+```python
+base = dict(canal="lumina", setor="beleza", inscritos=180_000, rosto=True,
+            mediana_prev=np.log1p(2300), tema="sazonal")
+lumina = pd.DataFrame([
+    dict(base, id="A", duracao_s=55, hora=14, gancho_n=0, texto_tela=False, musica_n=0),
+    dict(base, id="B", duracao_s=22, hora=19, gancho_n=2, texto_tela=True, musica_n=2),
+], index=["A", "B"])
+lumina["setor"] = pd.Categorical(lumina.setor, categories=df.setor.cat.categories)
+lumina["descricao"] = [descrever(p) for p in lumina.itertuples()]
+par = pd.DataFrame({"a": ["A"], "b": ["B"], "a_venceu": [0]})
+
+print("GBM  P(A > B):", prob_gbm(par, lumina).round(2)[0])
+print("LLM  P(A > B), 5 execuções:",
+      [round(float(prob_llm(par, lumina, seed=s)[0]), 2) for s in range(5)])
+p_ab = llm_mock(lumina.descricao["A"], lumina.descricao["B"], seed=0)["prob_a_melhor"]
+p_ba = llm_mock(lumina.descricao["B"], lumina.descricao["A"], seed=0)["prob_a_melhor"]
+print(f"LLM  perguntando (A, B): {p_ab:.2f} | perguntando (B, A), convertido: {1 - p_ba:.2f}")
+```
+
+```text
+GBM  P(A > B): 0.13
+LLM  P(A > B), 5 execuções: [0.05, 0.09, 0.04, 0.04, 0.08]
+LLM  perguntando (A, B): 0.08 | perguntando (B, A), convertido: 0.03
+```
+
+- **Os dois escolhem B.** O GBM dá cerca de 87% de chance de B render mais: forte, mas longe de certeza, coerente com os intervalos sobrepostos do módulo 5.
+- **O LLM parece mais seguro (91% a 96%), e essa segurança não foi medida.** Nada no experimento mostrou que as probabilidades dele são calibradas. Por isso, no combinador, ele entra com um peso aprendido, não com a probabilidade crua.
+- **A resposta muda com a ordem e com a execução.** Numa decisão tão desequilibrada quanto A vs. B, isso não inverte a escolha. Em pares apertados, inverte.
+- **No agente, o número continua vindo da tool de predição.** A opinião do LLM pode entrar de dois jeitos honestos: como feature de um combinador validado como na etapa 6, ou como "segunda opinião" rotulada como tal na resposta, nunca no lugar do $$P(B > A)$$ do modelo.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas do duelo LLM vs. modelo]
+1. **Comparar o seu modelo com o número de um paper.** Outra base, outra tarefa, outro período. Só vale o placar no seu teste.
+2. **Rodar o LLM uma vez** e reportar o resultado como se fosse determinístico. Rode $$k$$ vezes e mostre o desvio.
+3. **Testar em Shorts antigos e famosos**, ou com busca na web habilitada. O LLM pode estar lembrando, não prevendo.
+4. **Perguntar numa ordem só.** O viés de posição infla ou derruba a acurácia dependendo de como os pares foram montados.
+5. **Dar informação diferente a cada lado sem declarar**, por exemplo o GBM com histórico do canal e o LLM só com a legenda.
+6. **Ajustar o prompt ou o combinador olhando o teste.** Tudo que é escolhido vem da validação.
+7. **Declarar vencedor sem intervalo de confiança**, ou com bootstrap de pares em vez de canais.
+8. **Ler a probabilidade do LLM como calibrada.** É um número que o modelo escreveu, não uma frequência medida.
+:::
+
+<Quiz
+  id="m7-a3"
+  perguntas={[
+    {
+      pergunta: 'O LLM acerta 78% dos pares de 2024 e 63% dos pares de 2026. O seu GBM fica em 64% nas duas janelas. Qual é a explicação mais provável?',
+      opcoes: [
+        {texto: 'O mundo mudou (drift) e o LLM precisa ser retreinado.', explicacao: 'Se fosse drift do mundo, o GBM também sofreria na mesma janela. A queda é só do LLM.'},
+        {texto: 'Contaminação: o LLM provavelmente viu parte dos vídeos de 2024 no pré-treino. Avalie só pares posteriores ao corte dele.', correta: true, explicacao: 'Exato. Uma queda que só o LLM sofre, justamente ao cruzar o corte de conhecimento, é o sinal clássico de vazamento pelo pré-treino.'},
+        {texto: 'Os pares de 2024 eram mais fáceis.', explicacao: 'Se fossem, o GBM também iria melhor em 2024. O controle estável aponta para algo específico do LLM.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o harness pergunta ao LLM (A, B) e também (B, A)?',
+      opcoes: [
+        {texto: 'Para dobrar o tamanho do conjunto de teste.', explicacao: 'É o mesmo par nas duas ordens. As duas respostas não são observações independentes.'},
+        {texto: 'Para cancelar o viés de posição, fazendo a média de p(A,B) com 1 − p(B,A).', correta: true, explicacao: 'Correto. Se o LLM favorece a primeira opção, esse favorecimento aparece com sinal trocado nas duas ordens e se anula na média.'},
+        {texto: 'Porque a API exige as duas ordens para saída estruturada.', explicacao: 'Não existe essa exigência. A troca de ordem é uma decisão de desenho do experimento.'},
+      ],
+    },
+    {
+      pergunta: 'Quais escolhas tornam a comparação **injusta**? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'O GBM usa a mediana histórica do canal; o LLM recebe só a legenda.', correta: true, explicacao: 'Informação diferente sem declarar: você mede a informação, não o método.'},
+        {texto: 'Os dois são avaliados nos mesmos pares de jan–jun/26.', explicacao: 'Isso é o que torna a comparação justa: mesmos casos, mesma janela.'},
+        {texto: 'O LLM roda uma vez só, com temperatura maior que zero.', correta: true, explicacao: 'Uma execução isolada pode cair alguns pontos para qualquer lado. Sem k execuções, o placar é sorte.'},
+        {texto: 'O combinador é treinado nos pares de teste.', correta: true, explicacao: 'Vazamento clássico: o teste deixou de ser futuro. O combinador aprende na validação.'},
+        {texto: 'Os pares são filtrados para depois do corte de conhecimento do LLM.', explicacao: 'Essa é a proteção contra contaminação. Ela deixa a comparação mais justa, não menos.'},
+      ],
+    },
+    {
+      pergunta: 'O LLM ficou 3 pontos acima do GBM, com IC95% por bootstrap de canais de −0,8 a +6,9 pontos. O que você reporta?',
+      opcoes: [
+        {texto: '"O LLM é melhor que o modelo treinado."', explicacao: 'O intervalo inclui o zero. Os dados não sustentam a afirmação.'},
+        {texto: '"Empate técnico com vantagem numérica do LLM. Vamos investigar o que ele usa e testar a combinação."', correta: true, explicacao: 'É o relatório honesto, e a investigação costuma revelar uma feature que o modelo não tinha.'},
+        {texto: '"O GBM é melhor porque é determinístico."', explicacao: 'Determinismo é uma vantagem operacional, não de acurácia. O placar é empate.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: dê ao modelo o que o LLM estava usando]
+1. O tema do vídeo está na descrição, mas não virou coluna. Crie `tema_n` (genérico = 0, sazonal = 1, trend do momento = 2), acrescente em `X_COLS`, retreine o GBM e rode o harness e o combinador de novo. O LLM ainda fica à frente? A combinação ainda ajuda?
+2. Na sua base real: sorteie 50 pares intra-canal posteriores ao corte do LLM que você usa, rode a etapa 7 com as duas ordens e $$k = 3$$, e preencha a tabela `acc_par`, `dp_runs`, `spearman`, `ms_par` e tokens totais para GBM, LLM e combinação.
+:::
+
+<details>
+<summary>Ver a solução do item 1</summary>
+
+Continuando a sessão depois da etapa 6:
+
+```python
+# Solução do exercício: dar ao GBM a informação que só o LLM usava
+df["tema_n"] = df.tema.map({"genérico": 0, "sazonal": 1, "trend do momento": 2})
+X_COLS = X_COLS + ["tema_n"]
+treino, valid, teste = df.loc[treino.index], df.loc[valid.index], df.loc[teste.index]
+gbm.fit(treino[X_COLS], treino.y_rel)
+sigma = np.std(valid.y_rel - gbm.predict(valid[X_COLS]))
+res_gbm2, p_gbm2 = avaliar("GBM + tema", prob_gbm, pares_teste, teste)
+print(pd.DataFrame([res_gbm, res_gbm2, res_llm2]).set_index("abordagem").round(3).to_string())
+stack2 = LogisticRegression().fit(feats(prob_gbm(pares_valid, valid), p_llm_valid), pares_valid.a_venceu)
+p_s2 = stack2.predict_proba(feats(p_gbm2, p_llm_teste))[:, 1]
+print("pesos:", stack2.coef_.round(2), "| GBM+tema + LLM acc_par =", round(np.mean((p_s2 > 0.5) == y), 3))
+```
+
+```text
+               acc_par  dp_runs  spearman  prop_escolhe_A  ms_par
+abordagem
+GBM              0.633     0.00     0.379           0.536   0.005
+GBM + tema       0.665     0.00     0.447           0.548   0.003
+LLM, 2 ordens    0.656     0.01     0.435           0.502   0.043
+pesos: [[0.61 0.35]] | GBM+tema + LLM acc_par = 0.678
+```
+
+Com a coluna de tema, o GBM alcança o LLM (0,665 contra 0,656) e o combinador passa a dar mais peso ao GBM. A vantagem do LLM era **informação**, não mágica. A combinação ainda ganha um pouco porque os erros das duas abordagens não são idênticos; confira o intervalo antes de comemorar. No projeto real, quando o LLM acertar pares que o modelo erra, leia as justificativas dele e procure a feature que falta na rubrica.
+
+Para o item 2, tire o ID da descrição (como na etapa 7) e use os tokens do `usage_metadata` para extrapolar o custo.
+
+</details>
+
+---
+
+## Resumo
+
+- Um duelo justo exige **mesmos pares, mesmo formato ($$P(A > B)$$ intra-canal), mesma informação de entrada e mesma régua**, incluindo desvio entre execuções, custo e latência.
+- O LLM tem uma regra extra: **vazamento pelo pré-treino**. Avalie só Shorts publicados depois do corte de conhecimento, sem busca na web e sem ID ou URL no prompt.
+- **Viés de posição** se corrige perguntando nas duas ordens; **variância** se mede rodando $$k$$ vezes.
+- Declare vencedor só com **intervalo de confiança por bootstrap de canais**. "Empate técnico" é um resultado legítimo.
+- **Stacking** com a probabilidade do LLM como feature, treinado na validação, é a forma honesta de aproveitar o LLM. Quando ele vence, procure a informação que o seu modelo ainda não usa.
+
+## Referências
+
+- Kayal, Mettes, Dehmamy e Park. [*Large Language Models Are Natural Video Popularity Predictors*](https://aclanthology.org/2025.findings-acl.597/). Findings of ACL, 2025.
+- Zheng et al. [*Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena*](https://arxiv.org/abs/2306.05685). arXiv, 2023. Vieses de posição, verbosidade e autopromoção em LLMs juízes.
+- Sainz et al. [*NLP Evaluation in trouble: On the Need to Measure LLM Data Contamination for each Benchmark*](https://arxiv.org/abs/2310.18018). arXiv, 2023.
+- Wolpert. [*Stacked generalization*](https://doi.org/10.1016/S0893-6080(05)80023-1). Neural Networks, 1992. E a [seção de stacking do guia do scikit-learn](https://scikit-learn.org/stable/modules/ensemble.html#stacked-generalization).
+- LangChain. [Models: `init_chat_model`, saída estruturada e uso de tokens](https://docs.langchain.com/oss/python/langchain/models) e [Structured output](https://docs.langchain.com/oss/python/langchain/structured-output).
+- Na trilha: [Métricas de erro e de ordenação](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao), [Análise de erros e ablação](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao) e [LLM-as-a-judge e G-Eval](/aulas/eval-driven-development/llm-as-a-judge-e-g-eval).
+
+**Próxima aula:** [Embeddings de vídeo e áudio](/aulas/ml-preditivo-e-agentes/ir-alem/embeddings-de-video-e-audio): como capturar movimento e som com X-CLIP, VideoMAE e CLAP, e quando isso vale o custo.

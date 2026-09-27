@@ -1,0 +1,570 @@
+---
+sidebar_position: 5
+sidebar_label: 'MCP do zero'
+title: 'MCP do zero'
+description: 'Host, cliente e servidor; tools, resources e prompts; stdio e Streamable HTTP. Um servidor FastMCP 3.4.7 para a tool de previsão, testado em memória, no Inspector, no Claude e consumido por um agente LangGraph.'
+tags: [ml-preditivo, galaxies, mcp, fastmcp]
+---
+
+import McpFlow from '@site/src/components/interativos/McpFlow';
+
+# MCP do Zero: Expondo a Tool de Previsão Para a Persona
+
+<LessonMeta
+  tempo="60 min"
+  semana={4}
+  etapa="mcp"
+  objetivos={[
+    'Explicar os papéis de host, cliente e servidor, e as primitivas tools, resources e prompts',
+    'Escolher entre stdio e Streamable HTTP e entender o que mudou na spec 2026-07-28',
+    'Construir o servidor com FastMCP 3.4.7 e testá-lo em memória com pytest',
+    'Conectar o servidor ao MCP Inspector, ao Claude e a um agente LangGraph com langchain-mcp-adapters',
+    'Fixar versões compatíveis e evitar a pegadinha FastMCP 4 / mcp 2',
+  ]}
+  prerequisitos={[
+    {label: 'As cinco tools do agente', to: '/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/as-cinco-tools'},
+    {label: 'Function calling', to: '/aulas/conceitos-basicos-de-llm/function-calling'},
+  ]}
+/>
+
+Até aqui, a sua tool funciona dentro do seu processo Python. A persona sintética da Galaxies não vive nele. Ela é uma aplicação de outro time, com o próprio LLM, as próprias regras e um cliente <Termo id="mcp">MCP</Termo> que vai se conectar ao seu servidor, perguntar o que ele oferece e chamar a previsão quando achar necessário.
+
+Isso inverte a posição de quem escreve a tool. Você não controla o prompt da persona, não sabe qual modelo ela usa e não vê a conversa. O que você controla é o que o servidor **anuncia** (nomes, descrições, *schemas*, instruções) e o que ele **devolve** (dados tipados, erros legíveis). Tudo o que as aulas anteriores construíram (contrato, função pura, erros que dizem o que fazer) é o que torna esse servidor usável por um LLM que você nunca vai conhecer.
+
+:::info[A ideia central]
+Um **servidor MCP** anuncia **tools**, **resources** e **prompts** num formato padrão (JSON-RPC 2.0), e qualquer **host** com LLM consegue usá-los através de um **cliente**. O servidor da trilha é um adaptador fino: cada tool chama `api.prever_criativo` ou `api.comparar_criativos`, o *schema* vem do contrato Pydantic e a saída estruturada é o próprio `PredictionResponse`. **Não coloque um LLM no servidor**: o LLM já está do lado do cliente.
+:::
+
+---
+
+## Host, cliente e servidor
+
+O vocabulário do MCP separa três papéis:
+
+- **Host**: a aplicação com o LLM. A persona da Galaxies, o Claude Desktop, o Claude Code ou o seu agente LangGraph.
+- **Cliente**: o componente, dentro do host, que mantém a conexão com **um** servidor. Um host conectado a três servidores tem três clientes.
+- **Servidor**: o programa que expõe capacidades. O seu é o `galaxies-preditor`.
+
+O servidor oferece três primitivas, com donos diferentes:
+
+| Primitiva | Quem decide usar | No projeto |
+| :--- | :--- | :--- |
+| **Tools** | O LLM do host (*model-controlled*) | `prever_criativo`, `comparar_criativos` |
+| **Resources** | A aplicação do host, para dar contexto (*application-controlled*) | `model://card` (versão, métricas, limites) e os *schemas* |
+| **Prompts** | O usuário, como modelos prontos (*user-controlled*) | `decidir_entre_criativos` |
+
+<Sketch name="m6/mcp-arquitetura" alt="À esquerda, o host (persona da Galaxies, Claude Desktop, Claude Code ou um agente LangGraph) com o LLM, que decide chamar a tool, e o cliente MCP. À direita, o servidor galaxies-preditor em FastMCP 3.4.7, com tools (prever_criativo, comparar_criativos), resources (model://card, schema://prediction-request), prompts (decidir_entre_criativos) e a função api.prever_criativo. Entre os dois, as mensagens: 1 initialize (era legada), 2 tools/list com nomes e JSON Schema, 3 tools/call prever_criativo com o pedido, 4 resultado PredictionResponse. Embaixo, os transportes: stdio, em que o host inicia o servidor como subprocesso, e Streamable HTTP, com o servidor já rodando em /mcp. Nota: o stack da trilha fala a era legada (initialize, protocolo até 2025-11-25); a spec vigente 2026-07-28 é stateless, sem initialize, com versão no _meta de cada requisição e server/discover; cliente moderno só fala com servidor legado se tiver fallback; FastMCP 4 e mcp 2 quebram o adapter." caption="Quem é quem no MCP, e as mensagens que o nosso stack troca." />
+
+Por baixo, tudo é **JSON-RPC 2.0**: requisições com `method` e `params`, respostas com `result` ou `error`. O componente abaixo reproduz a sequência que o nosso servidor troca com um cliente (dados simulados).
+
+<McpFlow />
+
+---
+
+## stdio ou Streamable HTTP
+
+São dois transportes para as mesmas mensagens:
+
+| | stdio | Streamable HTTP |
+| :--- | :--- | :--- |
+| Como conecta | O host **inicia** o servidor como subprocesso e conversa pela entrada e saída padrão | O servidor já está no ar; o cliente faz POST num endpoint (`/mcp` no FastMCP) |
+| Quando usar | Local: Claude Desktop, Claude Code, testes, demo | Remoto: vários clientes, servidor compartilhado |
+| Cuidado principal | **Nada pode ir para o stdout** além do JSON-RPC | Autenticação e exposição na rede |
+
+Para a entrega, pergunte à Galaxies como a persona vai se conectar. Se for stdio, ela precisa conseguir rodar o seu servidor na máquina dela (o README vira crítico). Se for HTTP, você precisa hospedar o servidor.
+
+---
+
+## A spec 2026-07-28 e a "era" do seu servidor
+
+A revisão vigente da especificação é a **2026-07-28**, e ela mudou algo fundamental: o MCP ficou **stateless**. O *handshake* `initialize` saiu; cada requisição carrega a versão do protocolo e as capacidades do cliente no campo `_meta`; os servidores **devem** implementar um método novo, `server/discover`; e as sessões do Streamable HTTP (o cabeçalho `Mcp-Session-Id`) foram removidas. A spec chama as versões com `initialize` (2025-11-25 e anteriores) de **era legada**, as novas de **era moderna**, e define implementações de **duas eras** (*dual-era*).
+
+O stack desta trilha (`mcp==1.30.0` e `fastmcp==3.4.7`) fala a **era legada**: o servidor abaixo, testado no MCP Inspector, responde ao `initialize` com `protocolVersion: 2025-11-25`. Pela matriz de compatibilidade da spec, um cliente **moderno** só consegue falar com um servidor legado se implementar o *fallback* previsto (no stdio, sondar com `server/discover` e cair para o `initialize`). Clientes legados e clientes de duas eras funcionam.
+
+Duas consequências práticas:
+
+1. **Pergunte à Galaxies qual era o cliente da persona fala.** Se for legado ou de duas eras, o seu servidor funciona como está.
+2. **Não "atualize para a spec nova" trocando os pacotes.** É aí que entra a pegadinha de versões.
+
+:::danger[A pegadinha de versões: FastMCP 4 e mcp 2]
+Existem o **FastMCP 4.x** (lançado em ago/2026) e o **SDK oficial `mcp` 2.x**, em que a classe `FastMCP` foi renomeada para `MCPServer`, sem alias. Os dois são incompatíveis com o **`langchain-mcp-adapters` 0.3.2**, que declara `mcp<2.0.0,>=1.24.0` nas dependências (e o `fastmcp` 3.4.7 também exige `mcp<2.0`). Instalar qualquer um dos dois quebra o lado LangGraph do projeto.
+
+O próprio FastMCP 3.4.7, ao iniciar, imprime um aviso tentador: `Update available: 4.0.10. Run: pip install --upgrade fastmcp` (saída real no nosso ambiente). **Não siga.** Fixe as versões no `pyproject.toml` (`fastmcp==3.4.7`, `mcp==1.30.0`, `langchain-mcp-adapters==0.3.2`), como no bloco de ambiente da [aula 6.1](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/o-llm-orquestra-o-modelo-preve).
+:::
+
+---
+
+## O servidor
+
+O servidor tem duas partes: as tools e os resources, mais o ponto de entrada.
+
+```python
+# galaxies_tool/servidor_mcp.py — parte 1: o servidor e as tools
+import sys
+from typing import Annotated
+
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from langchain_core.tools import ToolException
+from pydantic import Field
+
+from galaxies_tool import api
+from galaxies_tool.modelo import carregar_modelo
+from galaxies_tool.schemas import PredictionRequest, PredictionResponse
+
+mcp = FastMCP(
+    "galaxies-preditor",
+    version="0.1.0",
+    instructions=("Prevê curtidas de YouTube Shorts (moda, beleza, automotivo) ANTES da "
+                  "publicação. O número vem de um modelo treinado: repasse-o sem alterar, "
+                  "sempre com o intervalo de 80% e a confiança. Limites em model://card."),
+)
+SOMENTE_LEITURA = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}
+
+
+@mcp.tool(annotations=SOMENTE_LEITURA, timeout=120)
+def prever_criativo(pedido: PredictionRequest) -> PredictionResponse:
+    """Prevê as curtidas de UM Short antes da publicação: mediana, intervalo de 80%,
+    confiança, fatores (SHAP), comparáveis e a versão do modelo."""
+    try:
+        return api.prever_criativo(pedido)
+    except ToolException as e:  # erro "de negócio": mensagem clara para o LLM do cliente
+        raise ToolError(str(e)) from e
+
+
+@mcp.tool(annotations=SOMENTE_LEITURA, timeout=300)
+def comparar_criativos(
+    criativos: Annotated[dict[str, PredictionRequest],
+                         Field(min_length=2, max_length=10, description="Nome curto -> pedido.")],
+) -> dict:
+    """Compara 2 a 10 criativos: ranking, intervalos e P(A supera B) para cada par."""
+    try:
+        return api.comparar_criativos(criativos)
+    except ToolException as e:
+        raise ToolError(str(e)) from e
+```
+
+O que cada detalhe faz:
+
+- **`instructions`** vai para o host no início da conexão. É o lugar para dizer ao LLM da persona que o número vem de um modelo e não deve ser alterado.
+- **O parâmetro `pedido: PredictionRequest`** vira o `inputSchema` da tool. A descrição de cada campo, os `Literal` e o exemplo de data com fuso chegam ao LLM do outro lado.
+- **O retorno `-> PredictionResponse`** faz o FastMCP publicar um `outputSchema` e devolver o resultado também como `structuredContent`, que é JSON tipado, além do texto. Um host que valida saídas consegue conferir o contrato sem parsear texto.
+- **`annotations`** informam ao host que a tool só lê, é idempotente e não acessa o mundo externo (`readOnlyHint`, `idempotentHint`, `openWorldHint`). São dicas para o host decidir, por exemplo, se pede confirmação ao usuário.
+- **`timeout`** limita o tempo de cada chamada no servidor.
+- **`ToolError`** transforma um erro de negócio (canal fora da base) numa resposta `isError` com a mensagem legível. Erros de validação do Pydantic viram erro de tool automaticamente.
+
+```python
+# galaxies_tool/servidor_mcp.py — parte 2: resources (model card e esquemas) e execução
+@mcp.resource("model://card", mime_type="application/json")
+def model_card() -> dict:
+    """Versão, features, métricas do teste temporal e limites do modelo."""
+    b = carregar_modelo()
+    return {"versao": b.versao, "alvo": "log(curtidas+1) relativo à mediana recente do canal",
+            "features": b.features, "metricas_teste_temporal": b.metricas,
+            "intervalo": "80%, regressão quantílica + ajuste conformal (CQR)",
+            "limites": ["base SINTÉTICA de demonstração", "Shorts de moda, beleza e automotivo",
+                        "prevê curtidas, não views", "não conhece tendências após o treino"]}
+
+
+@mcp.resource("schema://prediction-request", mime_type="application/json")
+def esquema_entrada() -> dict:
+    return PredictionRequest.model_json_schema()
+
+
+@mcp.resource("schema://prediction-response", mime_type="application/json")
+def esquema_saida() -> dict:
+    return PredictionResponse.model_json_schema()
+
+
+@mcp.prompt
+def decidir_entre_criativos(marca: str) -> str:
+    """Roteiro para o LLM do cliente comparar criativos de uma marca."""
+    return (f"Você assessora a marca {marca}. Chame comparar_criativos com os criativos "
+            "enviados, apresente o ranking com intervalos e P(A supera B) e diga, em uma "
+            "frase, o que mais pesou. Não altere nenhum número.")
+
+
+if __name__ == "__main__":
+    api.aquecer()  # modelo, índice e SHAP na memória antes da 1ª chamada
+    if "--http" in sys.argv:
+        mcp.run(transport="http", host="127.0.0.1", port=8000)  # Streamable HTTP em /mcp
+    else:
+        mcp.run(show_banner=False)  # stdio: NUNCA dê print() (stdout é o canal JSON-RPC)
+```
+
+O *resource* `model://card` responde à pergunta que todo consumidor sério faz antes de confiar num número: **qual modelo é esse, medido como, e onde ele não funciona**. O `api.aquecer()` carrega modelo, índice e SHAP antes da primeira chamada. E o comentário do `mcp.run` não é enfeite: num servidor stdio, **qualquer `print()` no stdout corrompe o protocolo**. Logs vão para o stderr (o `logging` do Python já faz isso por padrão), e o banner do FastMCP fica desligado com `show_banner=False`.
+
+Para rodar:
+
+```bash
+python -m galaxies_tool.servidor_mcp          # stdio (quem inicia é o host)
+python -m galaxies_tool.servidor_mcp --http   # Streamable HTTP em http://127.0.0.1:8000/mcp
+```
+
+---
+
+## Testar em memória, sem processo e sem rede
+
+O `fastmcp.Client` aceita o próprio objeto `FastMCP` como transporte. O cliente e o servidor rodam no mesmo processo, mas conversam pelo protocolo MCP de verdade: `initialize`, `tools/list`, `tools/call`.
+
+```python
+# rodar_mcp_memoria.py — o servidor visto por um cliente MCP, sem processo e sem rede
+import asyncio
+import json
+
+from fastmcp import Client
+
+from galaxies_tool.servidor_mcp import mcp
+
+B = {"creative": "lumina_b.mp4", "caption": "1 produto, 20 segundos #antesedepois #maquiagem",
+     "planned_datetime": "2026-10-01T19:00:00-03:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}
+
+
+async def main():
+    async with Client(mcp) as cliente:  # transporte em memória
+        for t in await cliente.list_tools():
+            print("tool:", t.name, "| args:", list(t.inputSchema["properties"]),
+                  "| outputSchema:", t.outputSchema is not None,
+                  "| readOnly:", t.annotations.readOnlyHint)
+        print("resources:", [str(r.uri) for r in await cliente.list_resources()])
+        print("prompts:", [p.name for p in await cliente.list_prompts()])
+        r = await cliente.call_tool("prever_criativo", {"pedido": B})
+        sc = r.structured_content
+        print("previsão:", sc["predicted_metric"], sc["interval_low"], sc["interval_high"],
+              sc["confidence_flag"], sc["model_version"])
+        card = json.loads((await cliente.read_resource("model://card"))[0].text)
+        print("model card:", card["versao"], {k: round(v, 3) for k, v in
+                                               card["metricas_teste_temporal"].items()})
+        ruim = B | {"planned_datetime": "2026-10-01T19:00:00"}
+        erro = await cliente.call_tool("prever_criativo", {"pedido": ruim}, raise_on_error=False)
+        print("erro:", erro.is_error, erro.content[0].text.splitlines()[1:3])
+
+
+asyncio.run(main())
+```
+
+```text
+tool: prever_criativo | args: ['pedido'] | outputSchema: True | readOnly: True
+tool: comparar_criativos | args: ['criativos'] | outputSchema: True | readOnly: True
+resources: ['model://card', 'schema://prediction-request', 'schema://prediction-response']
+prompts: ['decidir_entre_criativos']
+previsão: 4237.0 1655.0 9180.0 {'baixa_confianca': False, 'motivos': []} gbm-quantil-20260927-f9e6dda
+model card: gbm-quantil-20260927-f9e6dda {'n_teste': 793.0, 'spearman': 0.91, 'spearman_baseline': 0.884, 'par_a_par_intra_canal': 0.672, 'cobertura_80': 0.83}
+erro: True ['pedido.planned_datetime', "  Input should have timezone info [type=timezone_aware, input_value='2026-10-01T19:00:00', input_type=str]"]
+```
+
+O mesmo vira teste automatizado. O `pytest` não precisa do `pytest-asyncio`: o plugin do `anyio`, que já vem instalado como dependência do stack, roda testes marcados com `@pytest.mark.anyio`, e a *fixture* `anyio_backend` no `conftest.py` fixa o backend `asyncio`.
+
+```python
+# tests/test_mcp.py — o servidor MCP, testado em memória (sem processo, sem rede)
+import pytest
+from fastmcp import Client
+
+from galaxies_tool.api import prever_criativo
+from galaxies_tool.schemas import PredictionResponse
+from galaxies_tool.servidor_mcp import mcp
+
+
+@pytest.mark.anyio
+async def test_servidor_publica_tools_e_resources():
+    async with Client(mcp) as cliente:
+        assert {t.name for t in await cliente.list_tools()} == {"prever_criativo",
+                                                                 "comparar_criativos"}
+        uris = {str(r.uri) for r in await cliente.list_resources()}
+        assert {"model://card", "schema://prediction-request"} <= uris
+
+
+@pytest.mark.anyio
+async def test_mcp_devolve_o_mesmo_que_a_funcao(pedido_b):
+    async with Client(mcp) as cliente:
+        r = await cliente.call_tool("prever_criativo", {"pedido": pedido_b.model_dump(mode="json")})
+    resposta = PredictionResponse.model_validate(r.structured_content)
+    assert resposta == prever_criativo(pedido_b)
+
+
+@pytest.mark.anyio
+async def test_pedido_sem_fuso_vira_erro_legivel(pedido_b):
+    pedido = pedido_b.model_dump(mode="json") | {"planned_datetime": "2026-10-01T19:00:00"}
+    async with Client(mcp) as cliente:
+        r = await cliente.call_tool("prever_criativo", {"pedido": pedido}, raise_on_error=False)
+    assert r.is_error and "timezone" in r.content[0].text
+```
+
+```text
+tests/test_mcp.py ...                                                    [100%]
+3 passed
+```
+
+O segundo teste merece destaque: ele compara a resposta que passou pelo protocolo com a da função pura. Se alguém colocar lógica no adaptador, esse teste quebra.
+
+---
+
+## MCP Inspector
+
+O **MCP Inspector** é o cliente oficial de depuração. A versão atual (v2) tem três modos: interface web (padrão), `--cli` e `--tui`. Para um servidor stdio, o comando alvo vem logo depois das opções de modo, e as variáveis de ambiente entram com `-e`:
+
+```bash
+# interface web: abre no navegador, com as tools, resources e prompts do servidor
+npx @modelcontextprotocol/inspector /abs/galaxies-tool/.venv/bin/python \
+  /abs/galaxies-tool/galaxies_tool/servidor_mcp.py \
+  -e PYTHONPATH=/abs/galaxies-tool -e GALAXIES_ARTEFATOS=/abs/galaxies-tool/artefatos
+
+# CLI: bom para CI e para conferir o handshake
+npx @modelcontextprotocol/inspector --cli /abs/galaxies-tool/.venv/bin/python \
+  /abs/galaxies-tool/galaxies_tool/servidor_mcp.py \
+  -e PYTHONPATH=/abs/galaxies-tool -e GALAXIES_ARTEFATOS=/abs/galaxies-tool/artefatos \
+  --method initialize
+```
+
+Saída real do modo CLI (trecho):
+
+```json
+{
+  "serverInfo": {"name": "galaxies-preditor", "version": "0.1.0"},
+  "protocolVersion": "2025-11-25",
+  "instructions": "Prevê curtidas de YouTube Shorts (moda, beleza, automotivo) ANTES da publicação. O número vem de um modelo treinado: repasse-o sem alterar, sempre com o intervalo de 80% e a confiança. Limites em model://card."
+}
+```
+
+Duas armadilhas que custaram tempo ao testar esta aula. O Inspector v2 interpreta o `-m` de `python -m galaxies_tool.servidor_mcp` como uma opção dele: por isso o alvo acima é o **caminho do arquivo**, não o módulo. E o processo iniciado **não herda** o seu `PYTHONPATH`: sem o `-e`, o servidor morre com `ModuleNotFoundError` e o Inspector só mostra `Connection closed`.
+
+Para chamar a tool pela CLI, use `--method tools/call --tool-name prever_criativo --tool-arg 'pedido={...}'`, com o pedido em JSON.
+
+---
+
+## No Claude Desktop e no Claude Code
+
+Os dois são hosts MCP e servem como "persona de teste" antes da entrega. Use **caminhos absolutos**: o host inicia o servidor a partir de outro diretório, e o `artefatos/` relativo não será encontrado. No Claude Desktop, o arquivo `claude_desktop_config.json` (no macOS, em `~/Library/Application Support/Claude/`) recebe:
+
+```json
+{
+  "mcpServers": {
+    "galaxies": {
+      "command": "/abs/galaxies-tool/.venv/bin/python",
+      "args": ["-m", "galaxies_tool.servidor_mcp"],
+      "env": {
+        "PYTHONPATH": "/abs/galaxies-tool",
+        "GALAXIES_ARTEFATOS": "/abs/galaxies-tool/artefatos"
+      }
+    }
+  }
+}
+```
+
+No Claude Code, o equivalente é um comando (com `--scope project`, a configuração vai para um `.mcp.json` versionável no repositório):
+
+```bash
+claude mcp add --transport stdio \
+  --env PYTHONPATH=/abs/galaxies-tool --env GALAXIES_ARTEFATOS=/abs/galaxies-tool/artefatos \
+  galaxies -- /abs/galaxies-tool/.venv/bin/python -m galaxies_tool.servidor_mcp
+claude mcp list   # mostra o servidor e o status da conexão
+```
+
+Esses dois trechos seguem a documentação oficial de cada produto e **não foram executados** neste ambiente; o servidor em si foi testado pelo Inspector e pelos clientes das seções acima.
+
+---
+
+## Dogfooding: consumindo o seu servidor do LangGraph
+
+A melhor forma de enxergar o servidor como a persona vai enxergá-lo é **consumi-lo** de um agente. O `langchain-mcp-adapters` converte as tools MCP em tools do LangChain:
+
+```python
+# rodar_persona_mcp.py — dogfooding: um agente LangGraph consumindo o servidor via stdio
+import asyncio
+import json
+import sys
+import time
+from pathlib import Path
+
+from langchain.agents import create_agent
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+
+PROJETO = Path.cwd()
+cliente = MultiServerMCPClient({"galaxies": {
+    "transport": "stdio", "command": sys.executable,  # o Python do venv do projeto
+    "args": ["-m", "galaxies_tool.servidor_mcp"],
+    "env": {"GALAXIES_ARTEFATOS": str(PROJETO / "artefatos"), "PYTHONPATH": str(PROJETO)}}})
+
+
+class FakeComTools(GenericFakeChatModel):  # a "persona" falsa; troque por um LLM real
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+A = {"creative": "lumina_a.mp4", "caption": "Pele natural em 5 passos #maquiagem #tutorial",
+     "planned_datetime": "2026-09-29T14:00:00-03:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}
+B = {"creative": "lumina_b.mp4", "caption": "1 produto, 20 segundos #antesedepois #maquiagem",
+     "planned_datetime": "2026-10-01T19:00:00-03:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}
+
+
+async def main():
+    t0 = time.perf_counter()
+    async with cliente.session("galaxies") as sessao:  # UM processo para todas as chamadas
+        tools = await load_mcp_tools(sessao)
+        print(f"servidor no ar em {time.perf_counter() - t0:.1f} s; tools:", [t.name for t in tools])
+        roteiro = iter([AIMessage("", tool_calls=[{"name": "comparar_criativos", "id": "c1",
+                                                   "args": {"criativos": {"A": A, "B": B}}}]),
+                        AIMessage("Recomendo o B: P(B > A) = 0,884.")])
+        persona = create_agent(FakeComTools(messages=roteiro), tools=tools)
+        t0 = time.perf_counter()
+        saida = await persona.ainvoke({"messages": [{"role": "user", "content": "A ou B?"}]})
+        print(f"pergunta respondida em {time.perf_counter() - t0:.2f} s")
+        resultado = json.loads(saida["messages"][2].content[0]["text"])
+        print(resultado["ranking"][0], resultado["prob_supera"])
+        print(saida["messages"][-1].content)
+
+
+asyncio.run(main())
+```
+
+```text
+servidor no ar em 4.9 s; tools: ['prever_criativo', 'comparar_criativos']
+pergunta respondida em 0.06 s
+{'posicao': 1, 'criativo': 'B', 'predicted_metric': 4237.0, 'interval_low': 1655.0, 'interval_high': 9180.0, 'baixa_confianca': False} {'B > A': 0.884}
+Recomendo o B: P(B > A) = 0,884.
+```
+
+O detalhe mais importante do código é o `cliente.session("galaxies")`. Sem ele, o `MultiServerMCPClient.get_tools()` cria uma **sessão nova a cada chamada de tool**, e, no stdio, sessão nova significa **processo novo**: o servidor sobe, carrega o modelo e o SHAP, responde e morre. Na nossa máquina, cada chamada levou cerca de 10 s assim, contra cerca de 0,6 s com a sessão reaproveitada (com o servidor já aquecido, a comparação acima levou 0,06 s). Dois outros detalhes: o adapter chama o transporte HTTP de `"streamable_http"` (aceita também `"http"`), e o resultado da tool chega ao LLM como uma lista de blocos de conteúdo com o JSON em texto.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Do ponto de vista da persona, o encontro com o seu servidor é assim: ela conecta, lê as `instructions`, lista duas tools com descrições em português e *schemas* estritos, e talvez leia o `model://card` para saber que o modelo foi medido com par-a-par de 67,2% e cobertura de 83% no teste temporal. Quando o time da Lumina pergunta *"A ou B?"*, o LLM dela chama `comparar_criativos` e recebe o ranking, os intervalos e **P(B > A) = 0,884**, junto com a resposta completa de cada criativo (com `top_drivers`, `explanation` e `comparables`).
+
+O que o seu servidor **não** faz é tão importante quanto: ele não escreve a recomendação final, não opina sobre o público e não tem um LLM próprio. A persona já tem o dela. A sua responsabilidade é que cada número que ela citar tenha vindo de uma chamada que você consegue reproduzir, com a `model_version` registrada.
+
+Antes da entrega, faça o teste que a banca vai fazer: conecte o servidor ao Claude Desktop, pergunte "qual dos dois Shorts da Lumina eu impulsiono?" e confira se o número dito pelo Claude é exatamente o `predicted_metric` que o servidor devolveu.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **`print()` num servidor stdio.** Corrompe o JSON-RPC, e o sintoma costuma ser um erro de conexão genérico. Use `logging` (stderr) e `show_banner=False`.
+2. **Caminhos relativos.** O host inicia o servidor de outro diretório. Use caminhos absolutos na configuração e uma variável de ambiente para os artefatos.
+3. **Seguir o "Update available" do FastMCP.** O 4.x (e o `mcp` 2.x) quebram o `langchain-mcp-adapters` 0.3.2. Fixe as versões.
+4. **Uma sessão por chamada no adapter.** Cada chamada sobe um processo e recarrega o modelo. Use `client.session(...)` + `load_mcp_tools`.
+5. **Um LLM dentro do servidor.** O host já tem um. Um segundo LLM no servidor só acrescenta custo, latência e mais um lugar para o número ser alterado.
+6. **HTTP aberto na rede sem autenticação.** Para uso local, `127.0.0.1`; para expor, proteja o endpoint.
+:::
+
+<Quiz
+  id="m6-a5"
+  perguntas={[
+    {
+      pergunta: 'A persona da Galaxies roda num host com LLM próprio e se conecta ao seu servidor. Nesse cenário, quem é o **cliente MCP**?',
+      opcoes: [
+        {texto: 'O seu servidor FastMCP.', explicacao: 'O servidor é quem expõe tools; o cliente fica do outro lado.'},
+        {texto: 'O componente dentro da aplicação da persona que mantém a conexão com o seu servidor.', correta: true, explicacao: 'Exato: o host (a aplicação da persona) tem um cliente por servidor conectado.'},
+        {texto: 'O LLM da persona.', explicacao: 'O LLM decide o que chamar, mas quem fala o protocolo é o cliente, dentro do host.'},
+      ],
+    },
+    {
+      pergunta: 'O servidor stdio funciona no pytest (cliente em memória), mas o Claude Desktop mostra erro de conexão. Qual é a causa mais provável entre estas?',
+      opcoes: [
+        {texto: 'Um `print()` de depuração que escreve no stdout.', correta: true, explicacao: 'No stdio, o stdout é o canal do JSON-RPC. No teste em memória, o stdout não é usado, e o bug fica escondido.'},
+        {texto: 'O Claude Desktop não suporta tools com parâmetros Pydantic.', explicacao: 'O host recebe um JSON Schema; ele não sabe que veio do Pydantic.'},
+        {texto: 'O FastMCP 3.4.7 não suporta stdio.', explicacao: 'O stdio é o transporte padrão do `mcp.run()`.'},
+      ],
+    },
+    {
+      pergunta: 'Um colega quer "atualizar para a spec 2026-07-28" instalando `fastmcp` 4.x. O que acontece com o projeto?',
+      opcoes: [
+        {texto: 'Nada: o FastMCP é compatível com versões anteriores.', explicacao: 'O problema não é o FastMCP isolado, e sim a dependência do adapter em mcp<2.'},
+        {texto: 'O lado LangGraph quebra: o `langchain-mcp-adapters` 0.3.2 exige `mcp<2`, incompatível com o FastMCP 4.x e com o `mcp` 2.x.', correta: true, explicacao: 'Isso. Fixe fastmcp 3.4.7 e mcp 1.30.0 e confirme com a Galaxies a era do cliente da persona.'},
+        {texto: 'O servidor passa a falar só HTTP.', explicacao: 'Não é isso; a incompatibilidade é de dependências.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o `model://card` é um **resource**, e não mais uma tool?',
+      opcoes: [
+        {texto: 'Porque resources são mais rápidos que tools.', explicacao: 'A diferença não é de velocidade.'},
+        {texto: 'Porque é contexto que a aplicação lê para entender o modelo (versão, métricas, limites), não uma ação que o LLM executa.', correta: true, explicacao: 'Exato: resources são dados para dar contexto; tools são ações que o modelo decide chamar.'},
+        {texto: 'Porque tools não podem devolver JSON.', explicacao: 'Tools devolvem JSON estruturado; a escolha é semântica.'},
+      ],
+    },
+    {
+      pergunta: 'No dogfooding com `MultiServerMCPClient`, cada chamada de tool leva cerca de 10 s. Qual ajuste resolve?',
+      opcoes: [
+        {texto: 'Trocar stdio por HTTP.', explicacao: 'Ajuda se o servidor HTTP ficar no ar, mas o problema no stdio é outro: cada chamada cria uma sessão (um processo).'},
+        {texto: 'Abrir uma sessão com `client.session(...)` e carregar as tools com `load_mcp_tools(sessao)`.', correta: true, explicacao: 'Assim um único processo atende todas as chamadas, e o modelo fica carregado.'},
+        {texto: 'Diminuir o `n_estimators` do modelo.', explicacao: 'O tempo é de subir o processo e carregar tudo, não de prever.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: um resource template para o histórico do canal]
+Antes de pedir uma previsão, a persona às vezes quer saber se o canal está na sua base. Adicione ao servidor um **resource template** `canal://{channel_id}/resumo` que devolva setor, inscritos, número de posts e a mediana de curtidas dos últimos 90 dias da base. Um canal desconhecido deve gerar um erro legível. Teste com o cliente em memória.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import pandas as pd
+from fastmcp.exceptions import ResourceError
+
+from galaxies_tool.tools import _base_e_indice
+
+
+@mcp.resource("canal://{channel_id}/resumo", mime_type="application/json")
+def resumo_do_canal(channel_id: str) -> dict:
+    """Inscritos, número de posts e mediana de curtidas dos últimos 90 dias da base."""
+    base, _ = _base_e_indice()
+    posts = base[base["channel_id"] == channel_id]
+    if posts.empty:
+        raise ResourceError(f"canal '{channel_id}' não está na base")
+    ultimos = posts[posts["published_at"] >= posts["published_at"].max() - pd.Timedelta(days=90)]
+    return {"channel_id": channel_id, "setor": posts["sector"].iloc[-1],
+            "inscritos": int(posts["channel_stats_at_collection"].iloc[-1]["subscribers"]),
+            "posts_na_base": len(posts),
+            "mediana_curtidas_90d": float(ultimos["metric_target"].median()),
+            "ultimo_post": posts["published_at"].max().isoformat()}
+```
+
+Com o cliente em memória, `await cliente.list_resource_templates()` lista `canal://{channel_id}/resumo`, e a leitura devolve:
+
+```json
+{"channel_id": "UC_lumina_beauty", "setor": "beleza", "inscritos": 180000, "posts_na_base": 47, "mediana_curtidas_90d": 2305.0, "ultimo_post": "2026-09-10T22:00:00-03:00"}
+```
+
+Para um canal desconhecido, o cliente recebe um `McpError` com a mensagem `canal 'UC_x' não está na base`. Repare que a janela de 90 dias aqui termina no último post da base, e não numa data planejada: é um resumo do histórico, não uma *feature*.
+
+</details>
+
+---
+
+## Resumo
+
+- **Host** tem o LLM, **cliente** mantém a conexão com um servidor, **servidor** expõe **tools** (o LLM decide), **resources** (contexto) e **prompts** (modelos para o usuário), tudo sobre **JSON-RPC 2.0**.
+- **stdio** para uso local (o host inicia o servidor; nada no stdout) e **Streamable HTTP** para servidor remoto em `/mcp`.
+- A spec **2026-07-28** é *stateless* (sem `initialize`, com `server/discover`); o nosso stack fala a **era legada** (protocolo 2025-11-25). Confirme a era do cliente da persona.
+- Com **FastMCP 3.4.7**, o *schema* vem do contrato Pydantic, a saída vira `structuredContent` e erros viram respostas `isError` legíveis.
+- Teste com `fastmcp.Client(mcp)` em memória, depure com o **MCP Inspector**, e faça *dogfooding* com o **`langchain-mcp-adapters`** reaproveitando a sessão. **Fixe** `fastmcp==3.4.7` e `mcp==1.30.0`.
+
+## Referências
+
+- Model Context Protocol. [Especificação 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28), [transportes](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports) e [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog).
+- FastMCP. [Tools](https://gofastmcp.com/servers/tools), [Resources](https://gofastmcp.com/servers/resources), [Testing](https://gofastmcp.com/servers/testing) e [Running the server](https://gofastmcp.com/deployment/running-server).
+- MCP Inspector. [Repositório e documentação](https://github.com/modelcontextprotocol/inspector).
+- LangChain. [MCP no LangChain](https://docs.langchain.com/oss/python/langchain/mcp) e [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters).
+- Claude Code. [Conectando servidores MCP](https://code.claude.com/docs/en/mcp).
+- Model Context Protocol. [Conectando servidores locais ao Claude Desktop](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
+
+**Próxima aula:** [Testando e avaliando o agente](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente): a pirâmide de testes, a invariante "número do agente = número do modelo" e o golden set "de-para".

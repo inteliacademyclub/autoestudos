@@ -1,0 +1,497 @@
+---
+sidebar_position: 5
+sidebar_label: 'Conformal adaptativo e drift'
+title: 'Conformal adaptativo e drift'
+description: 'Por que o intervalo conformal perde cobertura quando o mundo muda e como o ACI e o EnbPI recalibram o intervalo online, com atraso de rótulo e MAPIE 1.5.0.'
+tags: [ml-preditivo, ir-alem, incerteza, conformal, drift]
+---
+
+# Conformal Adaptativo e Drift: Quando a Garantia de Cobertura Expira
+
+<LessonMeta
+  tempo="45 min"
+  semana="4+"
+  etapa="incerteza"
+  opcional
+  objetivos={[
+    'Explicar por que a garantia do split conformal depende de permutabilidade e quebra com drift',
+    'Implementar o ACI (Adaptive Conformal Inference) em poucas linhas de numpy e escolher o passo γ',
+    'Avaliar intervalos adaptativos levando em conta os ~30 dias de maturação das curtidas',
+    'Usar o TimeSeriesRegressor do MAPIE 1.5.0 com ACI e EnbPI sem cair nas pegadinhas da API',
+    'Decidir como combinar retreino periódico, recalibração e ACI como monitor no projeto',
+  ]}
+  prerequisitos={[
+    {label: 'Predição conformal', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal'},
+    {label: 'Regressão quantílica e pinball loss', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+  ]}
+/>
+
+Imagine que você calibrou o intervalo de 80% do seu modelo com os posts de agosto. No backtest, a <Termo id="cobertura">cobertura</Termo> deu 80,2%: exatamente o prometido. Você publica o agente, a Galaxies começa a usá-lo e, algumas semanas depois, alguma coisa muda na plataforma: o feed passa a premiar ganchos fortes, o nível geral de curtidas cai um pouco e os resultados ficam mais imprevisíveis.
+
+Nenhuma linha do seu código quebrou, e o intervalo continua saindo com o rótulo "80%". Mas, quando você finalmente confere, só **54%** dos posts publicados depois da mudança caíram dentro dele. Ninguém percebeu, porque ninguém estava medindo.
+
+O cenário é simulado (você vai reproduzi-lo abaixo), mas o mecanismo é real: a garantia da [predição conformal](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal) tem uma hipótese escondida, e o <Termo id="drift">drift</Termo> a viola.
+
+:::info[A ideia central]
+O split conformal garante cobertura **se o futuro for permutável com a calibração**. Com drift, essa hipótese cai e a cobertura real se afasta do nominal sem nenhum aviso.
+
+O **ACI** (*Adaptive Conformal Inference*) trata o nível do intervalo como um botão que se ajusta online: cada erro alarga o próximo intervalo, cada acerto o estreita um pouco. Em troca, ele entrega uma garantia mais fraca, mas que vale para **qualquer** sequência de dados: a taxa de erro de longo prazo converge para o nível nominal.
+:::
+
+---
+
+## A hipótese escondida: permutabilidade
+
+Relembrando: no split conformal você calcula os resíduos absolutos $$r_i = |y_i - \hat{y}_i|$$ num conjunto de calibração com $$n$$ posts, pega o $$k$$-ésimo menor, com $$k = \lceil (n+1)(1-\alpha) \rceil$$, e usa esse valor $$q$$ como meia-largura do intervalo. A garantia é:
+
+$$
+\mathbb{P}\left(y_{n+1} \in [\hat{y}_{n+1} - q,\ \hat{y}_{n+1} + q]\right) \ge 1 - \alpha
+$$
+
+Ela vale sob uma única hipótese: os pontos de calibração e o ponto novo são **permutáveis** (*exchangeable*), isto é, a distribuição conjunta não muda se você embaralhar a ordem deles. Dados i.i.d. são permutáveis. Uma série em que o mundo muda no meio **não** é: o resíduo de um post de novembro não é "mais um sorteio" da mesma urna que gerou os resíduos de agosto.
+
+Três tipos de mudança quebram a permutabilidade no seu projeto:
+
+- **Mudança de nível**: todos os posts passam a render menos (ou mais). O modelo fica enviesado.
+- **Mudança de ruído**: os resultados ficam mais dispersos. O modelo continua centrado, mas os resíduos crescem.
+- **Mudança de relação**: o peso de uma *feature* muda (por exemplo, o gancho passa a valer mais). O modelo erra de forma sistemática para certos tipos de criativo.
+
+A plataforma muda as regras de verdade (a contagem de views de Shorts mudou em 31/03/2025 e em ago/2026). Curtidas não mudaram de definição, mas nada garante que a distribuição delas fique parada quando o algoritmo de recomendação mudar. O que você pode fazer é **medir** e **reagir**.
+
+### Etapa 1: simulando uma quebra de regime
+
+O código abaixo gera 4.000 posts ao longo de 900 dias, treina um LightGBM nos primeiros 400, calibra o split conformal nos 100 dias seguintes e testa no resto. No dia 650 acontece uma quebra de regime **simulada**: o efeito do gancho mais que dobra, o nível cai 0,25 em escala log e o ruído sobe de 0,5 para 0,8. As versões das bibliotecas estão no bloco "Ambiente deste módulo" da [aula 7.1](/aulas/ml-preditivo-e-agentes/ir-alem/pipeline-agnostico).
+
+```python
+import numpy as np
+from lightgbm import LGBMRegressor
+
+rng = np.random.default_rng(7)
+N = 4000
+dia = np.sort(rng.uniform(0, 900, N))            # posts em ordem de publicação
+nivel = rng.normal(7.5, 1.0, N)                  # log da mediana do canal
+gancho = rng.integers(0, 11, N)                  # nota do gancho (0–10)
+nobre = rng.random(N) < 0.4                      # publicado entre 18h e 22h
+duracao = rng.uniform(10, 90, N)
+X = np.column_stack([nivel, gancho, nobre, duracao])
+
+# Quebra de regime SIMULADA no dia 650: o feed passa a premiar mais o gancho,
+# o nível cai um pouco e o ruído aumenta.
+depois = dia >= 650
+efeito_gancho = np.where(depois, 0.20, 0.09)
+ruido = np.where(depois, 0.80, 0.50)
+y = (nivel + efeito_gancho * (gancho - 5) + 0.12 * nobre
+     - 0.05 * (duracao - 30) / 10 - 0.25 * depois
+     + rng.normal(0, 1, N) * ruido)              # y = log1p(curtidas)
+
+treino, calib, teste = dia < 400, (dia >= 400) & (dia < 500), dia >= 500
+modelo = LGBMRegressor(n_estimators=300, learning_rate=0.05,
+                       num_leaves=15, verbose=-1).fit(X[treino], y[treino])
+
+# Split conformal: calibra UMA vez e congela o quantil dos resíduos
+alpha = 0.2                                       # intervalo de 80%
+res_cal = np.abs(y[calib] - modelo.predict(X[calib]))
+n = len(res_cal)
+k = int(np.ceil((n + 1) * (1 - alpha)))           # posição do quantil conformal
+q = np.sort(res_cal)[k - 1]                       # k-ésimo menor resíduo
+
+pred = modelo.predict(X[teste])
+cobre_split = np.abs(y[teste] - pred) <= q
+dia_teste = dia[teste]
+print(f"calibração: {n} posts, meia-largura q = {q:.3f}")
+for ini, fim in [(500, 650), (650, 750), (750, 900)]:
+    m = (dia_teste >= ini) & (dia_teste < fim)
+    print(f"dias {ini}–{fim}: cobertura split = {cobre_split[m].mean():.1%}")
+```
+
+```text
+calibração: 440 posts, meia-largura q = 0.674
+dias 500–650: cobertura split = 80.2%
+dias 650–750: cobertura split = 53.8%
+dias 750–900: cobertura split = 53.9%
+```
+
+Antes da quebra, o split conformal entrega o prometido. Depois dela, a cobertura despenca para 54% e **fica lá**: o $$q$$ foi medido num mundo que não existe mais, e nada no pipeline sabe disso.
+
+---
+
+## ACI: o intervalo que aprende com os próprios erros
+
+Gibbs e Candès (NeurIPS 2021) propuseram uma saída elegante. Em vez de fixar o nível $$\alpha$$, use um nível $$\alpha_t$$ que muda a cada passo. No instante $$t$$ você monta o intervalo com o quantil $$1 - \alpha_t$$ dos resíduos; quando o valor real chega, você anota se errou e atualiza:
+
+$$
+\alpha_{t+1} = \alpha_t + \gamma \, (\alpha - \text{err}_t)
+$$
+
+em que $$\text{err}_t = 1$$ se o valor real caiu fora do intervalo e $$\text{err}_t = 0$$ se caiu dentro. Com $$\alpha = 0{,}2$$, um erro subtrai $$0{,}8\gamma$$ de $$\alpha_t$$ (o próximo intervalo fica bem mais largo) e um acerto soma $$0{,}2\gamma$$ (fica um pouco mais estreito). O equilíbrio acontece exatamente quando a taxa de erro é 20%.
+
+<Sketch name="m7/conformal-adaptativo" alt="Comparação entre split conformal e ACI. À esquerda, o split conformal calibra uma vez, congela o quantil q = 0,674 e usa o mesmo intervalo para sempre; depois da quebra de regime, a cobertura cai de 80% para 54% sem ninguém perceber. À direita, o laço do ACI: prever o intervalo com o quantil 1 menos alfa t dos resíduos, publicar e esperar as curtidas maturarem por cerca de 30 dias, verificar se o valor real caiu dentro; se acertou, alfa t sobe um pouco e o intervalo estreita; se errou, alfa t desce bem mais e o intervalo alarga; a fórmula alfa t+1 = alfa t + gama vezes (alfa menos err t) alimenta o próximo post. Uma nota diz que, na simulação, o ACI volta para cerca de 80% de cobertura em poucas semanas com intervalos cerca de 1,6 vezes mais largos, e que com o atraso real de 30 dias a volta é mais lenta." caption="O split conformal congela o quantil; o ACI reajusta o nível a cada resultado observado." />
+
+Se a fórmula lembra a [regressão quantílica](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica), não é coincidência: o próprio artigo mostra (apêndice A.1) que essa atualização é um passo de gradiente descendente online na <Termo id="pinball">pinball loss</Termo>.
+
+A garantia do ACI (Proposição 4.1 do artigo) vale para **qualquer** sequência de dados, sem hipótese de permutabilidade:
+
+$$
+\left| \frac{1}{T} \sum_{t=1}^{T} \text{err}_t - \alpha \right| \le \frac{\max\{\alpha_1,\ 1 - \alpha_1\} + \gamma}{\gamma \, T}
+$$
+
+Com $$\alpha_1 = 0{,}2$$ e $$T = 1.000$$ posts, o limite é 16,1 pontos percentuais para $$\gamma = 0{,}005$$ e 4,1 pontos para $$\gamma = 0{,}02$$. Três observações importantes:
+
+1. **É uma garantia de média de longo prazo**, não de cobertura condicional. Nada impede que o intervalo cubra 95% dos posts de beleza e 60% dos de automotivo, ou que falhe em sequência logo depois de uma quebra.
+2. **$$\alpha_t$$ pode ficar negativo** (o artigo mostra que ele fica entre $$-\gamma$$ e $$1 + \gamma$$). Com $$\alpha_t \le 0$$, o intervalo é infinito. Isso não é bug: é o método dizendo "não sei". O seu agente precisa tratar esse caso como [sinal de baixa confiança](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca).
+3. **$$\gamma$$ é um compromisso entre adaptação e estabilidade.** Os autores descrevem exatamente essa troca e usam $$\gamma = 0{,}005$$ nos experimentos deles. $$\gamma$$ grande reage rápido, mas faz o intervalo oscilar entre estreito demais e largo demais.
+
+### Etapa 2: ACI na mão, em ~15 linhas
+
+Continuando o código da etapa 1:
+
+```python
+def aci(pred, y, res_cal, alpha=0.2, gamma=0.01):
+    """ACI (Gibbs & Candès, 2021) sobre os resíduos de calibração."""
+    r = np.sort(res_cal)
+    n = len(r)
+    alpha_t = alpha
+    cobre, meia = np.zeros(len(y), bool), np.zeros(len(y))
+    for t, (p, yt) in enumerate(zip(pred, y)):
+        k = int(np.ceil((n + 1) * (1 - alpha_t)))   # posição do quantil
+        q_t = np.inf if k > n else r[max(k, 1) - 1]  # alpha_t muito baixo → ∞
+        cobre[t] = abs(yt - p) <= q_t
+        err_t = 0.0 if cobre[t] else 1.0
+        alpha_t = alpha_t + gamma * (alpha - err_t)   # a atualização inteira
+        meia[t] = q_t
+    return cobre, meia
+
+res = {g: aci(pred, y[teste], res_cal, gamma=g) for g in (0.005, 0.02)}
+print("dias       split  ACI γ=0,005  ACI γ=0,02  largura (γ=0,02)")
+for ini, fim in [(500, 650), (650, 700), (700, 750), (750, 900)]:
+    m = (dia_teste >= ini) & (dia_teste < fim)
+    print(f"{ini}–{fim}  {cobre_split[m].mean():6.1%}  {res[0.005][0][m].mean():9.1%}"
+          f"  {res[0.02][0][m].mean():10.1%}  {np.median(2 * res[0.02][1][m]):9.2f}")
+for g, (c, h) in res.items():
+    print(f"γ={g}: cobertura no teste todo = {c.mean():.1%}, "
+          f"intervalos infinitos = {np.isinf(h).mean():.1%}")
+```
+
+```text
+dias       split  ACI γ=0,005  ACI γ=0,02  largura (γ=0,02)
+500–650   80.2%      79.7%       79.8%       1.35
+650–700   49.5%      64.0%       76.6%       2.30
+700–750   57.8%      82.2%       80.4%       2.13
+750–900   53.9%      80.0%       79.9%       2.16
+γ=0.005: cobertura no teste todo = 78.2%, intervalos infinitos = 0.1%
+γ=0.02: cobertura no teste todo = 79.5%, intervalos infinitos = 2.6%
+```
+
+Leia a tabela linha a linha. Antes da quebra, o ACI se comporta como o split. Nos 50 dias seguintes à quebra, o split cai para 49,5%, enquanto o ACI com $$\gamma = 0{,}02$$ já segura 76,6%. Com $$\gamma = 0{,}005$$ a reação é mais lenta (64,0%), mas depois os dois ficam em torno de 80%. O preço aparece nas duas últimas colunas: o intervalo ficou cerca de 1,6 vez mais largo (de 1,35 para ~2,2 em escala log), e $$\gamma = 0{,}02$$ produziu 2,6% de intervalos infinitos. **O ACI conserta a cobertura; ele não conserta o modelo.** O intervalo largo é o custo honesto de um modelo desatualizado.
+
+---
+
+## O mundo real tem atraso: curtidas maturam
+
+A etapa 2 tem uma trapaça: ela supõe que você conhece o valor real **logo depois** de prever. No projeto, o alvo só é confiável quando o post tem cerca de 30 dias. Com uns 4 posts por dia, há mais de uma centena de previsões "em voo" cujo erro você ainda não conhece. O próprio artigo do ACI lista respostas atrasadas como um problema em aberto na seção de discussão.
+
+### Etapa 3: ACI com 30 dias de atraso
+
+```python
+from collections import deque
+
+def aci_com_atraso(dias, pred, y, res_cal, alpha=0.2, gamma=0.01, atraso=30):
+    """ACI em que o erro de cada post só é conhecido `atraso` dias depois."""
+    r, n = np.sort(res_cal), len(res_cal)
+    alpha_t, fila = alpha, deque()            # fila de (dia em que matura, err)
+    cobre, meia = np.zeros(len(y), bool), np.zeros(len(y))
+    for t in np.argsort(dias, kind="stable"):
+        while fila and fila[0][0] <= dias[t]:     # rótulos que já maturaram
+            alpha_t += gamma * (alpha - fila.popleft()[1])
+            alpha_t = min(max(alpha_t, 0.0), 1.0)  # mesmo corte que o MAPIE usa
+        k = int(np.ceil((n + 1) * (1 - alpha_t)))
+        meia[t] = np.inf if k > n else r[max(k, 1) - 1]
+        cobre[t] = abs(y[t] - pred[t]) <= meia[t]
+        fila.append((dias[t] + atraso, 0.0 if cobre[t] else 1.0))
+    return cobre, meia
+
+print("janelas de 50 dias a partir do dia 500 (quebra no dia 650)")
+for g in (0.002, 0.02):
+    c, h = aci_com_atraso(dia_teste, pred, y[teste], res_cal, gamma=g)
+    por = " ".join(f"{c[(dia_teste >= i) & (dia_teste < i + 50)].mean():4.0%}"
+                   for i in range(500, 900, 50))
+    print(f"γ={g:<5}: {por} | infinitos: {np.isinf(h).mean():.1%}")
+```
+
+```text
+janelas de 50 dias a partir do dia 500 (quebra no dia 650)
+γ=0.002:  80%  83%  76%  50%  72%  82%  76%  87% | infinitos: 0.0%
+γ=0.02 :  82%  79%  73%  65%  86%  53%  69%  76% | infinitos: 10.7%
+```
+
+O mesmo $$\gamma = 0{,}02$$ que funcionava bem com rótulo imediato agora **oscila** (86%, depois 53%) e gera 10,7% de intervalos infinitos. O motivo é o mesmo de um chuveiro com água que demora a esquentar: você gira o registro, não sente diferença, gira mais, e quando a água finalmente chega está quente demais. Os erros da quebra chegam todos juntos, 30 dias depois, e empurram $$\alpha_t$$ muito além do necessário. Com $$\gamma = 0{,}002$$ o comportamento é estável, mas a recuperação leva uns 100 dias. **Com atraso, use $$\gamma$$ pequeno e não conte com o ACI para reagir rápido.**
+
+---
+
+## Na prática com MAPIE 1.5.0
+
+O MAPIE implementa ACI e EnbPI na classe `TimeSeriesRegressor`. Atenção: ela **não** segue o fluxo novo `fit` → `conformalize` → `predict_interval` das classes `SplitConformalRegressor` e `ConformalizedQuantileRegressor`. Com `cv="prefit"`, o `fit` não retreina o modelo: só calcula os resíduos no conjunto que você passar (a calibração). E o `predict` com `confidence_level` devolve uma tupla `(y_pred, y_pis)`, com `y_pis` de formato `(n, 2, n_níveis)`.
+
+### Etapa 4: ACI do MAPIE, em lotes semanais e com atraso
+
+```python
+import warnings
+from mapie.regression import TimeSeriesRegressor
+
+def aci_mapie(gamma=0.02, atualizar_scores=False, atraso=5):
+    ts = TimeSeriesRegressor(modelo, method="aci", cv="prefit")
+    ts.fit(X[calib], y[calib])      # "prefit": não retreina, só calcula resíduos
+    Xt, yt = X[teste], y[teste]
+    semana = (dia_teste // 7).astype(int)
+    cobre, larg = np.zeros(len(yt), bool), np.zeros(len(yt))
+    for s in np.unique(semana):
+        b = semana == s
+        _, pis = ts.predict(Xt[b], confidence_level=0.8, allow_infinite_bounds=True)
+        lo, hi = pis[:, 0, 0], pis[:, 1, 0]
+        cobre[b], larg[b] = (yt[b] >= lo) & (yt[b] <= hi), hi - lo
+        # as curtidas da semana s - atraso acabaram de "maturar" (~30 dias)
+        v = semana == s - atraso
+        if not v.any():
+            continue
+        ts.adapt_conformal_inference(Xt[v], yt[v], gamma=gamma, confidence_level=0.8)
+        if atualizar_scores:            # desliza a janela de resíduos (estilo EnbPI)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                ts.update(Xt[v], yt[v])
+    return cobre, larg, ts.current_alpha[0.2]
+
+print("variante                     500–650 650–700 700–750 750–900")
+variantes = {"só ACI, sem atraso": dict(atraso=0),
+             "só ACI, atraso 5 sem": dict(atraso=5),
+             "ACI + update, atraso 5 sem": dict(atraso=5, atualizar_scores=True)}
+for nome, kw in variantes.items():
+    c, l, a = aci_mapie(**kw)
+    linha = "  ".join(f"{c[(dia_teste >= i) & (dia_teste < f)].mean():6.1%}"
+                      for i, f in [(500, 650), (650, 700), (700, 750), (750, 900)])
+    print(f"{nome:28s} {linha}  | largura {np.median(l[dia_teste >= 750]):.2f}"
+          f", α_t final {a:.3f}")
+```
+
+```text
+variante                     500–650 650–700 700–750 750–900
+só ACI, sem atraso            80.3%   73.4%   77.8%   80.4%  | largura 2.26, α_t final 0.032
+só ACI, atraso 5 sem          79.7%   51.4%   83.1%   79.3%  | largura 2.26, α_t final 0.024
+ACI + update, atraso 5 sem    80.5%   51.4%   92.4%   81.5%  | largura 2.28, α_t final 0.208
+```
+
+Duas lições saem daqui. Primeiro, com 5 semanas de atraso, **nenhuma** variante salva os primeiros 50 dias depois da quebra (51,4%): nenhum método reage a erros que ainda não recebeu. Segundo, repare no $$\alpha_t$$ final. Só com ACI, ele desce até ~0,03: o método "estica" a cauda dos resíduos antigos para compensar. Com `update`, a janela de resíduos passa a ser preenchida com resíduos do regime novo, e $$\alpha_t$$ volta para perto de 0,2. Os dois chegam a ~80%, mas o segundo está mais saudável: ele reaprendeu a distribuição dos erros em vez de pedir um quantil extremo da antiga.
+
+### Etapa 5: EnbPI
+
+O **EnbPI** (Xu e Xie, ICML 2021) ataca o problema por outro lado. Ele treina um *ensemble* de modelos em reamostragens por blocos (*block bootstrap*, que preserva a ordem temporal dentro de cada bloco), usa as previsões *out-of-bag* para calcular resíduos sem separar um conjunto de calibração e, a cada novo lote de rótulos, descarta os resíduos mais antigos e entra com os mais novos. Não há garantia de cobertura sem hipóteses: os limites teóricos do artigo dependem de condições sobre o processo dos erros.
+
+```python
+from mapie.subsample import BlockBootstrap
+
+enbpi = TimeSeriesRegressor(
+    LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=15, verbose=-1),
+    method="enbpi", agg_function="mean",
+    cv=BlockBootstrap(n_resamplings=10, n_blocks=10, overlapping=False, random_state=0),
+)
+ate = dia < 500                   # sem conjunto de calibração separado:
+enbpi.fit(X[ate], y[ate])         # os resíduos são out-of-bag dos 10 modelos
+print("resíduos guardados:", enbpi.conformity_scores_.shape[0])
+
+Xt, yt = X[teste], y[teste]
+semana = (dia_teste // 7).astype(int)
+cobre = np.zeros(len(yt), bool)
+for s in np.unique(semana):
+    b = semana == s
+    _, pis = enbpi.predict(Xt[b], ensemble=True, confidence_level=0.8)
+    cobre[b] = (yt[b] >= pis[:, 0, 0]) & (yt[b] <= pis[:, 1, 0])
+    v = semana == s - 5                      # mesmo atraso de maturação
+    if v.any():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            enbpi.update(Xt[v], yt[v], ensemble=True)
+for ini, fim in [(500, 650), (650, 700), (700, 750), (750, 900)]:
+    m = (dia_teste >= ini) & (dia_teste < fim)
+    print(f"EnbPI dias {ini}–{fim}: cobertura {cobre[m].mean():.1%}")
+```
+
+```text
+resíduos guardados: 2231
+EnbPI dias 500–650: cobertura 80.9%
+EnbPI dias 650–700: cobertura 48.6%
+EnbPI dias 700–750: cobertura 58.7%
+EnbPI dias 750–900: cobertura 64.3%
+```
+
+O EnbPI se recupera, mas devagar: a janela guarda 2.231 resíduos e cada semana troca só uns 30. **A velocidade de adaptação do EnbPI é o tamanho da janela.** Se você quer que ele reaja mais rápido, ajuste o modelo numa janela mais curta e recente, ou combine com ACI.
+
+### Pegadinhas verificadas no MAPIE 1.5.0
+
+| Situação | O que acontece | O que fazer |
+| :--- | :--- | :--- |
+| Chamar `update()` | Sempre emite um `UserWarning` dizendo que `confidence_level` e `optimize_beta` não têm mais efeito | Silencie localmente; para ajustar o nível, use `adapt_conformal_inference` |
+| $$\alpha_t$$ chega a 0 | O MAPIE corta $$\alpha_t$$ no intervalo de 0 a 1; com 0, `predict` sem `allow_infinite_bounds=True` levanta `ValueError` ("Number of samples of the score is too low") | Passe `allow_infinite_bounds=True` e trate `inf` como baixa confiança |
+| `update()` com mais linhas que resíduos guardados | `ValueError` | Atualize em lotes menores |
+| `adapt_conformal_inference` com `method="enbpi"` | `AttributeError` | Só existe para `method="aci"` |
+| Ler o nível atual | `ts.current_alpha` é um dicionário com a chave arredondada a 2 casas (`0.2`) | Use `ts.current_alpha[0.2]` |
+
+---
+
+## Quando usar isso no projeto
+
+Em quatro semanas de projeto, você dificilmente vai observar uma quebra de regime **em produção**. O que dá para fazer é deixar o sistema preparado e demonstrá-lo com backtest. A receita, da mais simples para a mais sofisticada:
+
+1. **Retreino periódico com recalibração.** É o método adaptativo mais simples e o primeiro a implementar. Todo mês, retreine com os dados mais recentes e recalibre o split conformal numa janela **recente e já maturada** (por exemplo, posts publicados entre 60 e 30 dias atrás). Registre cada versão no [MLflow](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis).
+2. **ACI como monitor.** Rode um job semanal que pega os rótulos que acabaram de maturar, atualiza $$\alpha_t$$ e a cobertura rolante, e grava os dois num arquivo de estado. A tool de previsão só **lê** esse estado; ela nunca atualiza nada durante uma requisição. Se $$\alpha_t$$ ficar muito abaixo de $$\alpha$$ por várias semanas, é alarme de drift: hora de retreinar, não de continuar alargando.
+3. **Avalie com atraso.** Qualquer número de cobertura adaptativa que você reportar precisa simular os 30 dias de maturação. Sem isso, o resultado é otimista, como a etapa 2 mostrou.
+4. **Comunique.** Intervalo alargado pelo ACI ou infinito precisa aparecer na resposta do agente com a mesma franqueza de qualquer outro [sinal de baixa confiança](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca).
+
+---
+
+## No projeto Galaxies
+
+Uma boa notícia para a decisão da Galaxies: uma mudança de **nível** que atinge todos os posts por igual estraga os intervalos absolutos, mas mexe pouco na **ordem** entre dois criativos do mesmo canal. Uma mudança de **relação** (o gancho passando a valer mais) já afeta a ordenação, e só o retreino resolve.
+
+<NoProjeto>
+
+Suponha que a Lumina pediu a comparação em outubro e que, em setembro, a plataforma passou por uma mudança parecida com a da simulação. Com a calibração de agosto, o agente diria algo como (números ilustrativos):
+
+- Short A: intervalo de 80% entre **1.500 e 3.600** curtidas;
+- Short B: intervalo de 80% entre **2.400 e 5.800** curtidas.
+
+O monitor de ACI, porém, mostra que a cobertura rolante das últimas semanas maturadas caiu para perto de 55% e que $$\alpha_t$$ desceu de 0,20 para 0,05. Com o intervalo recalibrado (cerca de 1,6 vez mais largo em escala log, como na simulação), os números viram algo como **1.150 a 4.700** para A e **1.850 a 7.550** para B. A sobreposição entre os dois aumenta bastante.
+
+A resposta honesta do agente muda de tom: *"B continua à frente de A, mas a confiança caiu. O monitor detectou mudança recente na plataforma e os intervalos foram alargados até o retreino desta semana."* Repare também que, no cenário simulado, a mudança premia ganchos fortes, e B é justamente o Short com gancho forte. O modelo antigo tende a **subestimar** a vantagem de B até ser retreinado, e o ACI não corrige isso: ele só corrige a largura.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Calibrar uma vez e nunca mais olhar a cobertura.** Garantia conformal não é propriedade do modelo, é propriedade da relação entre calibração e futuro. Meça a cobertura rolante.
+2. **Avaliar o ACI com rótulo imediato.** Ignorar os ~30 dias de maturação produz números otimistas e esconde a oscilação que o atraso causa.
+3. **Escolher $$\gamma$$ grande "para reagir rápido".** Com atraso, $$\gamma$$ grande oscila e gera intervalos infinitos. Comece pequeno (0,002 a 0,005) e teste no backtest.
+4. **Ler a garantia do ACI como condicional.** Ela é sobre a taxa média de longo prazo, não sobre cada setor, canal ou semana.
+5. **Usar o ACI para esconder um modelo velho.** Se $$\alpha_t$$ vive perto de zero, o problema é o modelo. Retreine.
+6. **Misturar posts ainda não maturados na calibração.** As curtidas deles ainda estão crescendo, os resíduos ficam enviesados para baixo e o intervalo sai estreito demais.
+:::
+
+<Quiz
+  id="m7-a5"
+  perguntas={[
+    {
+      pergunta: 'O split conformal cobria 80% no backtest e passou a cobrir 54% depois de uma mudança na plataforma. Qual é a explicação mais precisa?',
+      opcoes: [
+        {texto: 'O conjunto de calibração era pequeno demais.', explicacao: 'Um conjunto pequeno deixa a cobertura mais variável, mas não explica uma queda sistemática e persistente de 26 pontos logo depois de uma mudança.'},
+        {texto: 'A garantia depende de calibração e futuro serem permutáveis; o drift quebrou essa hipótese e o quantil ficou velho.', correta: true, explicacao: 'Exato. O quantil q foi medido na distribuição de resíduos antiga. Depois da quebra, os resíduos novos são maiores e a garantia deixa de valer.'},
+        {texto: 'Predição conformal só funciona com modelos lineares.', explicacao: 'Conformal é agnóstico ao modelo: funciona com LightGBM, redes ou qualquer outro preditor.'},
+        {texto: 'O modelo precisava de mais árvores.', explicacao: 'Mais capacidade não resolve uma mudança de distribuição que aconteceu depois do treino.'},
+      ],
+    },
+    {
+      pergunta: 'No ACI com α = 0,2 e γ = 0,01, o nível atual é αₜ = 0,15 e o valor real caiu **fora** do intervalo. Qual é o próximo nível?',
+      opcoes: [
+        {texto: '0,152', explicacao: 'Esse seria o resultado de um acerto: 0,15 + 0,01 × (0,2 − 0) = 0,152.'},
+        {texto: '0,142', correta: true, explicacao: 'Com erro, err = 1: 0,15 + 0,01 × (0,2 − 1) = 0,15 − 0,008 = 0,142. αₜ menor significa um quantil mais alto e um intervalo mais largo.'},
+        {texto: '0,16', explicacao: 'O ACI nunca aumenta αₜ depois de um erro: aumentar αₜ estreitaria o intervalo justamente quando ele falhou.'},
+        {texto: '0,20', explicacao: 'O ACI não volta ao nível nominal a cada passo; ele acumula os ajustes.'},
+      ],
+    },
+    {
+      pergunta: 'Quais afirmações sobre o ACI são verdadeiras? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'A taxa média de erro converge para α em qualquer sequência de dados, sem supor permutabilidade.', correta: true, explicacao: 'É a Proposição 4.1 de Gibbs e Candès: o desvio da média fica abaixo de (max(α₁, 1 − α₁) + γ) / (γT).'},
+        {texto: 'Garante 80% de cobertura dentro de cada setor e de cada semana.', explicacao: 'Não. A garantia é de média de longo prazo, não condicional a setor, canal ou período.'},
+        {texto: 'O intervalo pode ficar infinito quando αₜ chega a zero ou abaixo.', correta: true, explicacao: 'Correto. É o método dizendo que não consegue garantir nada com os resíduos disponíveis. O agente deve tratar isso como baixa confiança.'},
+        {texto: 'Com rótulos que chegam 30 dias depois, o mesmo γ funciona tão bem quanto com rótulo imediato.', explicacao: 'Falso. A etapa 3 mostra que o atraso faz o γ = 0,02 oscilar entre 53% e 86%, com 10,7% de intervalos infinitos. O próprio artigo lista respostas atrasadas como problema em aberto.'},
+      ],
+    },
+    {
+      pergunta: 'No seu loop com `TimeSeriesRegressor(method="aci")`, o `predict` começou a falhar com `ValueError: Number of samples of the score is too low`. O que aconteceu?',
+      opcoes: [
+        {texto: 'O `update()` apagou todos os resíduos.', explicacao: 'O `update()` substitui os resíduos mais antigos pelos novos e mantém o tamanho da janela; ele não apaga a janela.'},
+        {texto: 'Depois de muitos erros, o αₜ foi cortado em 0 e o intervalo pedido passou a ser infinito; falta `allow_infinite_bounds=True`.', correta: true, explicacao: 'Exato. O MAPIE corta αₜ entre 0 e 1. Com αₜ = 0, só é possível devolver um intervalo infinito, e isso exige `allow_infinite_bounds=True`.'},
+        {texto: 'O `confidence_level` precisa ser passado em porcentagem (80, e não 0,8).', explicacao: 'O MAPIE espera um valor entre 0 e 1.'},
+        {texto: 'O modelo com `cv="prefit"` precisa ser retreinado a cada semana.', explicacao: 'Com `prefit`, o MAPIE não retreina o modelo; o erro não tem relação com isso.'},
+      ],
+    },
+    {
+      pergunta: 'Seu monitor mostra que, nas últimas 8 semanas maturadas, a cobertura rolante do intervalo de 80% ficou em 60% e o αₜ do ACI caiu de 0,20 para 0,05. Qual é a melhor ação?',
+      opcoes: [
+        {texto: 'Nenhuma: o ACI já está compensando e a média de longo prazo vai convergir.', explicacao: 'O ACI compensa a largura, mas não o viés do modelo. αₜ perto de zero por semanas é sintoma de modelo desatualizado.'},
+        {texto: 'Subir γ para 0,5 para o ACI reagir mais rápido.', explicacao: 'Com atraso de 30 dias, γ grande faz o intervalo oscilar e gera intervalos infinitos.'},
+        {texto: 'Tratar como alarme de drift: retreinar com dados recentes, recalibrar numa janela recente e maturada e avisar no agente que a confiança caiu até lá.', correta: true, explicacao: 'Exato. O ACI é um bom detector e um paliativo; a correção de verdade é retreino mais recalibração, com comunicação honesta no meio tempo.'},
+        {texto: 'Trocar o nível nominal para 95% para ganhar folga.', explicacao: 'Isso só troca um número nominal por outro que também não será cumprido; não resolve a mudança de distribuição.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: teste de estresse de cobertura na sua base]
+1. Faça uma validação [walk-forward](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal) na sua base: treine até o mês $$m$$, calibre o split conformal no mês seguinte (só com posts maturados) e gere previsões para **todos** os meses depois disso, sem retreinar.
+2. Calcule a cobertura do intervalo de 80% **por mês de publicação**. Ela fica estável ou escorrega com o tempo?
+3. Rode a função `aci_com_atraso` da etapa 3 com $$\gamma$$ em 0,002, 0,005 e 0,02 e compare a cobertura mensal e a fração de intervalos infinitos.
+4. Escolha um $$\gamma$$ e escreva, em duas linhas no README, a regra de alarme do seu monitor (por exemplo: "cobertura rolante abaixo de X% por Y semanas, ou $$\alpha_t$$ abaixo de Z").
+:::
+
+<details>
+<summary>Ver uma solução de referência</summary>
+
+Supondo um DataFrame `df` com uma linha por post de teste (colunas `published_at`, `y` e `pred`), os resíduos absolutos da calibração em `res_cal` e a função `aci_com_atraso` da etapa 3:
+
+```python
+import pandas as pd
+
+# df: uma linha por post de teste (published_at, y real, pred do modelo)
+# res_cal: resíduos absolutos da janela de calibração, ANTERIOR ao teste
+alpha = 0.2
+k = int(np.ceil((len(res_cal) + 1) * (1 - alpha)))
+q = np.sort(res_cal)[k - 1]
+df = df.sort_values("published_at").reset_index(drop=True)
+dias = (df["published_at"] - df["published_at"].min()).dt.days.to_numpy()
+df["split"] = (df["y"] - df["pred"]).abs() <= q
+for g in (0.002, 0.005, 0.02):
+    cobre, meia = aci_com_atraso(dias, df["pred"].to_numpy(), df["y"].to_numpy(),
+                                 res_cal, gamma=g, atraso=30)
+    df[f"aci_{g}"], df[f"inf_{g}"] = cobre, np.isinf(meia)
+mes = df["published_at"].dt.to_period("M")
+print(df.groupby(mes)[["split", "aci_0.002", "aci_0.005", "aci_0.02"]].mean().round(2))
+print(df[["inf_0.002", "inf_0.005", "inf_0.02"]].mean().round(3))
+```
+
+Nos dados simulados desta aula (com datas a partir de 01/01/2024 e a quebra em out/2025), o split fica perto de 0,80 até a quebra e depois entre 0,46 e 0,65; $$\gamma = 0{,}002$$ cai a 0,48 em novembro e depois fica entre 0,69 e 0,88, sem intervalos infinitos; $$\gamma = 0{,}02$$ oscila de 0,51 a 0,96, com 8,4% de intervalos infinitos.
+
+**O que esperar na sua base:**
+
+- Cobertura estável em todos os meses é evidência de que seu período não teve drift forte, e o ACI vai se comportar quase igual ao split. Reporte assim mesmo.
+- Se ela escorregar, descarte primeiro a **maturação** (posts recentes com curtidas ainda crescendo) antes de concluir que é drift.
+- Uma regra de alarme razoável para começar: cobertura rolante de 8 semanas abaixo de 70% para um intervalo de 80%, ou $$\alpha_t$$ abaixo de metade de $$\alpha$$. Ajuste com o seu backtest.
+
+</details>
+
+---
+
+## Resumo
+
+- A garantia do split conformal depende de **permutabilidade** entre calibração e futuro. Com **drift**, a cobertura real cai sem nenhum aviso (80% para 54% na simulação).
+- O **ACI** ajusta o nível online com $$\alpha_{t+1} = \alpha_t + \gamma(\alpha - \text{err}_t)$$ e garante a taxa de erro média de longo prazo para qualquer sequência, mas não cobertura condicional.
+- O passo **$$\gamma$$** troca velocidade por estabilidade. Com o **atraso de maturação** de ~30 dias, $$\gamma$$ grande oscila e gera intervalos infinitos.
+- No MAPIE 1.5.0, o **`TimeSeriesRegressor`** faz ACI (`adapt_conformal_inference`) e EnbPI (`BlockBootstrap` + `update`), com a API antiga e pegadinhas conhecidas.
+- No projeto, a base é **retreino periódico com recalibração**; o ACI entra como monitor e alarme de drift, e intervalos alargados são comunicados como baixa confiança.
+
+## Referências
+
+- Gibbs e Candès. [*Adaptive Conformal Inference Under Distribution Shift*](https://proceedings.neurips.cc/paper/2021/file/0d441de75945e5acbc865406fc9a2559-Paper.pdf). NeurIPS, 2021. Versão no arXiv: [2106.00170](https://arxiv.org/abs/2106.00170).
+- Xu e Xie. [*Conformal prediction interval for dynamic time-series*](https://arxiv.org/abs/2010.09107). ICML, 2021. O arXiv traz a versão ampliada, *Conformal prediction for time series*, que apresenta o EnbPI.
+- Zaffran, Féron, Goude, Josse e Dieuleveut. [*Adaptive Conformal Predictions for Time Series*](https://arxiv.org/abs/2202.07282). arXiv, 2022. Analisa o efeito de γ no ACI e propõe o AgACI, que agrega vários γ.
+- Barber, Candès, Ramdas e Tibshirani. [*Conformal prediction beyond exchangeability*](https://arxiv.org/abs/2202.13415). arXiv, 2022. Quantis ponderados para dar mais peso aos dados recentes.
+- [Documentação do MAPIE](https://mapie.readthedocs.io/en/stable/).
+
+**Próxima aula:** [Autoavaliação do projeto](/projetos/galaxies/autoavaliacao) — use o checklist final para conferir se o seu agente entrega número, intervalo, explicação e ranking com a honestidade que a trilha pediu.

@@ -1,0 +1,766 @@
+---
+sidebar_position: 3
+sidebar_label: 'As cinco tools do agente'
+title: 'As cinco tools do agente'
+description: 'O desenho de cada tool do agente preditivo: nome, docstring, contrato de entrada e saída, erros legíveis, idempotência, cache e limites, e como expor só o que o LLM deve ver.'
+tags: [ml-preditivo, galaxies, agente, tools]
+---
+
+# As Cinco Tools do Agente: Contratos, Erros e Limites
+
+<LessonMeta
+  tempo="60 min"
+  semana={3}
+  etapa="agente"
+  objetivos={[
+    'Especificar cada tool com nome, docstring, contrato de entrada e saída, erros, idempotência e custo',
+    'Implementar as cinco tools (extrair, histórico e comparáveis, prever, explicar, ordenar) como funções puras testáveis',
+    'Escrever erros que um LLM consegue ler e corrigir, e limites (timeout, número de chamadas) que protegem o agente',
+    'Expor ao LLM apenas tools de alto nível com @tool e args_schema Pydantic',
+  ]}
+  prerequisitos={[
+    {label: 'LangGraph em 2026', to: '/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/langgraph-em-2026'},
+    {label: 'Sinal de baixa confiança', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca'},
+    {label: 'Da explicação à narrativa', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa'},
+  ]}
+/>
+
+Uma tool é uma API com um leitor peculiar: um LLM que nunca abre o seu README. Tudo o que ele sabe sobre a tool está no nome, na *docstring* e no *schema* dos argumentos. Se a docstring diz "prevê o desempenho", ele vai chamá-la para perguntas sobre desempenho de campanhas pagas. Se o erro diz `KeyError: 'UC_x'`, ele vai inventar outro `channel_id` e tentar de novo.
+
+A tool também tem um segundo leitor, mais exigente: você, às 23h da véspera da entrega, tentando descobrir por que a previsão de um criativo mudou entre duas execuções. Para esse leitor, o que importa é outra lista: a tool é **idempotente**? Tem **cache**? Quanto **custa**? O que acontece quando o VLM demora três minutos?
+
+Esta aula implementa as cinco tools da arquitetura do briefing, uma de cada vez, respondendo às duas listas. No fim, a função `prever_criativo` ganha a versão definitiva, e o esqueleto da [aula 6.1](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/o-llm-orquestra-o-modelo-preve) é aposentado.
+
+:::info[A ideia central]
+Cada tool é uma **função pura com contrato Pydantic**, e o desenho dela responde a sete perguntas: nome, docstring, entrada, saída, erros, idempotência e cache, custo e limites. As cinco tools são **internas**: quem as encadeia é o grafo. O LLM enxerga só **duas tools de alto nível** (`prever_criativo` e `comparar_criativos`), cujos argumentos são o próprio pedido, e nunca as *features*.
+:::
+
+---
+
+## As sete perguntas de cada tool
+
+<Sketch name="m6/cinco-tools" alt="Tabela desenhada com cinco colunas, uma por tool. 1 extrair_atributos: vídeo ou imagem para Atributos; cache por hash do conteúdo, timeout, stub nos testes; lenta e cara (VLM + Whisper). 2 historico_e_comparaveis: pedido mais embedding para Contexto; só posts antes da data, canal fora da base dá erro claro; milissegundos com FAISS em memória. 3 prever: features para Previsao com q10, q50 e q90; pura e idempotente, única fonte do número; milissegundos com o GBM carregado uma vez. 4 explicar: Previsao para drivers SHAP e texto; LLM opcional só reescreve, números conferidos; milissegundos sem LLM, segundos com LLM. 5 ordenar_criativos: N respostas para ranking e P(A maior que B); pura, aproximação normal no log; microssegundos. Embaixo, uma caixa roxa: o LLM do agente enxerga só duas tools de alto nível, prever_criativo e comparar_criativos, que embrulham as cinco. Nota: se o LLM pudesse chamar prever passando features, ele poderia inventar um gancho igual a 10." caption="Cinco tools internas, duas portas para o LLM." />
+
+| Pergunta | Por que importa | Onde aparece no código |
+| :--- | :--- | :--- |
+| **Nome** | O LLM escolhe pela palavra. `prever_criativo` é melhor que `run_model` | `@tool("prever_criativo")` |
+| **Docstring** | É o *prompt* da tool: quando usar e o que ela devolve | primeira string da função |
+| **Entrada** | Um *schema* estrito recusa na porta o que causaria erro silencioso | `args_schema=PredictionRequest` |
+| **Saída** | Tipada, para o próximo passo e para o teste de contrato | `Atributos`, `Contexto`, `Previsao`... |
+| **Erros** | Mensagem que diz o que fazer, não o que quebrou | `ToolException("Reenvie com...")` |
+| **Idempotência e cache** | Mesma entrada, mesma saída; o caro é feito uma vez | `lru_cache`, cache por *hash* |
+| **Custo e limites** | Tempo e dinheiro por chamada, e o que acontece quando estoura | *timeout*, limite de chamadas |
+
+---
+
+## Tool 1: `extrair_atributos`
+
+A extração é a tool cara: um VLM respondendo uma rubrica e o Whisper transcrevendo o áudio, como no [módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado). Três decisões de desenho:
+
+1. **O extrator é injetado.** A tool recebe uma função `extrator(criativo) -> dict`. Em produção, é o pipeline do módulo 4; nesta aula, um `extrator_demo` que conhece os criativos do fio condutor; nos testes, um *stub* que devolve atributos fixos.
+2. **Cache pelo conteúdo, não pelo nome.** A chave é o SHA-256 do arquivo: o mesmo vídeo renomeado não é reprocessado, e um vídeo reeditado com o mesmo nome é. Isso torna a tool **idempotente** do ponto de vista de quem chama.
+3. **Timeout com mensagem útil.** Se a extração passar do limite, a tool devolve um erro que sugere o que fazer.
+
+```python
+# galaxies_tool/tools.py — parte 1: Tool 1, extrair_atributos (cache + timeout)
+import hashlib
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as TempoEsgotado
+from functools import lru_cache
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import pandas as pd
+from langchain_core.tools import ToolException
+from scipy.stats import norm
+
+from galaxies_tool.comparaveis import IndiceComparaveis
+from galaxies_tool.modelo import (DIR_ARTEFATOS, carregar_modelo, features_de_tempo_e_legenda,
+                                  features_do_canal, historico_recente, prever_quantis)
+from galaxies_tool.schemas import (Atributos, Comparable, ConfidenceFlag, Contexto, Driver,
+                                   Explicacao, Fator, Motivo, PredictionRequest,
+                                   PredictionResponse, Previsao, ResultadoExplicar)
+from galaxies_tool.sintetico import ATRIBUTOS, TZ, embedding_sintetico
+
+Extrator = Callable[[str], dict]  # criativo -> atributos + "embedding" (pipeline do módulo 4)
+
+# O que o pipeline do módulo 4 devolveria para os criativos do fio condutor.
+CRIATIVOS_DEMO = {  # setor, duracao_s, gancho, rosto, texto_na_tela, energia_musica
+    "lumina_a.mp4": ("beleza", 55, 3, 1, 0, 3),
+    "lumina_b.mp4": ("beleza", 22, 8, 1, 1, 7),
+    "garagem22_pov.mp4": ("automotivo", 34, 7, 0, 1, 7),
+    "garagem22_interior.mp4": ("automotivo", 41, 4, 0, 0, 3),
+}
+
+
+def extrator_demo(criativo: str) -> dict:
+    """Substitua pelo pipeline real do módulo 4 (VLM + Whisper + detectores)."""
+    nome = Path(criativo.split("?")[0]).name
+    if nome not in CRIATIVOS_DEMO:
+        raise ToolException(f"Não há atributos para '{nome}'. Envie um dos criativos de demo "
+                            "ou descreva o criativo em texto.")
+    setor, *valores = CRIATIVOS_DEMO[nome]
+    a = dict(zip(ATRIBUTOS, valores))
+    return a | {"embedding": embedding_sintetico(setor, **a, semente=nome)}
+```
+
+```python
+# galaxies_tool/tools.py — parte 1b: cache por conteúdo, timeout e o caminho do texto
+_CACHE: dict[str, dict] = {}
+_POOL = ThreadPoolExecutor(max_workers=2)
+
+
+def _chave(criativo: str) -> str:
+    """Mesmo conteúdo = mesma chave (o arquivo pode mudar de nome e continuar no cache)."""
+    p = Path(criativo)
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else criativo
+
+
+def extrair_atributos(pedido: PredictionRequest, extrator: Extrator = extrator_demo,
+                      timeout_s: float = 120.0) -> Atributos:
+    chave, fonte = _chave(pedido.creative), "cache"
+    if chave not in _CACHE:
+        try:
+            _CACHE[chave] = _POOL.submit(extrator, pedido.creative).result(timeout=timeout_s)
+        except TempoEsgotado:
+            raise ToolException(f"A extração passou de {timeout_s:.0f} s. Tente de novo em "
+                                "alguns minutos ou envie o criativo descrito em texto.")
+        fonte = "extrator"
+    a = _CACHE[chave]
+    return Atributos(tipo=pedido.tipo_criativo(), fonte=fonte, embedding=a["embedding"],
+                     **{k: a.get(k) for k in ATRIBUTOS})
+
+
+def atributos_de_texto(pedido: PredictionRequest) -> Atributos:
+    """Criativo só em texto: sem VLM. Os atributos visuais ficam ausentes (None)."""
+    emb = embedding_sintetico(pedido.sector, semente=pedido.creative)  # use um encoder de texto
+    return Atributos(tipo="texto", fonte="texto", embedding=emb)
+```
+
+O *timeout* com `ThreadPoolExecutor` tem um limite honesto: o Python não consegue matar uma *thread*, então a extração que estourou continua rodando em segundo plano até terminar. O que o *timeout* garante é que **quem chamou** não fica esperando. Para extrações longas em produção, a solução robusta é uma fila (a tool devolve "em processamento" e um identificador), mas isso foge do escopo do projeto.
+
+Repare que um criativo em texto nem passa por aqui: o grafo desvia para `atributos_de_texto`, que só calcula um *embedding* e deixa os atributos visuais como `None`. O LightGBM sabe lidar com valores ausentes, e o `confidence_flag` registra o motivo `extracao_falhou`.
+
+---
+
+## Tool 2: `historico_e_comparaveis`
+
+A segunda tool monta o contexto: a mediana recente do canal, quantos posts ele tem antes da data e os Shorts parecidos que vieram antes.
+
+```python
+# galaxies_tool/tools.py — parte 2: Tool 2, historico_e_comparaveis
+@lru_cache(maxsize=1)
+def _base_e_indice(origem: str = DIR_ARTEFATOS) -> tuple[pd.DataFrame, IndiceComparaveis]:
+    base = pd.read_parquet(Path(origem) / "base.parquet")
+    return base, IndiceComparaveis(base)
+
+
+def historico_e_comparaveis(pedido: PredictionRequest, atributos: Atributos,
+                            k_evidencia: int = 5, k_feature: int = 10) -> Contexto:
+    base, indice = _base_e_indice()
+    if pedido.channel_stats is not None:
+        inscritos, likes = pedido.channel_stats.subscribers, pedido.channel_stats.recent_likes
+        anteriores = len(likes)  # só sabemos o que o chamador enviou
+    else:
+        posts = base[base["channel_id"] == pedido.channel_id]
+        if posts.empty:
+            raise ToolException(f"O canal '{pedido.channel_id}' não está na base. Reenvie com "
+                                "channel_stats (inscritos + curtidas dos Shorts recentes).")
+        inscritos = int(posts["channel_stats_at_collection"].iloc[-1]["subscribers"])
+        likes = historico_recente(posts, pedido.planned_datetime).tolist()
+        anteriores = int((posts["published_at"] < pd.Timestamp(pedido.planned_datetime)).sum())
+        if not likes:
+            raise ToolException("O canal não tem posts anteriores à data planejada.")
+    viz = indice.buscar(atributos.embedding, pedido.sector, pedido.planned_datetime, k=k_feature)
+    comparaveis = [Comparable(post_id=v.post_id, channel_id=v.channel_id,
+                              published_at=v.published_at.to_pydatetime(), titulo=v.caption[:80],
+                              curtidas=int(v.metric_target),
+                              relativo_canal=round(float(np.exp(v.rel)), 2),
+                              similaridade=round(float(v.similarity), 3))
+                   for v in viz.head(k_evidencia).itertuples()]
+    return Contexto(subscribers=inscritos, mediana_curtidas=float(np.median(likes)),
+                    n_posts_canal=len(likes), posts_anteriores=anteriores,
+                    comparables=comparaveis,
+                    rel_vizinhos=float(viz["rel"].median()) if len(viz) else None,
+                    sim_vizinho=float(viz["similarity"].max()) if len(viz) else None)
+```
+
+Dois cuidados aparecem no código. O primeiro é que **tudo é filtrado pela data planejada**: o histórico usa só posts anteriores, e o índice de comparáveis também. O segundo é o erro de canal desconhecido. Em vez de `KeyError`, a mensagem diz ao LLM exatamente como reenviar o pedido (`channel_stats` com inscritos e curtidas recentes). A busca de comparáveis tem uma aula só para ela, a [próxima](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/comparaveis).
+
+---
+
+## Tool 3: `prever`
+
+Esta é a única tool de onde sai o número. Ela monta as *features* com **as mesmas funções usadas no treino** (`features_do_canal` e `features_de_tempo_e_legenda`, de `modelo.py`), chama o modelo quantílico e calcula o `confidence_flag` com as seis regras da [aula 5.4](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca).
+
+```python
+# galaxies_tool/tools.py — parte 3: Tool 3, prever (GBM + intervalo + confidence_flag)
+def montar_features(pedido: PredictionRequest, atributos: Atributos,
+                    contexto: Contexto) -> dict[str, float | None]:
+    f = features_do_canal(contexto.subscribers, contexto.mediana_curtidas, contexto.n_posts_canal)
+    f |= features_de_tempo_e_legenda(pedido.planned_datetime, pedido.caption, pedido.sector)
+    f |= {k: (None if getattr(atributos, k) is None else float(getattr(atributos, k)))
+          for k in ATRIBUTOS}
+    return f | {"rel_vizinhos": contexto.rel_vizinhos}
+
+
+def br(x: float, casas: int = 1) -> str:
+    return f"{x:.{casas}f}".replace(".", ",")
+
+
+def sinal_de_confianca(q_log, pedido: PredictionRequest, atributos: Atributos,
+                       contexto: Contexto, L: dict) -> ConfidenceFlag:
+    """As seis regras da aula 5.4; cada motivo tem um código estável e um texto."""
+    motivos = []
+    m = lambda codigo, texto: motivos.append(Motivo(codigo=codigo, texto=texto))
+    largura = float(q_log[2] - q_log[0])
+    if largura > L["largura_log"]:
+        m("intervalo_largo", f"o limite de cima é {br(np.exp(largura))} vezes o de baixo "
+                             f"(em 80% dos casos, fica abaixo de {br(np.exp(L['largura_log']))})")
+    if contexto.posts_anteriores < L["min_posts"]:
+        m("canal_novo", f"o canal tem só {contexto.posts_anteriores} posts anteriores")
+    if pedido.sector not in L["setores"]:
+        m("setor_desconhecido", f"o setor '{pedido.sector}' não aparece nos dados de treino")
+    if atributos.tipo == "texto" or any(getattr(atributos, k) is None for k in ATRIBUTOS):
+        m("extracao_falhou", "o vídeo não foi analisado; a previsão usa só canal e texto")
+    elif (contexto.sim_vizinho or 0.0) < L.get("sim_min", 0.0):
+        m("fora_da_distribuicao", "o criativo é diferente de tudo que o modelo viu")
+    dias = (pd.Timestamp(pedido.planned_datetime) - pd.Timestamp(L["ultima_data"])).days
+    if dias > L["max_dias"] or dias < -L["max_dias_passado"]:
+        m("data_fora_do_periodo", f"a publicação está a {abs(dias)} dias do fim dos dados")
+    return ConfidenceFlag(baixa_confianca=bool(motivos), motivos=motivos)
+
+
+def prever(pedido: PredictionRequest, atributos: Atributos, contexto: Contexto) -> Previsao:
+    """Tool 3: o ÚNICO lugar de onde sai o número."""
+    bundle = carregar_modelo()
+    feats = montar_features(pedido, atributos, contexto)
+    q_log = prever_quantis(bundle, [feats])[0]
+    q10, q50, q90 = (float(np.expm1(feats["log_mediana_canal"] + q)) for q in q_log)
+    flag = sinal_de_confianca(q_log, pedido, atributos, contexto, bundle.limiares)
+    return Previsao(q10=q10, q50=q50, q90=q90, features=feats, confidence_flag=flag,
+                    model_version=bundle.versao)
+```
+
+Os limiares não são números mágicos no código: vêm de `bundle.limiares`, calculados no treino. A largura máxima do intervalo é o percentil 80 das larguras na janela de calibração, e a similaridade mínima com o vizinho mais próximo é o percentil 1 da base (a aula 5.4 usa a distância; aqui, com vetores normalizados, a similaridade de cosseno faz o mesmo papel). Quando você retreina, os limiares mudam junto e ficam registrados com a versão do modelo.
+
+`prever` é **pura e idempotente**: sem rede, sem LLM, sem aleatoriedade. Duas chamadas com o mesmo pedido devolvem o mesmo número, o que é a base do teste de invariância da [aula 6.6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente).
+
+---
+
+## Tool 4: `explicar`
+
+A explicação tem três camadas, todas vindas do módulo 5: o SHAP da [aula 5.6](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica) vira `top_drivers`; os `top_drivers` e a previsão viram um *payload* fechado; e o *payload* vira o objeto `explanation` (`resumo`, `fatores`, `ressalvas`) do explicador da [aula 5.7](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa).
+
+```python
+# galaxies_tool/tools.py — parte 4: Tool 4, explicar (SHAP -> top_drivers -> payload)
+# contexto: o marketing não muda o canal nem os vizinhos, e eles se cancelam entre A e B
+CONTEXTO = {"log_inscritos", "log_mediana_canal", "n_posts_canal", "setor_cod", "rel_vizinhos"}
+
+
+@lru_cache(maxsize=4)
+def _explainer(versao: str):
+    import shap
+    return shap.TreeExplainer(carregar_modelo().modelos["q50"])  # explica a mediana
+
+
+def top_drivers(shap_row, feature_names, k=5, valores=None, min_abs=0.01):
+    """As k features que mais mexeram na previsão (escala log), no formato da aula 5.6."""
+    shap_row = np.asarray(shap_row, dtype=float)
+    saida = []
+    for i in np.argsort(-np.abs(shap_row))[:k]:
+        c = float(shap_row[i])
+        if abs(c) < min_abs:  # ignora contribuições desprezíveis
+            continue
+        v = None if valores is None else valores[i]
+        saida.append({"feature": feature_names[i], "valor": v,
+                      "contribuicao_log": round(c, 3), "multiplicador": round(float(np.exp(c)), 2),
+                      "direcao": "aumenta" if c > 0 else "reduz"})
+    return saida
+
+
+def montar_payload(pedido, previsao: Previsao, drivers: list[dict], contexto: Contexto,
+                   comparacao: dict | None = None) -> dict:
+    """Tudo o que o explicador pode citar, e nada além disso (aula 5.7)."""
+    local = pd.Timestamp(pedido.planned_datetime).tz_convert(TZ)
+    return {"criativo": {"creative": pedido.creative, "setor": pedido.sector,
+                         "publicacao": f"{local:%d/%m} às {local.hour}h"},
+            "predicted_metric": round(previsao.q50), "interval_low": round(previsao.q10),
+            "interval_high": round(previsao.q90), "nivel_intervalo": 0.8,
+            "mediana_canal_90d": round(contexto.mediana_curtidas),
+            "relative_to_channel": round(previsao.q50 / contexto.mediana_curtidas, 2),
+            "top_drivers": drivers,
+            "comparaveis": [c.model_dump(include={"titulo", "curtidas", "relativo_canal"})
+                            for c in contexto.comparables[:3]],
+            "confidence_flag": previsao.confidence_flag.model_dump(), "comparacao": comparacao}
+```
+
+As *features* de contexto (inscritos, nível do canal, setor e o desempenho dos vizinhos) ficam fora do ranking de fatores. O marketing não consegue mudá-las, e, entre dois Shorts do mesmo canal, elas se cancelam. A aula 5.6 chega ao mesmo resultado por outro caminho, usando como *background* os posts do próprio canal.
+
+A explicação sai primeiro **sem LLM**, montada a partir do *payload*. Se um `explicador` for passado, o subagente tenta escrever uma versão melhor; um validador determinístico confere números e fatores; se reprovar duas vezes, a tool **falha fechada** e mantém o texto sem LLM, que é sempre fiel.
+
+```python
+# galaxies_tool/tools.py — parte 5c: explicar = SHAP + texto de modelo + subagente opcional
+REGRAS = """Você explica previsões de performance de YouTube Shorts para um time de marketing.
+Use SOMENTE fatos e números do JSON; pode converter multiplicador em porcentagem.
+Cada fator precisa ser uma feature de top_drivers, com o nome exato e na mesma ordem.
+Sempre cite o intervalo. Se confidence_flag.baixa_confianca for true, a primeira ressalva
+começa com "Baixa confiança:". Os fatores são associações, não causas."""
+
+
+def explicar(pedido: PredictionRequest, previsao: Previsao, contexto: Contexto,
+             explicador=None, comparacao: dict | None = None, k: int = 5) -> ResultadoExplicar:
+    """explicador: Runnable que devolve Explicacao, por exemplo
+    init_chat_model("google_genai:gemini-3.5-flash-lite").with_structured_output(Explicacao)."""
+    bundle = carregar_modelo()
+    X = pd.DataFrame([previsao.features]).reindex(columns=bundle.features).astype(float)
+    sv = _explainer(bundle.versao).shap_values(X)[0]
+    idx = [i for i, f in enumerate(bundle.features) if f not in CONTEXTO]
+    drivers = top_drivers(sv[idx], [bundle.features[i] for i in idx], k=k,
+                          valores=[previsao.features.get(bundle.features[i]) for i in idx])
+    payload = montar_payload(pedido, previsao, drivers, contexto, comparacao)
+    explicacao = explicacao_de_modelo(payload)
+    if explicador is not None:  # subagente: 1 tentativa + 1 correção; se falhar, fica o modelo
+        msgs = [("system", REGRAS), ("human", json.dumps(payload, ensure_ascii=False))]
+        for _ in range(2):
+            candidata = explicador.invoke(msgs)
+            problemas = validar(candidata.model_dump(), payload)
+            if not problemas:
+                explicacao = candidata
+                break
+            msgs += [("ai", candidata.model_dump_json()),
+                     ("human", "Corrija e responda de novo: " + "; ".join(problemas))]
+    return ResultadoExplicar(top_drivers=[Driver(**d) for d in drivers], explanation=explicacao)
+```
+
+<details>
+<summary>Código da explicação "de modelo" e do validador (porte direto da aula 5.7)</summary>
+
+```python
+# galaxies_tool/tools.py — parte 5: a explicação "de modelo", montada sem LLM
+NOMES = {"gancho": "gancho com nota {v:.0f}", "energia_musica": "música com energia {v:.0f}",
+         "duracao_s": "duração de {v:.0f} s", "hora": "publicação às {v:.0f}h",
+         "dia_semana": "dia da semana", "len_legenda": "legenda de {v:.0f} caracteres",
+         "n_hashtags": "{v:.0f} hashtags"}
+BINARIAS = {"rosto": "rosto na tela", "texto_na_tela": "texto na tela"}
+fmt = lambda x: f"{x:,.0f}".replace(",", ".")  # 4380 -> "4.380"
+
+
+def evidencia(feature: str, valor) -> str:
+    if feature in BINARIAS:
+        return BINARIAS[feature] if valor else "sem " + BINARIAS[feature]
+    return "valor ausente" if valor is None else NOMES.get(feature, feature).format(v=valor)
+
+
+def explicacao_de_modelo(p: dict) -> Explicacao:
+    """Texto montado SEM LLM: sempre fiel ao payload (é o plano B do subagente)."""
+    fatores = [Fator(fator=d["feature"], evidencia=evidencia(d["feature"], d["valor"]),
+                     efeito=f"cerca de {round(abs(d['multiplicador'] - 1) * 100)}% "
+                            f"{'a mais' if d['direcao'] == 'aumenta' else 'a menos'} "
+                            f"(x{br(d['multiplicador'], 2)})") for d in p["top_drivers"]]
+    flag = p["confidence_flag"]
+    ressalvas = (["Baixa confiança: " + "; ".join(m["texto"] for m in flag["motivos"]) + "."]
+                 if flag["baixa_confianca"] else [])
+    ressalvas.append("Os fatores são associações aprendidas pelo modelo, não causas comprovadas.")
+    resumo = (f"Previsão de {fmt(p['predicted_metric'])} curtidas, "
+              f"{br(p['relative_to_channel'], 2)} vez a mediana recente do canal "
+              f"({fmt(p['mediana_canal_90d'])}). Em 80% dos cenários, fica entre "
+              f"{fmt(p['interval_low'])} e {fmt(p['interval_high'])} curtidas.")
+    return Explicacao(resumo=resumo, fatores=fatores, ressalvas=ressalvas)
+```
+
+```python
+# galaxies_tool/tools.py — parte 5b: o validador de fidelidade (porte da aula 5.7)
+NUM = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def _para_float(txt: str) -> float:  # "4.380" -> 4380 ; "1,33" -> 1.33 (pt-BR)
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", txt):
+        return float(txt.replace(".", ""))
+    return float(txt.replace(".", "").replace(",", "."))
+
+
+def numeros_permitidos(payload) -> set[float]:
+    ok: set[float] = set()
+
+    def visitar(x):
+        if isinstance(x, bool):
+            return
+        if isinstance(x, (int, float)):
+            ok.update({round(float(x), 2), round(float(x) * 100)})  # 0.8 -> 80 (%)
+            if 0.5 < x < 3:
+                ok.add(round(abs(x - 1) * 100))  # x1,33 -> 33 (%)
+        elif isinstance(x, str):
+            ok.update(_para_float(n) for n in NUM.findall(x))
+        elif isinstance(x, (list, dict)):
+            for v in (x.values() if isinstance(x, dict) else x):
+                visitar(v)
+
+    visitar(payload)
+    return ok
+
+
+def validar(explicacao: dict, payload: dict) -> list[str]:
+    """Checagem determinística de fidelidade (aula 5.7). Lista vazia = passou."""
+    problemas = []
+    texto = json.dumps(explicacao, ensure_ascii=False)  # sem \u00e7: dígitos falsos
+    citados = {round(_para_float(n), 2) for n in NUM.findall(texto)}
+    problemas += [f"número que não está no payload: {n:g}"
+                  for n in sorted(citados - numeros_permitidos(payload))]
+    drivers = {d["feature"] for d in payload["top_drivers"]}
+    problemas += [f"fator fora de top_drivers: {f['fator']}"
+                  for f in explicacao["fatores"] if f["fator"] not in drivers]
+    problemas += [f"o intervalo não foi citado ({c})" for c in ("interval_low", "interval_high")
+                  if round(float(payload[c]), 2) not in citados]
+    if payload["confidence_flag"]["baixa_confianca"] and not (
+            explicacao["ressalvas"] and explicacao["ressalvas"][0].startswith("Baixa confiança")):
+        problemas.append("confidence_flag ligado, mas a 1ª ressalva não é 'Baixa confiança'")
+    return problemas
+```
+
+Um detalhe que custa uma tarde: o `json.dumps` padrão escapa acentos (`ç` vira `ç`), e o validador encontraria o "00" desse escape como um número inventado. Por isso ele usa `ensure_ascii=False`.
+
+</details>
+
+Com LLM real, o explicador é criado assim (**requer `GOOGLE_API_KEY`** e o pacote `langchain-google-genai`, como na aula 5.7):
+
+```python
+from langchain.chat_models import init_chat_model
+
+from galaxies_tool.schemas import Explicacao
+
+explicador = init_chat_model("google_genai:gemini-3.5-flash-lite", temperature=0) \
+    .with_structured_output(Explicacao)  # requer GOOGLE_API_KEY
+```
+
+---
+
+## Tool 5: `ordenar_criativos`
+
+A pergunta da marca é comparativa: *qual dos dois?*. Com os intervalos de 80% em mãos, dá para estimar a probabilidade de A superar B sem rodar nada novo. Tratando o log das curtidas de cada criativo como aproximadamente normal, a mediana dá o centro $$\mu = \log(1 + q_{0,5})$$ e a largura do intervalo dá o desvio:
+
+$$
+\sigma = \frac{\log(1 + q_{0,9}) - \log(1 + q_{0,1})}{2 \times 1{,}2816}
+\qquad
+P(A > B) \approx \Phi\!\left(\frac{\mu_A - \mu_B}{\sqrt{\sigma_A^2 + \sigma_B^2}}\right)
+$$
+
+em que 1,2816 é o quantil 90% da normal padrão e $$\Phi$$ é a função de distribuição acumulada dela.
+
+```python
+# galaxies_tool/tools.py — parte 6: Tool 5, ordenar_criativos (+ P(A>B)) e a resposta final
+def prob_supera(a: PredictionResponse, b: PredictionResponse) -> float:
+    """P(A > B) aproximada: normal no log, sigma tirado do intervalo de 80%, independência."""
+    z80 = norm.ppf(0.9)  # 1,2816
+    mu = lambda r: np.log1p(r.predicted_metric)
+    sd = lambda r: (np.log1p(r.interval_high) - np.log1p(r.interval_low)) / (2 * z80)
+    return float(norm.cdf((mu(a) - mu(b)) / np.hypot(sd(a), sd(b))))
+
+
+def ordenar_criativos(respostas: dict[str, PredictionResponse]) -> dict:
+    nomes = sorted(respostas, key=lambda n: respostas[n].predicted_metric, reverse=True)
+    return {"ranking": [{"posicao": i + 1, "criativo": n,
+                         "predicted_metric": respostas[n].predicted_metric,
+                         "interval_low": respostas[n].interval_low,
+                         "interval_high": respostas[n].interval_high,
+                         "baixa_confianca": respostas[n].confidence_flag.baixa_confianca}
+                        for i, n in enumerate(nomes)],
+            "prob_supera": {f"{a} > {b}": round(prob_supera(respostas[a], respostas[b]), 3)
+                            for i, a in enumerate(nomes) for b in nomes[i + 1:]}}
+
+
+def montar_resposta(pedido: PredictionRequest, atributos: Atributos, contexto: Contexto,
+                    previsao: Previsao, resultado: ResultadoExplicar) -> PredictionResponse:
+    return PredictionResponse(
+        predicted_metric=round(previsao.q50), interval_low=round(previsao.q10),
+        interval_high=round(previsao.q90), confidence_flag=previsao.confidence_flag,
+        relative_to_channel=round(previsao.q50 / contexto.mediana_curtidas, 2),
+        top_drivers=resultado.top_drivers, explanation=resultado.explanation,
+        comparables=contexto.comparables, features_used=previsao.features,
+        model_version=previsao.model_version)
+```
+
+A fórmula supõe que os erros de A e B são **independentes**, e isso quase nunca é verdade para dois Shorts do mesmo canal: se o canal tiver uma semana ruim, os dois caem juntos. Com erros positivamente correlacionados, a variância da diferença é menor que $$\sigma_A^2 + \sigma_B^2$$, e a probabilidade real fica mais longe de 0,5 do que a calculada. Em outras palavras, a aproximação tende a ser **conservadora**. Registre isso nas limitações do README.
+
+---
+
+## A versão definitiva de `prever_criativo`
+
+Com as cinco tools prontas, `api.py` substitui o esqueleto. A assinatura é a mesma da versão 0; muda o que acontece dentro.
+
+```python
+# galaxies_tool/api.py — a API principal: funções Python puras (MCP e LangGraph só embrulham)
+from galaxies_tool import tools
+from galaxies_tool.schemas import PredictionRequest, PredictionResponse
+
+
+def prever_criativo(pedido: PredictionRequest, *, extrator: tools.Extrator = tools.extrator_demo,
+                    explicador=None) -> PredictionResponse:
+    if pedido.tipo_criativo() == "texto":
+        atributos = tools.atributos_de_texto(pedido)  # pula a extração (VLM + Whisper)
+    else:
+        atributos = tools.extrair_atributos(pedido, extrator)
+    contexto = tools.historico_e_comparaveis(pedido, atributos)
+    previsao = tools.prever(pedido, atributos, contexto)
+    resultado = tools.explicar(pedido, previsao, contexto, explicador)
+    return tools.montar_resposta(pedido, atributos, contexto, previsao, resultado)
+
+
+def comparar_criativos(pedidos: dict[str, PredictionRequest], **kwargs) -> dict:
+    respostas = {nome: prever_criativo(p, **kwargs) for nome, p in pedidos.items()}
+    return tools.ordenar_criativos(respostas) | {
+        "respostas": {n: r.model_dump(mode="json") for n, r in respostas.items()}}
+
+
+def what_if(pedido: PredictionRequest, **mudancas) -> dict:
+    """Re-pontua o MESMO criativo com outro horário ou outra legenda."""
+    variante = PredictionRequest.model_validate(pedido.model_dump() | mudancas)  # revalida
+    antes, depois = prever_criativo(pedido), prever_criativo(variante)
+    return {"mudancas": {k: str(v) for k, v in mudancas.items()},
+            "antes": antes.predicted_metric, "depois": depois.predicted_metric,
+            "razao": round(depois.predicted_metric / antes.predicted_metric, 2)}
+
+
+def aquecer() -> str:
+    """Carrega modelo, base, índice FAISS e SHAP antes da 1ª chamada (servidor e demo)."""
+    versao = tools.carregar_modelo().versao
+    tools._base_e_indice()
+    tools._explainer(versao)
+    return versao
+```
+
+Rodando as tools uma a uma no Short B:
+
+```python
+# rodar_tools.py — as cinco tools, uma a uma, no Short B da Lumina
+from galaxies_tool import tools
+from galaxies_tool.api import comparar_criativos, what_if
+from galaxies_tool.schemas import PredictionRequest
+
+B = PredictionRequest(creative="lumina_b.mp4", sector="beleza", channel_id="UC_lumina_beauty",
+                      caption="1 produto, 20 segundos #antesedepois #maquiagem",
+                      planned_datetime="2026-10-01T19:00:00-03:00")
+atr = tools.extrair_atributos(B)
+print("1.", atr.fonte, atr.model_dump(exclude={"embedding", "tipo", "fonte"}),
+      "| de novo:", tools.extrair_atributos(B).fonte)
+ctx = tools.historico_e_comparaveis(B, atr)
+print("2.", ctx.model_dump(include={"mediana_curtidas", "n_posts_canal", "posts_anteriores"}),
+      f"rel_vizinhos={ctx.rel_vizinhos:.2f} sim_vizinho={ctx.sim_vizinho:.3f}")
+prev = tools.prever(B, atr, ctx)
+print("3.", f"q10={prev.q10:.0f} q50={prev.q50:.0f} q90={prev.q90:.0f}",
+      prev.confidence_flag.model_dump(), prev.model_version)
+res = tools.explicar(B, prev, ctx)
+print("4.", [(d.feature, d.multiplicador) for d in res.top_drivers])
+print("  ", res.explanation.resumo)
+A = PredictionRequest(creative="lumina_a.mp4", sector="beleza", channel_id="UC_lumina_beauty",
+                      caption="Pele natural em 5 passos #maquiagem #tutorial",
+                      planned_datetime="2026-09-29T14:00:00-03:00")
+print("5.", comparar_criativos({"A": A, "B": B})["prob_supera"])
+print("   what-if A às 19h:", what_if(A, planned_datetime="2026-09-29T19:00:00-03:00"))
+```
+
+```text
+1. extrator {'duracao_s': 22.0, 'gancho': 8.0, 'rosto': True, 'texto_na_tela': True, 'energia_musica': 7.0} | de novo: cache
+2. {'mediana_curtidas': 2305.0, 'n_posts_canal': 9, 'posts_anteriores': 47} rel_vizinhos=0.51 sim_vizinho=0.982
+3. q10=1655 q50=4237 q90=9180 {'baixa_confianca': False, 'motivos': []} gbm-quantil-20260927-f9e6dda
+4. [('gancho', 1.17), ('energia_musica', 1.11), ('duracao_s', 1.05), ('hora', 1.05), ('rosto', 1.04)]
+   Previsão de 4.237 curtidas, 1,84 vez a mediana recente do canal (2.305). Em 80% dos cenários, fica entre 1.655 e 9.180 curtidas.
+5. {'B > A': 0.884}
+   what-if A às 19h: {'mudancas': {'planned_datetime': '2026-09-29T19:00:00-03:00'}, 'antes': 1477.0, 'depois': 1518.0, 'razao': 1.03}
+```
+
+A segunda chamada de `extrair_atributos` veio do cache. E um criativo que só existe como texto, num canal pequeno, mostra o `confidence_flag` fazendo o trabalho dele:
+
+```text
+61.0 18.0 160.0
+{"baixa_confianca": true, "motivos": [{"codigo": "intervalo_largo", "texto": "o limite de cima é 8,6 vezes o de baixo (em 80% dos casos, fica abaixo de 6,0)"}, {"codigo": "canal_novo", "texto": "o canal tem só 4 posts anteriores"}, {"codigo": "extracao_falhou", "texto": "o vídeo não foi analisado; a previsão usa só canal e texto"}]}
+Baixa confiança: o limite de cima é 8,6 vezes o de baixo (em 80% dos casos, fica abaixo de 6,0); o canal tem só 4 posts anteriores; o vídeo não foi analisado; a previsão usa só canal e texto.
+```
+
+---
+
+## O que o LLM enxerga
+
+As tools para o LLM ficam em `agente.py` e foram mostradas na [aula 6.2](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/langgraph-em-2026): `@tool("prever_criativo", args_schema=PredictionRequest)` e `@tool("comparar_criativos", args_schema=PedidoComparacao)`. O `args_schema` é o próprio contrato, então o LLM recebe as descrições e as restrições que você escreveu no Pydantic. Convertendo a tool para o formato de *function calling*, é isto que o modelo vê:
+
+```python
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+from galaxies_tool.agente import tool_prever
+
+esquema = convert_to_openai_tool(tool_prever)["function"]
+for nome, campo in esquema["parameters"]["properties"].items():
+    print(f"{nome}: {campo.get('description', '')} {campo.get('enum', '')}")
+print("obrigatórios:", esquema["parameters"]["required"])
+```
+
+```text
+creative: Caminho/URL do vídeo ou imagem, ou texto.
+caption: Legenda planejada.
+planned_datetime: Data e hora planejadas, COM fuso. Ex.: 2026-10-01T19:00:00-03:00.
+channel_id: ID do canal na base.
+channel_stats: Use se o canal não está na base.
+sector:  ['moda', 'beleza', 'automotivo']
+obrigatórios: ['creative', 'planned_datetime', 'sector']
+```
+
+O exemplo de data **com fuso** na descrição não é enfeite: é a instrução que evita o erro de validação mais comum. E o `enum` do setor chega ao LLM como lista fechada.
+
+Três mecanismos transformam falhas em mensagens que o LLM consegue usar:
+
+- **Erro de validação do `args_schema`**: o nó `tools` do `create_agent` devolve uma `ToolMessage` com o erro do Pydantic e *"Please fix the error and try again"* (você viu isso na aula 6.2).
+- **`ToolException` com `handle_tool_error = True`**: a mensagem da exceção vira o conteúdo da `ToolMessage`. Por exemplo, `tool_prever.invoke({... "channel_id": "UC_nao_existe"})` devolve `O canal 'UC_nao_existe' não está na base. Reenvie com channel_stats (inscritos + curtidas dos Shorts recentes).`
+- **Limite de chamadas**: um agente em laço pode chamar a mesma tool dezenas de vezes. O `ToolCallLimitMiddleware` do LangChain 1.4 corta isso:
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import ToolCallLimitMiddleware
+
+from galaxies_tool.agente import SISTEMA, tool_comparar, tool_prever
+
+agente = create_agent("google_genai:gemini-3.5-flash-lite",  # requer GOOGLE_API_KEY
+                      tools=[tool_prever, tool_comparar], system_prompt=SISTEMA,
+                      middleware=[ToolCallLimitMiddleware(run_limit=6)])
+```
+
+Testado com um LLM falso que tenta cinco chamadas e limite de duas: as duas primeiras executam, e as seguintes voltam como `ToolMessage` de erro com o texto `Tool call limit exceeded. Do not make additional tool calls.`, sem derrubar a execução.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Com as tools reais, a comparação da Lumina fica completa. **B: 4.237 curtidas (80%: 1.655 a 9.180), 1,84 vez a mediana do canal. A: 1.477 (80%: 671 a 2.923), 0,64 vez.** P(B > A) = 0,884.
+
+Os `top_drivers` contam a história em termos que o marketing entende. Em B: gancho com nota 8 (x1,17), música com energia 7 (x1,11), duração de 22 s (x1,05), publicação às 19h (x1,05) e rosto na tela (x1,04). Em A, os mesmos fatores aparecem com o sinal trocado: gancho com nota 3 (x0,90) e música com energia 3 (x0,91). A ordem bate com a do caso canônico do módulo 5 (gancho, energia, rosto, texto, horário), mas os multiplicadores do modelo treinado são menores que os do simulador (gancho x1,33). É o mesmo encolhimento que a aula 5.6 observou.
+
+O *what-if* merece cautela. Mover A para as 19h muda a previsão de 1.477 para 1.518 (x1,03), bem menos que o efeito de horário do simulador (x1,13). Quando o modelo aprende um efeito menor que o esperado, o *what-if* herda a estimativa do modelo, e não a verdade. Apresente como "o que o modelo acha", nunca como "o que vai acontecer".
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Tool de "passo interno" exposta ao LLM.** Se `prever(features)` for uma tool do agente, o LLM vai preencher `gancho=9` quando o vídeo não foi analisado. Exponha tools no nível do pedido.
+2. **Erro técnico cru.** `KeyError: 'UC_x'` faz o LLM tentar outro ID inventado. Escreva erros que digam o que reenviar.
+3. **Cache pelo nome do arquivo.** O vídeo reeditado com o mesmo nome devolve atributos velhos. Use o *hash* do conteúdo.
+4. ***Features* montadas de um jeito no treino e de outro na tool.** A hora em UTC num lugar e local no outro já basta para derrubar a previsão. Reaproveite as mesmas funções.
+5. **Deixar o LLM reescrever a explicação sem validador.** Ele vai arredondar, somar porcentagens e citar fatores que não estão no SHAP. Valide e falhe fechado.
+6. **Ler P(A > B) como certeza.** 0,88 significa que, em cerca de 12% dos cenários, A rende mais. Diga isso na resposta.
+:::
+
+<Quiz
+  id="m6-a3"
+  perguntas={[
+    {
+      pergunta: 'O LLM do agente chama `prever_criativo` com um `channel_id` que não está na base. Qual resposta da tool leva mais rápido a uma previsão correta?',
+      opcoes: [
+        {texto: '`KeyError: UC_x`', explicacao: 'O LLM não sabe o que fazer com isso e tende a tentar outro ID inventado.'},
+        {texto: 'Uma previsão usando a mediana global da base.', explicacao: 'Silencia o problema: a resposta parece válida e não é.'},
+        {texto: '"O canal não está na base. Reenvie com channel_stats (inscritos + curtidas dos Shorts recentes)."', correta: true, explicacao: 'Diz o que fazer. O LLM consegue pedir esses dados ao usuário ou reenviar o pedido corrigido.'},
+      ],
+    },
+    {
+      pergunta: 'Por que a chave do cache da extração é o SHA-256 do conteúdo do arquivo, e não o nome?',
+      opcoes: [
+        {texto: 'Porque é mais rápido calcular um hash do que comparar nomes.', explicacao: 'Não é por velocidade: calcular o hash exige ler o arquivo inteiro.'},
+        {texto: 'Porque o mesmo vídeo pode ser renomeado e um vídeo reeditado pode manter o nome; o conteúdo é o que define os atributos.', correta: true, explicacao: 'Exato. Isso torna a tool idempotente em relação ao que importa.'},
+        {texto: 'Porque o MCP exige chaves com hash.', explicacao: 'O MCP não sabe nada sobre o cache interno da sua tool.'},
+      ],
+    },
+    {
+      pergunta: 'A tool 5 calcula P(B > A) = 0,88 supondo erros independentes. A e B são do mesmo canal. O que acontece com a probabilidade real, se os erros dos dois forem positivamente correlacionados?',
+      opcoes: [
+        {texto: 'Fica mais perto de 0,5: a aproximação é otimista.', explicacao: 'É o contrário: a correlação reduz a variância da diferença.'},
+        {texto: 'Fica mais longe de 0,5: a aproximação é conservadora.', correta: true, explicacao: 'Com erros correlacionados, parte da incerteza se cancela na diferença B - A.'},
+        {texto: 'Não muda: a probabilidade só depende das medianas.', explicacao: 'Depende também da variância da diferença, que muda com a correlação.'},
+      ],
+    },
+    {
+      pergunta: 'O subagente de explicação devolve um texto que diz "cerca de 40% a mais por causa da trend do momento". O que a Tool 4 faz?',
+      opcoes: [
+        {texto: 'Publica o texto, porque o LLM conhece tendências.', explicacao: 'O modelo preditivo não usou nenhuma trend; o texto seria infiel ao que determinou o número.'},
+        {texto: 'O validador reprova (número e fator fora do payload), o subagente recebe os problemas e, se falhar de novo, fica a explicação montada sem LLM.', correta: true, explicacao: 'Isso. O LLM escreve, o código confere, e a falha é fechada.'},
+        {texto: 'Descarta a previsão inteira e devolve erro.', explicacao: 'A previsão está correta; só o texto foi reprovado. Não há motivo para perder o número.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: uma tool de what-if para o LLM]
+Exponha `api.what_if` ao agente como uma terceira tool, `simular_mudanca`. Ela recebe o pedido original e, opcionalmente, um novo horário (com fuso) e/ou uma nova legenda, e devolve a razão depois/antes. Escreva a docstring pensando no LLM: quando usar e quando **não** usar. Se nenhuma mudança for informada, a tool deve devolver um erro legível, não uma exceção.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+from langchain_core.tools import ToolException, tool
+from pydantic import AwareDatetime, BaseModel, Field
+
+from galaxies_tool.api import what_if
+from galaxies_tool.schemas import PredictionRequest
+
+
+class PedidoWhatIf(BaseModel):
+    pedido: PredictionRequest
+    novo_horario: AwareDatetime | None = Field(default=None, description="Novo horário, com fuso.")
+    nova_legenda: str | None = Field(default=None, description="Nova legenda.")
+
+
+@tool("simular_mudanca", args_schema=PedidoWhatIf)
+def tool_what_if(pedido, novo_horario=None, nova_legenda=None) -> dict:
+    """Re-pontua o MESMO criativo mudando só o horário e/ou a legenda e devolve a razão
+    depois/antes. Use quando perguntarem "e se eu postar às 19h?" ou "e se mudar a legenda?"."""
+    mudancas = {k: v for k, v in [("planned_datetime", novo_horario), ("caption", nova_legenda)]
+                if v is not None}
+    if not mudancas:
+        raise ToolException("Informe novo_horario ou nova_legenda (ou os dois).")
+    return what_if(PredictionRequest.model_validate(pedido), **mudancas)
+
+
+tool_what_if.handle_tool_error = True
+```
+
+Testando com o Short A:
+
+```text
+>>> tool_what_if.invoke({"pedido": A, "novo_horario": "2026-09-29T19:00:00-03:00"})
+{'mudancas': {'planned_datetime': '2026-09-29 19:00:00-03:00'}, 'antes': 1477.0, 'depois': 1518.0, 'razao': 1.03}
+>>> tool_what_if.invoke({"pedido": A})
+Informe novo_horario ou nova_legenda (ou os dois).
+```
+
+A tool **não** aceita mudar gancho, duração ou música: esses atributos vêm do vídeo, e simular um vídeo que não existe é outra conversa, tratada na [aula de what-if](/aulas/ml-preditivo-e-agentes/ir-alem/what-if).
+
+</details>
+
+---
+
+## Resumo
+
+- Cada tool responde a **sete perguntas**: nome, docstring, entrada, saída, erros, idempotência e cache, custo e limites.
+- **Tool 1** injeta o extrator, faz cache pelo **hash do conteúdo** e tem *timeout*; **Tool 2** filtra tudo pela data planejada; **Tool 3** é a única fonte do número e calcula o **`confidence_flag`** com limiares do treino.
+- **Tool 4** transforma SHAP em **`top_drivers`**, monta um *payload* fechado e só aceita o texto do subagente se o **validador** aprovar; senão, **falha fechada**.
+- **Tool 5** estima **P(A > B)** com uma normal no log; a hipótese de independência torna a estimativa conservadora.
+- O LLM enxerga **duas tools de alto nível** com `args_schema` Pydantic, erros legíveis (`ToolException`) e limite de chamadas (`ToolCallLimitMiddleware`).
+
+## Referências
+
+- LangChain. [Tools: `@tool`, `args_schema` e tratamento de erros](https://docs.langchain.com/oss/python/langchain/tools).
+- LangChain. [Agents e *middleware* (`create_agent`)](https://docs.langchain.com/oss/python/langchain/agents).
+- Anthropic. [*Writing effective tools for agents*](https://www.anthropic.com/engineering/writing-tools-for-agents): nomes, descrições e erros pensados para o modelo.
+- Lundberg et al. [*From local explanations to global understanding with explainable AI for trees*](https://www.nature.com/articles/s42256-019-0138-9). Nature Machine Intelligence, 2020 (TreeSHAP).
+- Python. [`concurrent.futures`](https://docs.python.org/3/library/concurrent.futures.html): `Future.result(timeout=...)`.
+
+**Próxima aula:** [Comparáveis: retrieval de criativos](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/comparaveis): a busca por Shorts parecidos, sem vazamento temporal, como evidência e como *feature*.
