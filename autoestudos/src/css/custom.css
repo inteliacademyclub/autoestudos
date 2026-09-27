@@ -28,6 +28,10 @@
   --ifm-color-primary-lightest: #7a4dff;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
   
+  /* links legíveis no fundo escuro (o roxo da marca fica escuro demais) */
+  --ifm-link-color: #a78bfa;
+  --ifm-link-hover-color: #c4b5fd;
+
   /* Fundos mais pretos no modo escuro */
   --ifm-background-color: #111116;
   --ifm-background-surface-color: #17171d;
@@ -38,6 +42,17 @@
 @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap');
 
 :root {
+  /* Sombra como borda (profundidade sem linha dura) — usada pelos cards e
+     componentes da trilha. */
+  --shadow-border:
+    0px 0px 0px 1px oklch(0 0 0 / 0.06),
+    0px 1px 2px -1px oklch(0 0 0 / 0.06),
+    0px 2px 4px 0px oklch(0 0 0 / 0.04);
+  --shadow-border-hover:
+    0px 0px 0px 1px oklch(0 0 0 / 0.08),
+    0px 1px 2px -1px oklch(0 0 0 / 0.08),
+    0px 2px 4px 0px oklch(0 0 0 / 0.06);
+
   /* Use a modern Google Font */
   --ifm-font-family-base: 'Outfit', system-ui, sans-serif;
   
@@ -48,6 +63,8 @@
 
 [data-theme='dark'] {
   --ifm-menu-color: #a0aec0;
+  --shadow-border: 0 0 0 1px oklch(1 0 0 / 0.08);
+  --shadow-border-hover: 0 0 0 1px oklch(1 0 0 / 0.13);
 }
 
 /* Glassmorphism Navbar */
@@ -89,7 +106,9 @@
 
 /* Smooth Hover Animations for Sidebar */
 .menu__link {
-  transition: all 0.2s ease-in-out;
+  transition-property: transform, background-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
 }
 .menu__link:hover {
   transform: translateX(4px);
@@ -117,6 +136,11 @@
 .markdown h1 {
   color: #3F01FF;
   font-weight: 700;
+}
+
+/* no fundo escuro, o roxo da marca fica com contraste baixo demais */
+[data-theme='dark'] .markdown h1 {
+  color: #9f86ff;
 }
 
 /* Linha decorativa abaixo de h2 */
@@ -193,7 +217,9 @@
 /* ================== TABLE OF CONTENTS ================== */
 
 .table-of-contents__link {
-  transition: all 0.2s ease;
+  transition-property: background-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
   border-radius: 4px;
   padding: 4px 8px;
 }
@@ -214,7 +240,9 @@
 /* ================== BREADCRUMBS ================== */
 
 .breadcrumbs__link {
-  transition: all 0.2s ease;
+  transition-property: background-color, color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
   border-radius: 6px;
   padding: 4px 10px;
 }
@@ -264,12 +292,20 @@
   animation: fadeInUp 0.4s ease-out;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .markdown {
+    animation: none;
+  }
+}
+
 /* ================== PAGINATION (PREV/NEXT) ================== */
 
 .pagination-nav__link {
   border: 1px solid rgba(63, 1, 255, 0.15);
   border-radius: 12px;
-  transition: all 0.25s ease;
+  transition-property: border-color, box-shadow, transform;
+  transition-duration: 200ms;
+  transition-timing-function: ease-out;
 }
 
 .pagination-nav__link:hover {

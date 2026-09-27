@@ -1,0 +1,2 @@
+Excalifont — fonte do Excalidraw (https://github.com/excalidraw/excalidraw), distribuída sob a SIL Open Font License 1.1.
+Arquivos copiados de @excalidraw/excalidraw 0.18.1 (dist/prod/fonts/Excalifont).

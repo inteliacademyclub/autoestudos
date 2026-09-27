@@ -1,0 +1,16 @@
+{
+  "name": "autoestudos-excalidraw",
+  "private": true,
+  "type": "module",
+  "description": "Gera os diagramas Excalidraw (.excalidraw + SVG claro/escuro) usados nas aulas. Não roda no CI: os SVGs são commitados.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@excalidraw/excalidraw": "0.18.1",
+    "esbuild": "^0.25.0",
+    "playwright-core": "1.63.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  }
+}
