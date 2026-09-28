@@ -153,11 +153,7 @@
   padding: 16px 16px 8px;
   margin: 32px 0;
   background: var(--ifm-background-surface-color);
-  box-shadow: var(--shadow-border), inset 0 3px 0 0 rgba(63, 1, 255, 0.55);
-}
-
-[data-theme='dark'] .quiz {
-  box-shadow: var(--shadow-border), inset 0 3px 0 0 rgba(151, 117, 250, 0.7);
+  box-shadow: var(--shadow-border);
 }
 
 .quizHeader {
@@ -537,7 +533,6 @@
 /* ---------- NoProjeto (fio condutor) ---------- */
 
 .projeto {
-  border-inline-start: 5px solid #2f9e44;
   border-radius: 12px;
   background: rgba(47, 158, 68, 0.07);
   padding: 14px 16px;
@@ -546,7 +541,6 @@
 
 [data-theme='dark'] .projeto {
   background: rgba(47, 158, 68, 0.12);
-  border-inline-start-color: #51cf66;
 }
 
 .projetoTitle {

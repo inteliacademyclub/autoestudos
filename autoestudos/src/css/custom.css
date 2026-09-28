@@ -158,9 +158,7 @@
 /* Item ativo com glow sutil */
 .menu__link--active:not(.menu__link--sublist) {
   background: rgba(63, 1, 255, 0.08) !important;
-  border-left: 3px solid #3F01FF;
-  border-radius: 0 8px 8px 0;
-  padding-left: 9px;
+  border-radius: 8px;
 }
 
 [data-theme='dark'] .menu__link--active:not(.menu__link--sublist) {
@@ -206,12 +204,13 @@
   color: #a380ff;
 }
 
-/* Não aplicar estilo inline em blocos de código */
+/* Não aplicar estilo inline em blocos de código, mas manter o respiro
+   interno padrão do tema (sem ele, o código encosta na borda do bloco) */
 .prism-code code {
   background: none !important;
   border: none !important;
   color: inherit !important;
-  padding: 0 !important;
+  padding: var(--ifm-pre-padding) !important;
 }
 
 /* ================== TABLE OF CONTENTS ================== */
@@ -253,17 +252,18 @@
 
 /* ================== ADMONITIONS (CALLOUTS) ================== */
 
+/* Sem faixa lateral: o destaque vem só do fundo tingido. */
 .alert {
-  border-left-width: 5px;
+  --ifm-alert-border-width: 0;
+  --ifm-alert-border-left-width: 0;
+  border: none;
   border-radius: 12px;
-  border-color: #3F01FF !important;
   background-color: rgba(63, 1, 255, 0.05) !important;
   box-shadow: 0 4px 12px rgba(63, 1, 255, 0.08);
 }
 
 [data-theme='dark'] .alert {
   background-color: rgba(63, 1, 255, 0.12) !important;
-  border-color: #7a4dff !important;
   backdrop-filter: blur(8px);
 }
 
