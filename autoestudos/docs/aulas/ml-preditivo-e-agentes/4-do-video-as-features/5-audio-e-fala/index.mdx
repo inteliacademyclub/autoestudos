@@ -1,0 +1,507 @@
+---
+sidebar_position: 5
+sidebar_label: 'Áudio e fala'
+title: 'Áudio e fala'
+description: 'Como transformar a trilha sonora de um Short em colunas: transcrição com faster-whisper, densidade de fala, fala no gancho, energia, ritmo e presença de música.'
+tags: [ml-preditivo, multimodal, audio]
+---
+
+# Áudio e Fala: O Que o Short Diz e Como Ele Soa
+
+<LessonMeta
+  tempo="50 min"
+  semana={2}
+  etapa="multimodal"
+  objetivos={[
+    'Extrair a trilha de áudio de um Short e transcrevê-la localmente com faster-whisper',
+    'Transformar a transcrição em features de fala: idioma, densidade, fala no gancho e cobertura',
+    'Medir energia, ritmo e clareza da batida com librosa e combinar isso com a transcrição',
+    'Decidir entre transcrição local e a API gratuita do Groq, sabendo o custo de cada uma',
+  ]}
+  prerequisitos={[
+    {label: 'Obtendo a mídia', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia'},
+    {label: 'Frames, cortes e sinais de baixo nível', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais'},
+  ]}
+/>
+
+Faça um teste rápido: abra três Shorts de maquiagem, assista com o som desligado e depois assista de novo com som. Em pelo menos um deles a experiência muda de natureza. Sem som, um antes/depois vira uma sequência de fotos; com uma batida marcada, cada corte parece "cair" no tempo certo. Um tutorial com narração vira, sem som, uma pessoa mexendo a boca.
+
+Os dados apontam na mesma direção. No paper *Understanding Virality* (Gupta et al., arXiv:2512.21402), que previu engajamento de 11 mil Shorts educativos, o fator com maior importância SHAP foi **"dinâmica de energia do áudio"**, com 12,4% da importância total. Na ablação do mesmo trabalho, o modelo só com atributos visuais teve Spearman de 0,62; somando os atributos de áudio, subiu para 0,71.
+
+Dois cuidados antes de sair medindo. Primeiro, naquele paper a "energia do áudio" não é um sinal medido: é um agrupamento de **frases que um VLM escreveu** sobre o áudio ("música enérgica", "batida rápida"). Segundo, o split foi aleatório, não temporal, então o número absoluto é otimista. Nesta aula você vai fazer o que o paper não fez: medir diretamente o que dá para medir, com ferramentas locais e gratuitas, e deixar a interpretação para o VLM da [aula 4.7](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado).
+
+:::info[A ideia central]
+O áudio responde duas perguntas diferentes, e cada uma tem sua ferramenta:
+- **O que é dito?** A transcrição com timestamps (faster-whisper) vira idioma, quantidade de fala, velocidade e se há voz no <Termo id="gancho">gancho</Termo>. O texto transcrito também alimenta o bloco de texto.
+- **Como soa?** O sinal bruto (librosa) vira energia, dinâmica, ritmo e presença de batida.
+
+Cada Short sai daqui com cerca de 15 colunas numéricas com prefixo `aud_`, calculadas em segundos e sem nenhuma API paga.
+:::
+
+---
+
+## Duas perguntas, um pipeline
+
+<Sketch name="m4/a5-audio" alt="Pipeline de áudio: o Short em mp4 passa pelo ffmpeg, que gera um WAV mono de 16 kHz. O WAV segue para dois ramos: faster-whisper (VAD, idioma, palavras com tempo), que gera as features de fala, e librosa (RMS, onsets, batida), que gera as features de energia e ritmo. Uma nota embaixo mostra combinações: energia onde não há fala indica música de fundo, e a transcrição comparada ao texto na tela gera o contraste texto/fala. Outra nota avisa que a librosa 1.0 não lê mp4." caption="O WAV é extraído uma vez e alimenta os dois ramos." />
+
+<CardGrid>
+  <ToolCard nome="faster-whisper" versao="1.2.1" licenca="MIT" custo="grátis (local)" papel="Reimplementação do Whisper sobre CTranslate2. Roda em CPU com int8, detecta idioma, filtra silêncio com VAD e dá timestamps por palavra." link="https://github.com/SYSTRAN/faster-whisper" alerta="O modelo é baixado do Hugging Face na primeira execução: tiny tem 76 MB, base 145 MB e small 484 MB." />
+  <ToolCard nome="librosa" versao="1.0.0" licenca="ISC" custo="grátis (local)" papel="Análise de sinal de áudio: RMS, onsets, batida, planura espectral." link="https://librosa.org/doc/latest/" alerta="Na 1.0, librosa.load não abriu .mp4 no nosso teste (LibsndfileError). Extraia o WAV com ffmpeg antes." />
+  <ToolCard nome="Groq Whisper" versao="whisper-large-v3-turbo" licenca="API proprietária" custo="free tier" papel="Transcrição remota rápida, com a mesma saída verbose_json da OpenAI." link="https://console.groq.com/docs/speech-to-text" alerta="Free tier: 20 req/min, 2.000 req/dia, 28.800 s de áudio/dia, arquivos de até 25 MB. Cada requisição é cobrada como no mínimo 10 s." />
+</CardGrid>
+
+---
+
+## Passo 1: extrair o áudio
+
+O Whisper trabalha com áudio mono a 16 kHz. Extrair esse formato uma vez, logo depois do download, economiza decodificação em todos os passos seguintes e deixa um arquivo pequeno (cerca de 32 KB por segundo).
+
+```python
+import subprocess
+from pathlib import Path
+
+
+def extrair_audio(video: Path, sr: int = 16_000) -> Path:
+    """Extrai a trilha de áudio em WAV mono 16 kHz (o formato que o Whisper usa)."""
+    wav = video.with_suffix(".wav")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
+         "-vn",               # descarta o vídeo
+         "-ac", "1",          # mono
+         "-ar", str(sr),      # 16 kHz
+         str(wav)],
+        check=True,
+    )
+    return wav
+
+
+for nome in ["short_a.mp4", "short_b.mp4"]:
+    wav = extrair_audio(Path(nome))
+    print(wav, f"{wav.stat().st_size / 1e6:.2f} MB")
+```
+
+```text
+short_a.wav 0.55 MB
+short_b.wav 0.45 MB
+```
+
+:::tip[Os dois Shorts de teste]
+Para esta aula geramos dois arquivos sintéticos que imitam a Lumina, porque não baixamos vídeos reais do YouTube nos testes. O **short_a** tem 4 s de vinheta suave (o "logo") seguidos de uma narração calma em português, gerada com a voz sintética do macOS (`say -v Luciana`), e 1,5 s de silêncio: 17,2 s no total. O **short_b** tem 14 s de música a 128 BPM (bumbo, chimbal e acorde), sem voz. Troque pelos seus arquivos da [aula 4.2](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia).
+:::
+
+---
+
+## Passo 2: transcrever com faster-whisper
+
+```python
+from faster_whisper import WhisperModel
+
+# "tiny" para testar; use "small" (ou "base") no projeto. int8 roda bem em CPU.
+modelo = WhisperModel("tiny", device="cpu", compute_type="int8")
+
+
+def transcrever(caminho: str) -> dict:
+    segmentos, info = modelo.transcribe(
+        caminho,
+        vad_filter=True,        # Silero VAD: pula trechos sem voz (música, silêncio)
+        beam_size=5,
+    )
+    segmentos = list(segmentos)  # é um gerador: a transcrição só roda aqui
+    return {
+        "idioma": info.language,
+        "prob_idioma": round(info.language_probability, 2),
+        "duracao_s": round(info.duration, 2),
+        "duracao_com_voz_s": round(info.duration_after_vad, 2),
+        "segmentos": [(round(s.start, 2), round(s.end, 2), s.text.strip()) for s in segmentos],
+    }
+
+
+for nome in ["short_a.wav", "short_b.wav"]:
+    r = transcrever(nome)
+    print(nome, {k: v for k, v in r.items() if k != "segmentos"})
+    for seg in r["segmentos"]:
+        print("   ", seg)
+```
+
+```text
+short_a.wav {'idioma': 'pt', 'prob_idioma': 0.99, 'duracao_s': 17.22, 'duracao_com_voz_s': 13.58}
+    (3.63, 16.63, 'Oi gente, hoje eu vou mostrar como fazer uma pele natural e e cinco passos, primeiro, hidrate bem e o rosto e espere secar, depois, aplique a base com uma esponjão humida.')
+short_b.wav {'idioma': 'en', 'prob_idioma': 0.26, 'duracao_s': 14.02, 'duracao_com_voz_s': 0.0}
+```
+
+Três leituras dessa saída valem para a base inteira:
+
+1. **`segments` é um gerador.** Nada é transcrito até você iterar. Se você só pedir `info.language`, o custo é o da detecção de idioma, que olha os primeiros 30 s. E os tempos de **segmento** são frouxos: o segmento acima "termina" em 16,63 s, mas a voz acaba em 15,7 s. Para medir quando a fala acontece, use tempos por palavra (passo 3).
+2. **O modelo `tiny` erra palavras** ("esponjão humida" no lugar de "esponja úmida"). Para features de *contagem* e *ritmo* isso quase não importa. Para o texto que vai virar <Termo id="embedding">embedding</Termo>, use pelo menos `small`.
+3. **O idioma de um vídeo sem fala é lixo.** No short_b, só com música, o detector respondeu "en" com probabilidade 0,26 (sem o VAD, respondeu "ro"). A regra da trilha: **só aceite o idioma se houver palavras transcritas e probabilidade de pelo menos 0,7**; caso contrário, grave `sem_fala`.
+
+O VAD também protege contra um problema conhecido: o Whisper às vezes "alucina" frases inteiras em trechos de música ou silêncio (Koenecke et al., *Careless Whisper*, FAccT 2024). Com `vad_filter=True`, esses trechos nem chegam ao decodificador.
+
+---
+
+## Passo 3: da transcrição para features de fala
+
+Com `word_timestamps=True`, cada palavra vem com início e fim. Isso permite medir **quando** a fala acontece, e não só **o que** é dito.
+
+```python
+import numpy as np
+from faster_whisper import WhisperModel
+
+modelo = WhisperModel("tiny", device="cpu", compute_type="int8")
+
+
+def features_fala(caminho: str, gancho_s: float = 3.0) -> tuple[dict, list]:
+    segs, info = modelo.transcribe(caminho, vad_filter=True, word_timestamps=True)
+    palavras = [w for s in segs for w in (s.words or [])]
+    dur = info.duration
+    tem_fala = len(palavras) > 0
+    tempo_fala = float(sum(w.end - w.start for w in palavras))  # só trechos com palavra
+    feats = {
+        # idioma só vale se houve voz e o detector está confiante
+        "aud_idioma": info.language if tem_fala and info.language_probability >= 0.7 else "sem_fala",
+        "aud_n_palavras": len(palavras),
+        "aud_palavras_por_s_video": len(palavras) / dur,
+        "aud_palavras_por_s_fala": len(palavras) / tempo_fala if tem_fala else 0.0,
+        "aud_pct_com_fala": tempo_fala / dur,
+        "aud_fala_no_gancho": any(w.start < gancho_s for w in palavras),
+        "aud_inicio_fala_s": float(palavras[0].start) if tem_fala else np.nan,
+    }
+    return feats, palavras
+
+
+if __name__ == "__main__":
+    for nome in ["short_a.wav", "short_b.wav"]:
+        feats, palavras = features_fala(nome)
+        print(nome, {k: round(v, 2) if isinstance(v, float) else v for k, v in feats.items()})
+```
+
+```text
+short_a.wav {'aud_idioma': 'pt', 'aud_n_palavras': 32, 'aud_palavras_por_s_video': 1.86, 'aud_palavras_por_s_fala': 3.05, 'aud_pct_com_fala': 0.61, 'aud_fala_no_gancho': False, 'aud_inicio_fala_s': 3.63}
+short_b.wav {'aud_idioma': 'sem_fala', 'aud_n_palavras': 0, 'aud_palavras_por_s_video': 0.0, 'aud_palavras_por_s_fala': 0.0, 'aud_pct_com_fala': 0.0, 'aud_fala_no_gancho': False, 'aud_inicio_fala_s': nan}
+```
+
+O que cada coluna captura:
+
+| Coluna | Pergunta que responde | Leitura no short_a |
+| :--- | :--- | :--- |
+| `aud_palavras_por_s_video` | Quanto do vídeo é "ocupado" por fala? (densidade) | 1,86 palavra/s |
+| `aud_palavras_por_s_fala` | Quando fala, fala rápido? (ritmo da narração) | 3,05 palavras/s, ritmo de conversa |
+| `aud_pct_com_fala` | Que fração do tempo tem voz? | 61% |
+| `aud_fala_no_gancho` | Alguém fala nos primeiros 3 s? | não: a vinheta ocupa o gancho |
+| `aud_inicio_fala_s` | Quanto o espectador espera pela primeira palavra? | 3,63 s |
+
+Repare que a voz real começa em 4,0 s e o Whisper marcou 3,63 s. Timestamps por palavra têm imprecisão de alguns décimos de segundo, e isso importa num limiar de 3 s. Não trate `aud_fala_no_gancho` como verdade absoluta: `aud_inicio_fala_s`, que é contínuo, deixa o modelo escolher o corte.
+
+A **transcrição** em si (`"".join(w.word for w in palavras)`) não vira coluna aqui. Ela entra no bloco de texto, junto com título e legenda, pelo mesmo caminho de embedding e <Termo id="pca">PCA</Termo> da aula de [features de texto](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto).
+
+---
+
+## Passo 4: energia e ritmo com librosa
+
+Três medidas cobrem quase tudo o que importa para um Short:
+
+- **RMS** (*root mean square*): a energia do sinal em janelas curtas. Para uma janela com $$N$$ amostras $$x_n$$, vale $$\text{RMS} = \sqrt{\tfrac{1}{N}\sum_n x_n^2}$$. A média diz "quão alto"; o coeficiente de variação diz "quão dinâmico"; a média nos primeiros 3 s diz "o gancho é alto ou baixo".
+- **Onset strength**: quanto o espectro muda de uma janela para a seguinte. Picos marcam ataques: batidas, sílabas fortes, efeitos sonoros.
+- **Batida**: `beat_track` estima o BPM a partir dos onsets.
+
+```python
+import librosa
+import numpy as np
+
+HOP = 512
+
+
+def features_energia(caminho: str, gancho_s: float = 3.0) -> dict:
+    y, sr = librosa.load(caminho, sr=16_000)  # WAV extraído com ffmpeg
+    rms = librosa.feature.rms(y=y, hop_length=HOP)[0]              # energia por quadro
+    t = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=HOP)
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP)
+    tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=HOP)
+    onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, hop_length=HOP)
+
+    # "clareza do pulso": pico da autocorrelação do envelope de onsets
+    # entre 60 e 200 BPM (música com batida regular -> perto de 1)
+    x = onset_env - onset_env.mean()
+    ac = np.correlate(x, x, mode="full")[len(x) - 1 :]
+    ac = ac / (ac[0] + 1e-9)
+    fps = sr / HOP
+    lags = np.arange(int(fps * 60 / 200), int(fps * 60 / 60))
+    pulso = float(ac[lags].max())
+
+    return {
+        "aud_rms_media": float(rms.mean()),
+        "aud_rms_gancho": float(rms[t < gancho_s].mean()),
+        "aud_rms_cv": float(rms.std() / (rms.mean() + 1e-9)),   # dinâmica
+        "aud_bpm": float(np.atleast_1d(tempo)[0]),
+        "aud_onsets_por_s": len(onsets) / (len(y) / sr),
+        "aud_pulso": pulso,
+        "aud_planura": float(librosa.feature.spectral_flatness(y=y).mean()),
+    }
+
+
+if __name__ == "__main__":
+    for nome in ["short_a.wav", "short_b.wav"]:
+        f = features_energia(nome)
+        print(nome, {k: round(v, 3) for k, v in f.items()})
+```
+
+```text
+short_a.wav {'aud_rms_media': 0.159, 'aud_rms_gancho': 0.02, 'aud_rms_cv': 0.843, 'aud_bpm': 133.929, 'aud_onsets_por_s': 4.995, 'aud_pulso': 0.178, 'aud_planura': 0.082}
+short_b.wav {'aud_rms_media': 0.116, 'aud_rms_gancho': 0.118, 'aud_rms_cv': 0.524, 'aud_bpm': 125.0, 'aud_onsets_por_s': 6.849, 'aud_pulso': 0.805, 'aud_planura': 0.022}
+```
+
+A linha mais instrutiva é o **BPM do short_a: 134**. Não há batida nenhuma ali, só voz. O `beat_track` sempre devolve um número, porque ele procura o tempo mais provável, não verifica se existe tempo. Quem separa as duas situações é `aud_pulso`: 0,18 na narração, 0,81 na música (cujo BPM real é 128; a estimativa de 125 está na resolução da grade do algoritmo). Na prática, o BPM só tem significado quando o pulso é alto, e o <Termo id="gbm">GBM</Termo> consegue aprender essa interação se receber as duas colunas.
+
+Repare também em `aud_rms_gancho`: 0,02 no short_a (vinheta baixinha) contra 0,118 no short_b. É a versão medida do "gancho fraco vs. gancho forte" do fio condutor.
+
+:::warning[Por que não `librosa.autocorrelate`?]
+Na librosa 1.0.0 do venv da trilha, `librosa.autocorrelate` emitiu `RuntimeWarning: invalid value encountered in cast` vindo do numba. O `np.correlate` acima dá o mesmo resultado para sinais curtos, sem o aviso.
+:::
+
+---
+
+## Passo 5: música, fala e o contraste com o texto da tela
+
+Duas combinações simples transformam os passos anteriores em sinais mais próximos do que o espectador percebe.
+
+**Energia fora da fala.** Se há energia alta onde o Whisper não encontrou palavras, há música ou efeitos sonoros de fundo. Junto com o pulso, isso dá uma heurística de "música provável".
+
+**Sobreposição texto/fala.** O paper *Understanding Virality* tem um fator chamado *text-from-speech contrast* (9,1% da importância SHAP). Uma versão medida: que fração das palavras na tela também é falada? Perto de 1, o texto é legenda da fala; perto de 0, texto e fala dizem coisas diferentes (ou só um dos dois existe). O texto da tela vem do OCR da [próxima aula](/aulas/ml-preditivo-e-agentes/do-video-as-features/detectores-leves); aqui usamos uma string de exemplo.
+
+```python
+import unicodedata
+import librosa
+import numpy as np
+
+
+def energia_fora_da_fala(wav: str, palavras, pad: float = 0.2) -> float:
+    """RMS médio nos trechos SEM palavra: indica música/efeitos de fundo."""
+    y, sr = librosa.load(wav, sr=16_000)
+    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+    t = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
+    com_fala = np.zeros(len(t), dtype=bool)
+    for w in palavras:
+        com_fala |= (t >= w.start - pad) & (t <= w.end + pad)
+    return float(rms[~com_fala].mean()) if (~com_fala).any() else 0.0
+
+
+def _tokens(texto: str) -> set[str]:
+    sem_acento = unicodedata.normalize("NFKD", texto.lower()).encode("ascii", "ignore").decode()
+    return {p for p in "".join(c if c.isalnum() else " " for c in sem_acento).split() if len(p) >= 3}
+
+
+def sobreposicao_texto_fala(texto_tela: str, transcricao: str) -> float:
+    """Fração das palavras da tela que também são faladas (1 = legenda da fala)."""
+    tela, fala = _tokens(texto_tela), _tokens(transcricao)
+    return len(tela & fala) / len(tela) if tela else np.nan
+
+
+def features_audio(wav: str, texto_tela: str = "") -> dict:
+    f_fala, palavras = features_fala(wav)        # passo 3
+    f_ener = features_energia(wav)               # passo 4
+    fora = energia_fora_da_fala(wav, palavras)
+    transcricao = "".join(w.word for w in palavras)
+    return {
+        **f_fala, **f_ener,
+        "aud_rms_fora_fala": fora,
+        # heurística: batida regular OU som forte onde não há voz
+        "aud_musica_provavel": bool(f_ener["aud_pulso"] > 0.5 or fora > 0.03),
+        "aud_txt_sobreposicao": sobreposicao_texto_fala(texto_tela, transcricao),
+        "txt_transcricao": transcricao.strip(),  # vai para o bloco de texto
+    }
+
+
+if __name__ == "__main__":
+    # o texto da tela virá do OCR (aula 4.6); aqui, um exemplo digitado
+    telas = {"short_a.wav": "", "short_b.wav": "1 PRODUTO, 20 SEGUNDOS"}
+    for wav, tela in telas.items():
+        f = features_audio(wav, tela)
+        f.pop("txt_transcricao")
+        print(wav, {k: round(v, 3) if isinstance(v, float) else v for k, v in f.items()})
+```
+
+```text
+short_a.wav {..., 'aud_rms_fora_fala': 0.015, 'aud_musica_provavel': False, 'aud_txt_sobreposicao': nan}
+short_b.wav {..., 'aud_rms_fora_fala': 0.116, 'aud_musica_provavel': True, 'aud_txt_sobreposicao': 0.0}
+```
+
+Note o limite da heurística: a vinheta do short_a é música, mas baixa demais (RMS de 0,015) para passar no limiar. Limiares fixos quebram fácil; por isso as colunas contínuas (`aud_pulso`, `aud_rms_fora_fala`) vão para o modelo junto com a flag, e o GBM decide onde cortar.
+
+Para a base inteira, embrulhe tudo numa etapa com o cache da [aula 4.1](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short). Ela entra na lista de etapas do `extrair_e_apagar` da [aula 4.2](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia), ao lado de `sinais_baixo_nivel`:
+
+```python
+import time
+from pathlib import Path
+
+# cache_por_video vem da aula 4.1; extrair_audio e features_audio, dos blocos acima
+
+
+@cache_por_video("audio", versao=1)
+def etapa_audio(video_id: str, caminho: str) -> dict:
+    wav = extrair_audio(Path(caminho))
+    try:
+        # sem texto da tela aqui: a sobreposição texto/fala é recalculada na fusão (aula 4.8),
+        # quando OCR (det_texto_tela) e transcrição estão na mesma linha
+        return features_audio(str(wav))
+    finally:
+        wav.unlink(missing_ok=True)  # o WAV é intermediário
+
+
+for rodada in (1, 2):
+    t0 = time.perf_counter()
+    f = etapa_audio("sint_A", "short_a.mp4")
+    print(f"rodada {rodada}: {time.perf_counter() - t0:.2f} s | início da fala: {f['aud_inicio_fala_s']} s")
+```
+
+```text
+rodada 1: 0.88 s | início da fala: 3.63 s
+rodada 2: 0.00 s | início da fala: 3.63 s
+```
+
+Se você quiser uma classificação de verdade ("música", "fala", "ruído de motor"), a extensão natural é o **CLAP** (`laion/clap-htsat-unfused`, Apache-2.0), que compara o áudio com rótulos em texto, no mesmo espírito do CLIP. Ele aparece na aula opcional de [embeddings de vídeo e áudio](/aulas/ml-preditivo-e-agentes/ir-alem/embeddings-de-video-e-audio).
+
+---
+
+## Alternativa rápida: Groq Whisper
+
+Se a sua máquina for lenta, a API gratuita do Groq roda o `whisper-large-v3-turbo` remotamente. A chamada segue o formato da OpenAI:
+
+```python
+# requer GROQ_API_KEY (não executado aqui; assinatura conferida no pacote groq 1.7.0)
+import os
+from groq import Groq
+
+cliente = Groq()  # lê GROQ_API_KEY do ambiente
+
+
+def transcrever_groq(caminho_wav: str) -> dict:
+    with open(caminho_wav, "rb") as f:
+        t = cliente.audio.transcriptions.create(
+            file=(os.path.basename(caminho_wav), f.read()),
+            model="whisper-large-v3-turbo",
+            response_format="verbose_json",           # necessário para timestamps
+            timestamp_granularities=["word", "segment"],
+            temperature=0.0,
+        )
+    d = t.model_dump()  # words, segments, language e duration vêm como campos extras
+    return {"texto": d["text"], "palavras": d.get("words", []), "duracao": d.get("duration")}
+```
+
+Faça a conta antes de escolher. Uma base de 3.000 Shorts com 40 s em média soma 120.000 s de áudio. Com o limite de 28.800 s por dia, isso leva cerca de **4,2 dias** de cota, e cada Short com menos de 10 s é cobrado como 10 s. Localmente, a etapa inteira (extração, `tiny` em int8 e librosa) levou 0,88 s para os 17 s do short_a no nosso teste em CPU, com o modelo já carregado; `base` e `small` custam mais. O tempo depende muito da máquina: meça em 20 vídeos antes de estimar a base inteira. E lembre que, na API, o áudio sai da sua máquina.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Os dois Shorts de teste imitam a Lumina, e as colunas já contam a história do fio condutor:
+
+| | Short A (tutorial) | Short B (antes/depois) |
+| :--- | :--- | :--- |
+| `aud_fala_no_gancho` | não (voz começa em ~3,6 s, depois do logo) | não (não há voz) |
+| `aud_rms_gancho` | 0,02 (vinheta baixa) | 0,118 |
+| `aud_pulso` | 0,18 (sem batida) | 0,81 (batida regular) |
+| `aud_palavras_por_s_fala` | 3,05 | 0 |
+| `aud_idioma` | pt | sem_fala |
+
+A leitura para a marca: o B abre alto e ritmado; o A abre baixo e demora a começar a falar. No simulador da trilha, a energia do B (7 na escala de 0 a 10) empurra a previsão para cima em cerca de +0,10 em log (×1,11), e a do A (3) empurra para baixo na mesma medida. Esses números são **ilustrativos**, gerados pelo simulador; o seu modelo vai estimar os dele.
+
+Para o **Garagem 22**, cuidado com o POV de direção: ronco de motor e vento têm energia alta sem música, e o `aud_pulso` pode subir com a rotação do motor. Ouça 10 vídeos do setor antes de confiar na flag `aud_musica_provavel`.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Aceitar o idioma de um vídeo sem fala.** O detector sempre responde algo. Exija palavras transcritas e probabilidade mínima.
+2. **Usar o BPM sozinho.** O `beat_track` inventa um tempo até para narração pura. Mande o BPM junto com uma medida de pulso.
+3. **Rodar sem VAD.** Sem `vad_filter=True`, o Whisper perde tempo em música e pode produzir frases que ninguém disse.
+4. **Tratar a transcrição do `tiny` como texto confiável.** Serve para contar e medir ritmo; para embedding de texto, use `small` ou maior.
+5. **Esquecer de guardar a transcrição.** Ela é cara de refazer. Salve o texto e as palavras com timestamps num parquet por vídeo, junto com a versão do modelo.
+:::
+
+<Quiz
+  id="m4-a5"
+  perguntas={[
+    {
+      pergunta: 'Um Short só com música recebeu `info.language = "en"` com `language_probability = 0.26`. O que gravar em `aud_idioma`?',
+      opcoes: [
+        {texto: '"en", porque foi o idioma mais provável.', explicacao: 'Com probabilidade 0,26 e sem palavras transcritas, a detecção é ruído. Gravar "en" cria uma categoria falsa.'},
+        {texto: '"sem_fala", porque não há palavras e a confiança está abaixo de 0,7.', correta: true, explicacao: 'Exato. A regra combina as duas evidências: ausência de palavras e baixa confiança do detector.'},
+        {texto: 'Deixar a linha fora da base.', explicacao: 'Vídeos sem fala são informativos (o B da Lumina é assim). Descartá-los enviesaria a base.'},
+      ],
+    },
+    {
+      pergunta: 'A narração pura do short_a recebeu `aud_bpm = 134`. Qual a melhor interpretação?',
+      opcoes: [
+        {texto: 'A narração tem ritmo de 134 batidas por minuto.', explicacao: 'O beat_track sempre devolve um tempo, mesmo sem batida. O número não descreve nada real aqui.'},
+        {texto: 'O BPM só tem sentido quando o pulso é alto; com `aud_pulso = 0.18`, ele deve ser lido como ausência de batida.', correta: true, explicacao: 'Isso. Por isso as duas colunas vão juntas para o modelo, que aprende a interação.'},
+        {texto: 'Houve erro na extração do WAV.', explicacao: 'A extração está correta; o comportamento é do algoritmo de batida.'},
+      ],
+    },
+    {
+      pergunta: 'Quais destas colunas de áudio existem ANTES da publicação e podem ser features? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: '`aud_rms_gancho`', correta: true, explicacao: 'Vem do arquivo do vídeo, que a marca tem antes de publicar.'},
+        {texto: '`aud_palavras_por_s_fala`', correta: true, explicacao: 'Também é calculada só a partir do arquivo.'},
+        {texto: 'Número de comentários que citam a música', explicacao: 'Comentários só existem depois da publicação: é vazamento.'},
+        {texto: '`aud_txt_sobreposicao`', correta: true, explicacao: 'Combina OCR e transcrição do próprio vídeo; nada de pós-publicação.'},
+      ],
+    },
+    {
+      pergunta: 'Sua base tem 3.000 Shorts de 40 s em média. Por que o Groq free tier não resolve a transcrição "numa tarde"?',
+      opcoes: [
+        {texto: 'Porque o limite de 20 requisições por minuto impede passar de 1.000 vídeos.', explicacao: '20 RPM dão 1.200 vídeos por hora; o gargalo é outro.'},
+        {texto: 'Porque o limite diário de 28.800 s de áudio exige cerca de 4 dias para 120.000 s.', correta: true, explicacao: 'Correto. O teto de segundos por dia domina, e vídeos curtos ainda são cobrados como 10 s.'},
+        {texto: 'Porque o Groq não aceita arquivos WAV.', explicacao: 'WAV é aceito (assim como flac, mp3, mp4, m4a, ogg e webm).'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: áudio de 20 Shorts reais]
+1. Escolha 20 Shorts da sua base (7 de beleza, 7 de moda, 6 de automotivo) e rode `features_audio` em todos.
+2. Assista aos 20 com som e anote à mão: há fala nos primeiros 3 s? Há música?
+3. Compare com `aud_fala_no_gancho` e `aud_musica_provavel`. Em quantos casos a heurística erra, e em qual setor?
+4. Rode `features_fala` com `tiny` e com `small` nos mesmos vídeos. A contagem de palavras muda mais que 10%?
+:::
+
+<details>
+<summary>O que esperar e como ajustar</summary>
+
+- A flag de fala no gancho costuma errar perto do limiar de 3 s, por causa da imprecisão dos timestamps. Se isso acontecer muito, mantenha só `aud_inicio_fala_s` (contínua).
+- A música costuma ser subestimada quando está baixa sob a voz: a energia fora da fala some porque quase todo o vídeo tem fala. Nesses casos, o `aud_pulso` ainda pode denunciar a batida.
+- No automotivo, espere falsos positivos de "música" em vídeos de motor. Uma alternativa é subir o limiar de pulso para esse setor, ou deixar o GBM usar `aud_pulso` contínuo com a coluna de setor.
+- `tiny` e `small` tendem a concordar na contagem de palavras (as diferenças estão na grafia). Se a diferença passar de 10%, investigue ruído de fundo ou fala sobreposta à música.
+
+</details>
+
+---
+
+## Resumo
+
+- O áudio responde duas perguntas: **o que é dito** (faster-whisper, com VAD e timestamps por palavra) e **como soa** (librosa: RMS, onsets, batida).
+- Features de fala úteis: **densidade** de palavras, velocidade, **fala no gancho**, início da fala e cobertura; o idioma só vale com fala e confiança.
+- O BPM sozinho engana; combine com a **clareza do pulso**. A energia no gancho e a energia fora da fala contam mais que o volume médio.
+- A **sobreposição texto/fala** é a versão medida do "contraste texto/fala" do *Understanding Virality*, que lá veio de descrições de um VLM.
+- Local (faster-whisper) ou **Groq** (28.800 s/dia no free tier): faça a conta de tempo antes de escolher.
+
+## Referências
+
+- Gupta et al. [*Understanding Virality: A Rubric based Vision-Language Model Framework for Short-Form Edutainment Evaluation*](https://arxiv.org/abs/2512.21402). arXiv, 2025. Tabelas 4 (ablação áudio/visual) e 5 (importância SHAP).
+- SYSTRAN. [faster-whisper](https://github.com/SYSTRAN/faster-whisper): documentação de `WhisperModel`, VAD e `word_timestamps`.
+- Radford et al. [*Robust Speech Recognition via Large-Scale Weak Supervision*](https://arxiv.org/abs/2212.04356) (Whisper). ICML, 2023.
+- Koenecke et al. [*Careless Whisper: Speech-to-Text Hallucination Harms*](https://arxiv.org/abs/2402.08021). FAccT, 2024.
+- McFee et al. [librosa](https://librosa.org/doc/latest/): `feature.rms`, `onset.onset_strength`, `beat.beat_track`.
+- Groq. [Speech to Text](https://console.groq.com/docs/speech-to-text): modelos, parâmetros e limites de arquivo.
+- Wu et al. [*Large-scale Contrastive Language-Audio Pretraining with Feature Fusion and Keyword-to-Caption Augmentation*](https://arxiv.org/abs/2211.06687) (CLAP). ICASSP, 2023.
+
+**Próxima aula:** [Detectores leves: rosto, texto e objetos](/aulas/ml-preditivo-e-agentes/do-video-as-features/detectores-leves): MediaPipe, OCR e detecção de objetos com vocabulário aberto, e como usá-los para conferir o VLM.

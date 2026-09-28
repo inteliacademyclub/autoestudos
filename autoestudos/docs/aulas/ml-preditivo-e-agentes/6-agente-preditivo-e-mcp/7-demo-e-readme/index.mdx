@@ -1,0 +1,389 @@
+---
+sidebar_position: 7
+sidebar_label: 'Demo e README que convencem'
+title: 'Demo e README que convencem'
+description: 'Roteiro de demo de 5 a 7 minutos, plano B para quando algo falhar, o README pedido no briefing com template completo, uma interface mínima opcional e o checklist de entrega.'
+tags: [ml-preditivo, galaxies, agente, demo, readme]
+---
+
+# Demo e README Que Convencem: Sete Minutos e Um Documento
+
+<LessonMeta
+  tempo="45 min"
+  semana={4}
+  etapa="agente"
+  objetivos={[
+    'Montar um roteiro de demo de 5 a 7 minutos em que cada número dito tem fonte na tela',
+    'Preparar um plano B que mantenha a demo de pé se a rede, a chave ou o modelo falharem',
+    'Escrever o README com todas as seções pedidas no briefing, a partir de um template',
+    'Conferir a entrega com um checklist antes de 23/10',
+  ]}
+  prerequisitos={[
+    {label: 'Testando e avaliando o agente', to: '/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente'},
+    {label: 'Documentação, ética e termos de uso', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos'},
+  ]}
+/>
+
+Na banca, a Galaxies vai ver dezenas de agentes que "preveem curtidas". A maioria vai abrir com a arquitetura, passar dois minutos em diagramas e mostrar o agente respondendo a uma pergunta que ninguém consegue conferir. A pergunta que a Galaxies tem na cabeça é outra, e é simples: **esse número merece confiança?**
+
+Uma demo que convence responde a isso com evidência, na ordem em que a dúvida aparece. Primeiro, o problema e o recorte. Depois, a base e o que ela não cobre. Depois, o modelo contra um *baseline* honesto. Só então o agente, prevendo criativos cujo resultado real a banca pode ver. O agente é o final da história, não o começo.
+
+O README é a versão durável da mesma história. A demo dura sete minutos; o README é o que alguém da Galaxies vai abrir três semanas depois, quando quiser rodar o servidor MCP na máquina dela.
+
+:::info[A ideia central]
+A demo é um **argumento com evidência**: cada número dito em voz alta aparece na tela, com a fonte (tabela, *trace* ou JSON da tool). O **roteiro** segue a ordem da dúvida (problema, base, *baseline*, ganho, agente ao vivo com "de-para", explicação, MCP, limitações) e tem um **plano B** gravado. O **README** segue as seções do briefing e permite que outra pessoa reproduza tudo.
+:::
+
+---
+
+## O roteiro de sete minutos
+
+<Sketch name="m6/roteiro-demo" alt="Linha do tempo de 7 minutos com oito blocos: 0:00 problema e recorte; 0:40 base (data card); 1:20 baseline vs. modelo; 2:00 ganho multimodal; 2:40 agente ao vivo com 3 criativos, previsto vs. real (o bloco mais longo); 4:10 explicação (SHAP e texto); 4:50 MCP num cliente real; 5:40 limitações e próximos passos, até 7:00. Embaixo, à esquerda, o plano B: gravação da demo inteira mais prints do Inspector e do trace MLflow, se a rede, a chave ou o modelo falharem. À direita, a regra de ouro: cada número dito em voz alta aparece na tela com a fonte." caption="Oito blocos, com o agente no meio e as limitações no fim." />
+
+| Tempo | Bloco | O que aparece na tela | A frase que importa |
+| :--- | :--- | :--- | :--- |
+| 0:00 | **Problema e recorte** | Uma frase e o Short A vs. B da Lumina | "Prever curtidas antes de publicar, em moda, beleza e automotivo, com margem de erro." |
+| 0:40 | **Base** | O *data card*: canais, posts, período, licença, limites | "N canais, M Shorts, de tal data a tal data. Não cobre X." |
+| 1:20 | ***Baseline* vs. modelo** | A tabela de ablação | "O *baseline* é a mediana do canal. O modelo acerta a ordem de dois Shorts do mesmo canal em Y% das vezes." |
+| 2:00 | **Ganho multimodal** | A linha "+ atributos do vídeo" da mesma tabela | "Ler o vídeo acrescenta Z pontos. É pouco, e a literatura diz o mesmo." |
+| 2:40 | **Agente ao vivo** | Três criativos de teste, previsto vs. real | "Estes três foram escolhidos antes de eu ver o resultado." |
+| 4:10 | **Explicação** | `top_drivers` e o texto de um criativo | "O gancho é o fator que mais pesa. É associação, não causa." |
+| 4:50 | **MCP** | O Claude Desktop (ou o Inspector) chamando o servidor | "A persona de vocês vai conectar exatamente aqui." |
+| 5:40 | **Limitações** | Uma lista curta e honesta | "Onde o modelo não funciona, e o que faríamos com mais tempo." |
+
+Os blocos 3 e 4 saem de uma única tabela. O script abaixo treina o modelo com blocos de *features* crescentes, no mesmo split temporal, e imprime a ablação que vai para o slide e para o README:
+
+```python
+# ablacao.py — tabela para a demo: baseline vs. modelo, e o ganho de cada bloco
+import pandas as pd
+
+from galaxies_tool.comparaveis import adicionar_rel_vizinhos
+from galaxies_tool.modelo import FEATURES_BASE, preparar_treino, treinar
+from galaxies_tool.sintetico import ATRIBUTOS, gerar_base
+
+tabela = preparar_treino(adicionar_rel_vizinhos(gerar_base()))
+sem_video = [f for f in FEATURES_BASE if f not in ATRIBUTOS]
+linhas = {}
+for nome, feats in [("canal + tempo + legenda", sem_video),
+                    ("+ atributos do vídeo", FEATURES_BASE),
+                    ("+ comparáveis (rel_vizinhos)", FEATURES_BASE + ["rel_vizinhos"])]:
+    m = treinar(tabela, feats).metricas
+    linhas["baseline: mediana do canal"] = {"spearman": m["spearman_baseline"],
+                                            "par_a_par_intra_canal": 0.5, "cobertura_80": None}
+    linhas[nome] = {k: m[k] for k in ("spearman", "par_a_par_intra_canal", "cobertura_80")}
+print(pd.DataFrame(linhas).T.round(3).to_string())
+```
+
+```text
+                              spearman  par_a_par_intra_canal  cobertura_80
+baseline: mediana do canal       0.884                  0.500           NaN
+canal + tempo + legenda          0.891                  0.593         0.818
++ atributos do vídeo             0.903                  0.638         0.826
++ comparáveis (rel_vizinhos)     0.910                  0.672         0.830
+```
+
+Leia a tabela como a banca vai ler. O Spearman alto do *baseline* (0,884) mostra que o nível do canal explica quase toda a variação entre canais, e é por isso que ele não serve para escolher entre A e B: dentro do mesmo canal, o *baseline* acerta 50% dos pares, que é o acaso. O modelo completo acerta 67,2%. O vídeo acrescenta 4,5 pontos de par-a-par e 0,012 de Spearman, na mesma direção do que a literatura reporta (o visual soma pouco sobre as *features* do canal). Os números são da base sintética; os seus serão outros, e é a sua tabela que vai para a demo.
+
+O bloco 5 usa o golden set da [aula 6.6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente). Os três criativos são escolhidos por uma regra definida antes (aqui, o primeiro de cada setor no arquivo), e não depois de ver quais acertaram:
+
+```python
+# demo_de_para.py — bloco 5 da demo: previsão vs. curtidas reais em 3 criativos de teste
+from galaxies_tool.api import aquecer, prever_criativo
+from galaxies_tool.schemas import PredictionRequest
+from tests.golden import carregar_golden
+
+aquecer()
+golden = carregar_golden()
+escolhidos = [next(g for g in golden if g["pedido"]["sector"] == s)
+              for s in ("moda", "beleza", "automotivo")]  # 1 por setor, escolhidos ANTES
+cache = {g["pedido"]["creative"]: g["atributos"] for g in escolhidos}
+br = lambda x: f"{x:,.0f}".replace(",", ".")
+print(f"{'criativo':<26}{'previsto':>9}{'intervalo 80%':>16}{'real':>7}  dentro?")
+for g in escolhidos:
+    r = prever_criativo(PredictionRequest.model_validate(g["pedido"]), extrator=cache.__getitem__)
+    real = g["curtidas_reais"]
+    faixa = f"{br(r.interval_low)} a {br(r.interval_high)}"
+    dentro = "sim" if r.interval_low <= real <= r.interval_high else "NÃO"
+    print(f"{g['id']:<26}{br(r.predicted_metric):>9}{faixa:>16}{br(real):>7}  {dentro}")
+```
+
+```text
+criativo                   previsto   intervalo 80%   real  dentro?
+UC_novo_moda_00_007           1.623     685 a 4.933  1.924  sim
+UC_novo_beleza_00_015            45        22 a 134     31  sim
+UC_novo_automotivo_00_017       882     376 a 1.736  1.566  sim
+```
+
+Três acertos em três é sorte tanto quanto mérito. Diga isso, e mostre os números do conjunto inteiro: 36 criativos, cobertura de 89% e par-a-par de 64%.
+
+---
+
+## O que mostrar se algo falhar
+
+Demos ao vivo falham por motivos que não têm nada a ver com o modelo: a rede do auditório, a cota da API do VLM, uma atualização automática do Claude Desktop. O plano B precisa ser montado **antes**:
+
+1. **Grave a demo inteira** no dia anterior, com o mesmo roteiro, e deixe o vídeo aberto numa aba. Se algo falhar, diga "vou mostrar a gravação de ontem" e siga. Ninguém desconta ponto por isso; desconta-se por dez minutos de silêncio.
+2. **Tire prints** do Inspector com o `tools/list`, de um `tools/call` e do *trace* do MLflow de uma execução completa.
+3. **Não dependa da rede no bloco ao vivo.** Use criativos com atributos já extraídos (o cache e o golden set existem para isso), o servidor em stdio e o modelo local. Chamadas ao VLM ao vivo só se houver tempo sobrando.
+4. **Aqueça tudo antes de começar.** A primeira chamada carrega modelo, índice e SHAP; `api.aquecer()` faz isso uma vez. Na nossa máquina, a primeira execução do grafo sem aquecimento levou cerca de 7 s, e as seguintes, dezenas de milissegundos.
+5. **Tenha os números na ponta da língua.** Se a tela travar, você ainda consegue dizer "par-a-par de 67%, contra 50% do *baseline*, com cobertura de 83%".
+
+---
+
+## Uma interface mínima (opcional)
+
+O briefing não exige interface, e o MCP no Claude Desktop já é uma interface. Se o grupo quiser uma tela própria para a demo, mantenha-a mínima e com zero lógica: ela só chama a API.
+
+```python
+# app.py — demo mínima (opcional): streamlit run app.py
+import pandas as pd
+import streamlit as st
+
+from galaxies_tool.api import aquecer, comparar_criativos
+from galaxies_tool.schemas import PredictionRequest
+from galaxies_tool.tools import CRIATIVOS_DEMO
+
+st.title("Galaxies: previsão de curtidas antes de postar")
+versao = st.cache_resource(aquecer)()  # modelo, índice e SHAP carregados uma vez
+st.caption(f"modelo {versao} · base sintética de demonstração")
+
+canal = st.text_input("channel_id", "UC_lumina_beauty")
+setor = st.selectbox("setor", ["beleza", "moda", "automotivo"])
+escolhidos = st.multiselect("criativos", list(CRIATIVOS_DEMO), ["lumina_a.mp4", "lumina_b.mp4"])
+quando = st.text_input("data planejada (ISO, com fuso)", "2026-10-01T19:00:00-03:00")
+
+if st.button("Prever") and len(escolhidos) >= 2:
+    pedidos = {c: PredictionRequest(creative=c, channel_id=canal, sector=setor,
+                                    planned_datetime=quando) for c in escolhidos}
+    resultado = comparar_criativos(pedidos)
+    st.dataframe(pd.DataFrame(resultado["ranking"]), hide_index=True)
+    st.write(resultado["prob_supera"])
+    for nome, r in resultado["respostas"].items():
+        with st.expander(f"{nome}: por que {r['predicted_metric']:.0f}?"):
+            st.write(r["explanation"]["resumo"])
+            st.json({"top_drivers": r["top_drivers"], "comparables": r["comparables"][:3]})
+```
+
+O Streamlit não está no ambiente fixado do módulo. O código foi verificado com `streamlit==1.64.0`, num ambiente separado, usando o `AppTest`, que executa o *script* sem navegador:
+
+```python
+from streamlit.testing.v1 import AppTest
+
+at = AppTest.from_file("app.py", default_timeout=120).run()
+at.button[0].click().run()
+print("erros:", [e.value for e in at.exception])
+print(at.caption[0].value)
+```
+
+```text
+erros: []
+modelo gbm-quantil-20260927-f9e6dda · base sintética de demonstração
+```
+
+Repare no `st.cache_resource(aquecer)`: sem ele, cada clique recarregaria o modelo. E nenhuma linha do `app.py` calcula algo: se a interface mostrar um número, ele veio de `comparar_criativos`.
+
+---
+
+## O README pedido no briefing
+
+O briefing lista as seções do README. O template abaixo segue essa lista, com o que cada seção precisa conter. Os modelos de *data card* e *model card* do hub estão em [Templates](/projetos/galaxies/templates).
+
+````markdown
+# <Nome do projeto>: prevendo curtidas de YouTube Shorts antes da publicação
+
+> Uma frase: o que o agente faz, para quem, e com que margem de erro.
+
+## 1. Problema e recorte
+- Pergunta: prever curtidas de um Short ANTES de publicar, a partir do criativo e do histórico do canal.
+- Recorte: setores (moda, beleza, automotivo), idioma, formato (Shorts até 3 min), alvo (curtidas aos 30 dias).
+- Decisão apoiada: qual criativo impulsionar. Métrica principal: acerto par-a-par dentro do canal.
+
+## 2. Base
+- Origem: YouTube Data API v3 (endpoints usados, cota gasta, data da coleta).
+- Período: de AAAA-MM-DD a AAAA-MM-DD. Canais: N (critério de curadoria). Posts: M.
+- Esquema: post_id, channel_id, published_at, caption, media_ref, metric_target,
+  channel_stats_at_collection, sector (+ tabela de atributos extraídos).
+- Licença e termos: Developer Policies do YouTube (retenção de 30 dias, sem scraping); dados não redistribuídos.
+- Limites: quebras de regime, canais pequenos, vieses de curadoria. Data card completo: docs/data_card.md.
+
+## 3. Arquitetura
+- Diagrama (função pura no centro; LangGraph e MCP como adaptadores; cinco tools).
+- Onde o LLM entra (orquestração e redação da explicação) e onde NÃO entra (o número).
+
+## 4. Instalação e execução
+- Requisitos: Python 3.12, uv. Versões fixadas no pyproject.toml (fastmcp 3.4.7 + mcp 1.30.0).
+- Passos: instalar, treinar (ou baixar artefatos), rodar os testes, subir o servidor MCP.
+- Configuração do Claude Desktop / Claude Code (JSON e comando), com caminhos absolutos.
+- Variáveis de ambiente (GALAXIES_ARTEFATOS, chaves de API) e o que funciona sem chave.
+
+## 5. Modelos e configurações
+- Modelo: LightGBM quantílico (q10, q50, q90) + ajuste conformal (CQR). Hiperparâmetros.
+- Features por bloco (canal, tempo, legenda, atributos do vídeo, comparáveis).
+- Extração multimodal: modelos, versões, custo por vídeo. Versão do modelo em produção.
+
+## 6. Metodologia
+- Alvo relativo ao canal (log), split temporal (treino / calibração / teste com datas).
+- Baselines, métricas (par-a-par, Spearman, MAE em log, cobertura) e por quê.
+- Anti-vazamento: features point-in-time, comparáveis só do passado maduro.
+- Testes do agente: contrato, invariante, golden set, trajetória e fidelidade.
+
+## 7. Resultados
+- Tabela de ablação (baseline, + blocos), com intervalo de confiança se possível.
+- Golden set "de-para" (N criativos de canais fora do treino): cobertura e par-a-par.
+- Taxas de trajetória correta e de fidelidade do agente.
+
+## 8. Limitações
+- Onde o modelo não funciona (canais novos, setores fora do recorte, formatos inéditos).
+- O que o confidence_flag sinaliza, e com que frequência dispara no teste.
+- Aproximações (P(A>B) supõe independência; what-if herda os vieses do modelo).
+
+## 9. Evolução
+- O que faríamos com mais 4 semanas, em ordem de impacto esperado.
+````
+
+Três conselhos sobre o README:
+
+- **Resultados com números, limitações com números.** "O modelo funciona bem" não informa nada; "par-a-par de 67% no teste temporal, contra 50% do *baseline*" informa.
+- **Instalação testada numa máquina limpa.** Peça a alguém de fora do grupo para seguir o README do zero. Cada passo em que essa pessoa travar é um passo que a Galaxies também vai travar.
+- **Versões e comandos exatos.** A pegadinha do FastMCP 4 cabe numa linha do README e economiza uma tarde de quem for rodar.
+
+---
+
+## Checklist de entrega
+
+<Checklist
+  id="galaxies-entrega-m6"
+  titulo="Antes de 23/10"
+  itens={[
+    {texto: 'A tool devolve `PredictionResponse` válida para qualquer pedido válido', detalhe: 'Teste de contrato passando, com vídeo, texto, canal na base e canal novo.'},
+    {texto: 'O número do agente é o número do modelo', detalhe: 'Testes de invariante: grafo, função, MCP e ReAct.'},
+    {texto: 'Golden set "de-para" congelado, com canais fora do treino', detalhe: 'Cobertura e par-a-par reportados no README.'},
+    {texto: 'Servidor MCP testado no Inspector e num host real (Claude Desktop ou Claude Code)'},
+    {texto: 'Versões fixadas: `fastmcp==3.4.7`, `mcp==1.30.0`, `langchain-mcp-adapters==0.3.2`'},
+    {texto: '`model://card` com versão, métricas do teste temporal e limites'},
+    {texto: 'README com as nove seções, testado numa máquina limpa'},
+    {texto: 'Roteiro de demo ensaiado em até 7 minutos, com cronômetro'},
+    {texto: 'Plano B: gravação da demo e prints do Inspector e do trace'},
+    {texto: 'Autoavaliação do hub preenchida', detalhe: 'Veja /projetos/galaxies/autoavaliacao.'},
+  ]}
+/>
+
+Antes de entregar, preencha a [autoavaliação do projeto](/projetos/galaxies/autoavaliacao): ela usa os mesmos critérios que a banca.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A demo fecha o fio condutor da trilha. No bloco 5, depois dos três criativos do golden set, vale mostrar A e B da Lumina, com uma ressalva explícita: "estes dois ainda não foram publicados, então aqui não há de-para; o que vocês veem é o que o agente diria à Lumina hoje".
+
+E o que ele diz é: **B, com 4.237 curtidas previstas (80%: 1.655 a 9.180), 1,84 vez o Short típico do canal; A, com 1.477 (80%: 671 a 2.923), 0,64 vez. P(B > A) = 0,884.** O gancho com nota 8 e a música com energia 7 são os fatores que mais pesam a favor de B. Os intervalos se sobrepõem entre 1.655 e 2.923, e isso precisa ser dito: a recomendação é B, com cerca de 88% de chance de estar certa, não com certeza.
+
+Na primeira aula da trilha, a resposta honesta para "A ou B?" era "ainda não sei". A resposta de agora continua honesta, só que com um número, um intervalo, uma probabilidade, os fatores e a versão do modelo que a produziu.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Abrir pela arquitetura.** A banca quer saber se o número presta. Comece pelo problema e pela evidência.
+2. **Escolher os criativos do "de-para" depois de ver quais acertaram.** É *cherry-picking*, e a banca percebe. Fixe a regra antes.
+3. **Número dito sem fonte na tela.** Todo número falado precisa estar visível.
+4. **Demo que depende da rede.** Use cache, stdio e modelo local no bloco ao vivo.
+5. **Esconder as limitações.** Um projeto com limitações bem descritas parece mais sólido que um sem nenhuma.
+6. **README que só funciona na máquina de quem escreveu.** Teste numa máquina limpa, com os caminhos e as versões exatas.
+:::
+
+<Quiz
+  id="m6-a7"
+  perguntas={[
+    {
+      pergunta: 'Qual abertura aproveita melhor o primeiro minuto da demo?',
+      opcoes: [
+        {texto: 'O diagrama da arquitetura, com as cinco tools e o LangGraph.', explicacao: 'A arquitetura responde "como", mas a banca ainda não sabe "o quê" nem "por que confiar".'},
+        {texto: 'O problema e o recorte, com o caso Lumina A vs. B, e em seguida o data card.', correta: true, explicacao: 'Exato: a dúvida da banca começa no problema e na base.'},
+        {texto: 'O agente respondendo a uma pergunta livre no Claude Desktop.', explicacao: 'Sem baseline nem de-para, o número não tem régua. O agente vem depois da evidência.'},
+      ],
+    },
+    {
+      pergunta: 'No ensaio, dois dos três criativos do de-para ficaram fora do intervalo. O que fazer?',
+      opcoes: [
+        {texto: 'Trocar por três criativos que ficaram dentro.', explicacao: 'É cherry-picking: a demo deixa de representar o modelo.'},
+        {texto: 'Manter a regra de escolha, mostrar os três e contextualizar com a cobertura do golden set inteiro.', correta: true, explicacao: 'Isso. Com 80% de cobertura, dois de três fora acontece, e dizer isso com números mostra domínio.'},
+        {texto: 'Alargar o intervalo para 95% só na demo.', explicacao: 'Muda a promessa do modelo para caber na demo; a banca vai perguntar por quê.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas seções do README a Galaxies mais vai precisar três semanas depois da banca?',
+      opcoes: [
+        {texto: 'Instalação e execução, com versões fixadas e a configuração do cliente MCP.', correta: true, explicacao: 'É a seção que permite rodar o servidor e conectar a persona sem vocês por perto.'},
+        {texto: 'A lista de ideias de evolução.', explicacao: 'Útil, mas ninguém consegue usar o projeto só com ela.'},
+        {texto: 'Os agradecimentos.', explicacao: 'Não faz parte das seções do briefing.'},
+      ],
+    },
+    {
+      pergunta: 'A demo ao vivo trava no bloco do MCP. Qual é a melhor reação?',
+      opcoes: [
+        {texto: 'Tentar reiniciar o Claude Desktop até funcionar.', explicacao: 'Consome o tempo dos blocos seguintes e a atenção da banca.'},
+        {texto: 'Passar para a gravação ou para os prints do Inspector e seguir o roteiro.', correta: true, explicacao: 'O plano B existe para isso: a evidência continua na tela e o tempo é preservado.'},
+        {texto: 'Pular o MCP e dizer que funciona.', explicacao: 'Afirmação sem evidência é o que a demo inteira tenta evitar.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: ensaie com cronômetro]
+1. Escreva o roteiro do seu grupo nos oito blocos, com uma frase-chave e a fonte de cada número.
+2. Rode `ablacao.py` e `demo_de_para.py` com a **sua** base e cole as saídas no roteiro.
+3. Ensaie com cronômetro. Se passar de 7 minutos, corte do bloco de arquitetura, nunca do de limitações.
+4. Grave o ensaio. Essa gravação é o seu plano B.
+:::
+
+<details>
+<summary>Ver um exemplo de roteiro preenchido</summary>
+
+> **0:00 Problema.** "A Lumina tem dois Shorts e verba para impulsionar um. Nosso agente prevê as curtidas de cada um antes da publicação, com margem de erro." *(tela: A e B lado a lado)*
+>
+> **0:40 Base.** "Coletamos N Shorts de M canais de moda, beleza e automotivo, de janeiro de 2025 a setembro de 2026, pela API oficial. Não cobrimos canais com menos de 10 posts." *(tela: data card)*
+>
+> **1:20 Baseline.** "Dentro do mesmo canal, a mediana do canal acerta 50% dos pares; nosso modelo, 67%." *(tela: tabela de ablação)*
+>
+> **2:00 Multimodal.** "Ler o vídeo acrescenta 4,5 pontos. É um ganho real, e pequeno." *(tela: a linha do vídeo destacada)*
+>
+> **2:40 Ao vivo.** "Três criativos de canais que o modelo nunca viu, escolhidos pela regra 'primeiro de cada setor'. Os três ficaram dentro do intervalo; no conjunto de 36, a cobertura é de 89%." *(tela: saída do demo_de_para)*
+>
+> **4:10 Explicação.** "Para o B, o gancho com nota 8 pesa 17% a mais. É o que o modelo aprendeu, não uma lei." *(tela: top_drivers e o texto)*
+>
+> **4:50 MCP.** "É assim que a persona de vocês vai chamar." *(tela: Claude Desktop pedindo A ou B; o número bate com o JSON)*
+>
+> **5:40 Limitações.** "Canal novo, formato inédito e setor fora do recorte ligam o sinal de baixa confiança. A probabilidade de B superar A supõe erros independentes."
+
+Os números acima são do exemplo sintético da trilha; troque pelos do seu grupo.
+
+</details>
+
+---
+
+## Resumo
+
+- A demo é um **argumento com evidência**, na ordem da dúvida: problema, base, **baseline**, ganho, **agente ao vivo com de-para**, explicação, **MCP**, **limitações**.
+- **Todo número dito aparece na tela**, com fonte; os criativos do de-para são escolhidos **antes** de ver o resultado.
+- O **plano B** (gravação, prints, cache, stdio, `aquecer()`) é montado antes da demo, não durante.
+- O **README** segue as nove seções do briefing e é testado numa **máquina limpa**, com versões exatas.
+- Uma **interface mínima** é opcional; se existir, ela só chama a API.
+
+## Referências
+
+- Hub do projeto: [Templates (data card, model card, README)](/projetos/galaxies/templates) e [Autoavaliação](/projetos/galaxies/autoavaliacao).
+- Gebru et al. [*Datasheets for Datasets*](https://arxiv.org/abs/1803.09010). Communications of the ACM, 2021.
+- Mitchell et al. [*Model Cards for Model Reporting*](https://arxiv.org/abs/1810.03993). FAT*, 2019.
+- Streamlit. [App testing (`AppTest`)](https://docs.streamlit.io/develop/api-reference/app-testing).
+
+**Próxima aula:** [Pipeline agnóstico: treinar para a base de um cliente](/aulas/ml-preditivo-e-agentes/ir-alem/pipeline-agnostico): o mesmo agente, retreinado para a base de outra marca (módulo opcional).

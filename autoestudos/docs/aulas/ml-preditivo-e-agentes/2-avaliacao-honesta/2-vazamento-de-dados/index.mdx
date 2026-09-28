@@ -1,0 +1,431 @@
+---
+sidebar_position: 2
+sidebar_label: 'Vazamento de dados'
+title: 'Vazamento de dados'
+description: 'As cinco famílias de vazamento de dados no case Galaxies (alvo, temporal, grupo, pré-processamento e duplicatas), como detectá-las e o salto de métrica que cada uma produz.'
+tags: [ml-preditivo, avaliacao, vazamento]
+---
+
+import LeakageDetective from '@site/src/components/interativos/LeakageDetective';
+
+# Vazamento de Dados: Como o Futuro Entra no Seu Treino
+
+<LessonMeta
+  tempo="50 min"
+  semana={1}
+  etapa="avaliacao"
+  objetivos={[
+    'Definir vazamento de dados pelo teste do momento da previsão',
+    'Classificar um vazamento em uma das cinco famílias: alvo, temporal, grupo, pré-processamento e duplicatas',
+    'Detectar vazamento por métrica boa demais, importância dominante e o teste de remover a feature',
+    'Calcular estatísticas do canal sem usar o próprio post, o futuro nem alvos imaturos',
+  ]}
+  prerequisitos={[
+    {label: 'Baselines', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/baselines'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+  ]}
+/>
+
+Você adiciona uma coluna à base, retreina, e o Spearman no teste temporal pula de **0,845 para 0,982**. O MAE em log cai de 0,79 para 0,31, ou seja, o erro típico passa de um fator de 2,2 para um fator de 1,4. Nenhum paper de predição de popularidade antes da publicação chegou perto disso: a faixa realista é de 0,55 a 0,85.
+
+A coluna era `log_views`, as visualizações do próprio Short. O modelo não ficou genial; ele aprendeu a ler a resposta. Curtidas e views são quase a mesma medida, tomadas depois da publicação. Na hora em que a Lumina pede a previsão, **o vídeo ainda não tem views**.
+
+Esse é o caso fácil, porque o número absurdo denuncia o problema. O difícil é o vazamento que melhora a métrica em 0,007. Ele não dispara alarme nenhum, passa para o relatório e só aparece quando o agente erra em produção.
+
+:::info[Definição]
+Existe <Termo id="leakage">vazamento de dados</Termo> (*data leakage*) quando o treino ou a avaliação usam informação que **não estaria disponível no momento da previsão**, em produção. O teste é uma pergunta só, feita coluna a coluna: *"no instante em que a marca pede a previsão, este valor existe, e é exatamente este?"*.
+:::
+
+---
+
+## Por que é o erro mais caro do projeto
+
+Um bug comum quebra o código. Um vazamento **melhora** a métrica, e por isso sobrevive. Ele tem três custos:
+
+- **Decisões erradas no desenvolvimento.** Você escolhe features, hiperparâmetros e arquiteturas guiado por um número inflado.
+- **Promessa falsa.** O README diz "Spearman 0,95" e o agente entrega bem menos quando a Galaxies o usa com Shorts novos.
+- **Credibilidade.** Quem avalia o projeto conhece a literatura. Um número fora da faixa sem explicação vai ser tratado como vazamento até prova em contrário.
+
+Se você vem do mundo de LLMs, já conhece o primo desse problema: **contaminação de benchmark**, quando os exemplos de teste estavam nos dados de treino do modelo. A lógica de defesa é a mesma da curadoria de [golden datasets](/aulas/eval-driven-development/criacao-e-curadoria-de-golden-datasets): o conjunto de avaliação precisa ser genuinamente novo para o modelo.
+
+Kapoor e Narayanan (2023) reuniram relatos de erros de ML, sobretudo vazamento, em 17 áreas científicas, somando centenas de artigos publicados afetados, e propuseram uma taxonomia com 8 tipos de vazamento. Não é erro de iniciante; é erro de quem não fez a auditoria.
+
+---
+
+## Cinco famílias de vazamento
+
+<Sketch name="m2/taxonomia-vazamento" alt="Diagrama com a caixa central 'vazamento: informação que não existe no momento da previsão' ligada a cinco tipos. 1, de alvo: views, comentários e compartilhamentos do próprio post; sintoma: métrica boa demais e uma feature dominando a importância. 2, temporal: estatísticas do canal com posts futuros, inscritos de hoje, alvo imaturo; teste: altere o futuro e veja se a feature do passado muda. 3, de grupo: mesmo canal no treino e no teste quando a meta é canal novo; compare split por canal com split aleatório. 4, de pré-processamento: scaler, PCA, TF-IDF ou encoder ajustados na base inteira; faça o fit só no treino, dentro de um Pipeline. 5, duplicatas: reupload do mesmo vídeo nos dois lados do split; agrupe por hash de título e duração ou por embedding quase igual." caption="Cinco jeitos de o futuro entrar no treino, e o teste que pega cada um." />
+
+### 1. Vazamento de alvo (*target leakage*)
+
+A feature é uma **consequência** do alvo, ou mede a mesma coisa por outro caminho. No case:
+
+- views, comentários, compartilhamentos e inscritos ganhos com o vídeo;
+- qualquer "taxa de engajamento" que use o próprio post (curtidas/views, comentários/views);
+- as curtidas das primeiras horas. Esse é outro problema, o de *early popularity*, muito mais fácil e fora do escopo do briefing.
+
+É a família mais barulhenta: no código abaixo, views e comentários levam o Spearman para cerca de 0,98.
+
+### 2. Vazamento temporal
+
+A feature é legítima em princípio, mas foi **calculada com dados de depois** do momento da previsão. É a família mais comum no case, porque quase toda feature de canal é uma agregação no tempo:
+
+- **Estatísticas do canal com o futuro.** `groupby("canal")["y"].transform("median")` usa todos os posts do canal, inclusive os que vêm depois. O mesmo vale para um *target encoding* do canal ajustado na base inteira.
+- **Janela que inclui o próprio post.** Esquecer o `shift(1)` antes de `rolling` ou `expanding` coloca uma fração do alvo dentro da feature. No código, isso sozinho leva o Spearman de 0,845 para 0,918.
+- **Inscritos coletados hoje.** A API devolve o número de inscritos atual. Para um post de 2024, esse valor inclui crescimento futuro. É um vazamento brando, mas real. Mitigações: coletar o canal periodicamente e usar o valor mais próximo da data do post; ou aceitar o valor atual, documentar o risco e testar a sensibilidade retirando a feature.
+- **Alvo imaturo.** Um post publicado há 2 dias ainda não tem as curtidas de 30 dias. Se a "mediana dos posts anteriores" usa a contagem final desse post, ela usa um número que ninguém conhecia no momento da previsão. A correção é usar só posts com **pelo menos 30 dias** antes do post a prever (a função `mediana_madura` no código).
+
+Um detalhe que engana: fazer o **split** temporal não resolve nada disso. As features são calculadas antes do split; se a coluna já carrega o futuro, ela o carrega para dentro do teste também.
+
+### 3. Vazamento de grupo
+
+Acontece quando a **pergunta** é "como o modelo vai se sair em canais que ele nunca viu", mas posts do mesmo canal estão no treino e no teste. O modelo aprende a identidade do canal (pelo `canal_id`, pelo número exato de inscritos, pelo estilo de título) e a métrica mede memorização. Para a Galaxies isso importa: a Lumina pode não estar na sua base. A defesa é o split por canal, na [próxima aula](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal).
+
+### 4. Vazamento de pré-processamento
+
+Transformações **ajustadas** na base inteira antes do split: `StandardScaler`, PCA dos embeddings de vídeo, vocabulário e IDF de um TF-IDF, *target encoders*. O PCA "vê" a distribuição dos vídeos de teste; o target encoder vê o alvo deles. O efeito do scaler costuma ser pequeno; o do target encoder pode ser enorme (ele é, literalmente, a "mediana do canal com o futuro"). A regra: tudo o que tem `fit` roda **só no treino** de cada fold, de preferência dentro de um `Pipeline` do scikit-learn. Você vai aplicar isso ao reduzir embeddings no [módulo 3](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto) e no [módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais).
+
+### 5. Duplicatas e reuploads
+
+O mesmo vídeo aparece duas vezes: reupload do próprio canal, corte de um vídeo longo publicado como Short, o mesmo criativo postado pela marca e pelo influenciador. Se uma cópia cai no treino e outra no teste, o modelo "reconhece" o vídeo. Detecção: título e duração idênticos, hash perceptual da thumbnail ou embeddings visuais com similaridade de cosseno muito alta ([módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais)). Defesa: tratar cada grupo de duplicatas como uma unidade no split (as duas cópias do mesmo lado) ou manter só uma.
+
+---
+
+## Como detectar
+
+Nenhum teste isolado pega todos os vazamentos. Use os quatro em conjunto.
+
+**1. Bom demais para ser verdade.** Compare com duas réguas: a literatura (Spearman de cerca de 0,55 a 0,85 antes da publicação, com o conteúdo visual somando +0,02 a +0,04) e o seu baseline. Uma única feature que soma +0,14 de Spearman sobre um baseline forte é quase certamente vazamento.
+
+**2. Importância dominada por uma feature.** Olhe a importância por ganho (*gain*) do modelo. No código abaixo, `log_views` concentra **97%** do ganho total. Em um modelo honesto do case, as features do canal lideram, mas nenhuma sozinha costuma levar quase tudo.
+
+**3. Remova e veja.** Retreine sem a feature suspeita. Se a métrica despenca para o nível do baseline, o modelo dependia dela para "ler a resposta". A tabela do código é esse teste feito para cinco cenários.
+
+**4. Auditoria da linha do tempo, coluna a coluna.** Para cada feature, escreva numa tabela: de onde ela vem (qual endpoint, qual cálculo), **quando** o valor existe e se, no treino, ela foi calculada do mesmo jeito que será em produção. É o único teste que pega os vazamentos sutis, e dá para automatizar parte dele com um teste de perturbação: altere o futuro e confira que as features do passado não mudam (você vai escrever esse teste com pytest na aula [2.5](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis)).
+
+Treine o olhar com o componente abaixo: classifique cada coluna como "existe antes" ou "vaza". As colunas e os valores do componente são ilustrativos, gerados por um simulador.
+
+<LeakageDetective />
+
+---
+
+## Na prática (código)
+
+O código usa a mesma base sintética da [aula anterior](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/baselines), com o mesmo modelo, e muda só o conjunto de features. Como na base sintética as views e os comentários são gerados a partir das curtidas (como no mundo real), eles se comportam como a versão real do vazamento.
+
+<details>
+<summary>Passo 1: o gerador da base sintética (o mesmo em todo o módulo)</summary>
+
+```python
+import numpy as np
+import pandas as pd
+
+
+def gerar_base(n_canais=60, seed=42):
+    """Shorts sintéticos: nível próprio por canal + tendência lenta + ruído."""
+    rng = np.random.default_rng(seed)
+    efeito_rosto = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}
+    partes = []
+    for c in range(n_canais):
+        setor = ["moda", "beleza", "automotivo"][c % 3]
+        inscritos = int(np.exp(np.clip(rng.normal(11.3, 1.3), 8, 15.5)))
+        nivel = 0.85 * np.log(inscritos) - 4.2 + rng.normal(0, 0.55)
+        tendencia = np.cumsum(rng.normal(rng.normal(0, 0.03), 0.09, 32))  # por mês
+        inicio = rng.integers(0, 400) if rng.random() < 0.85 else rng.integers(700, 900)
+        n = max(8, int((960 - inicio) / rng.uniform(6, 20)))  # 1 post a cada 6-20 dias
+        dia = np.sort(rng.integers(inicio, 960, n))
+        hora = np.where(rng.random(n) < 0.4, rng.integers(18, 23, n), rng.integers(7, 24, n))
+        duracao = np.clip(rng.normal(38 if setor == "automotivo" else 28, 12, n), 8, 90).round()
+        rosto = rng.random(n) < (0.35 if setor == "automotivo" else 0.7)
+        texto_tela = rng.random(n) < 0.5
+        cortes_10s = np.clip(rng.normal(2.5, 1.0, n), 0, 6).round(1)
+        pergunta = rng.random(n) < 0.3
+        gancho = np.clip(rng.normal(5, 2, n), 0, 10).round()  # nota do VLM, 0-10
+        conteudo = (0.09 * (gancho - 5) + efeito_rosto[setor] * rosto + 0.15 * texto_tela
+                    + 0.05 * (cortes_10s - 2.5) - 0.05 * (duracao - 30) / 10
+                    + 0.06 * pergunta + 0.12 * ((hora >= 18) & (hora <= 22)))
+        viral = rng.random(n) < 0.03
+        y = (nivel + tendencia[dia // 30] + conteudo + rng.normal(0, 0.7, n)
+             + viral * rng.normal(1.5, 0.4, n))
+        curtidas = np.maximum(0, np.round(np.expm1(y)))
+        regime = np.where(dia >= 455, 1.7, 1.0)  # replays contam desde 31/03/2025
+        views = np.round((curtidas + 1) * np.exp(rng.normal(np.log(35), 0.35, n)) * regime)
+        partes.append(pd.DataFrame({
+            "canal": f"c{c:02d}", "setor": setor, "inscritos": inscritos,
+            "data_pub": pd.Timestamp("2024-01-01") + pd.to_timedelta(dia, "D")
+                        + pd.to_timedelta(hora, "h"),
+            "hora": hora, "duracao_s": duracao, "rosto": rosto, "texto_tela": texto_tela,
+            "cortes_10s": cortes_10s, "titulo_pergunta": pergunta,
+            "legenda_chars": np.clip(rng.normal(90, 45, n), 0, None).round(),
+            "gancho_vlm": gancho, "curtidas": curtidas, "views": views,
+            "comentarios": rng.poisson(curtidas * 0.02),
+        }))
+    df = pd.concat(partes, ignore_index=True)
+    df["y"] = np.log1p(df["curtidas"])
+    return df.sort_values(["data_pub", "canal"]).reset_index(drop=True)
+```
+
+</details>
+
+**Passo 2: uma feature honesta e quatro que vazam.** Todas aparecem em projetos reais, e três delas parecem inofensivas.
+
+```python
+import lightgbm as lgb
+
+df = gerar_base().sort_values(["canal", "data_pub"]).reset_index(drop=True)
+g = df.groupby("canal")["y"]
+df["log_inscritos"] = np.log(df["inscritos"])
+# honesta: só posts anteriores
+df["mediana_canal"] = g.transform(lambda s: s.shift(1).expanding().median())
+# vazamentos que aparecem em projetos reais:
+df["mediana_canal_tudo"] = g.transform("median")  # base inteira: inclui o futuro
+df["media_ult5_sem_shift"] = g.transform(lambda s: s.rolling(5, min_periods=1).mean())
+df["log_views"] = np.log1p(df["views"])  # só existe depois da publicação
+df["log_comentarios"] = np.log1p(df["comentarios"])  # idem
+
+conteudo = ["hora", "duracao_s", "rosto", "texto_tela", "cortes_10s",
+            "titulo_pergunta", "gancho_vlm"]
+base = ["log_inscritos", "mediana_canal"] + conteudo
+cenarios = {
+    "honesto": base,
+    "+ comentários": base + ["log_comentarios"],
+    "+ views": base + ["log_views"],
+    "mediana da base inteira": ["log_inscritos", "mediana_canal_tudo"] + conteudo,
+    "últimos 5 sem shift(1)": ["log_inscritos", "media_ult5_sem_shift"] + conteudo,
+}
+```
+
+**Passo 3: o mesmo modelo, o mesmo split temporal, cinco conjuntos de features.**
+
+```python
+def spearman(a, b):
+    ra, rb = pd.Series(a).rank().to_numpy(), pd.Series(b).rank().to_numpy()
+    return 0.0 if ra.std() == 0 or rb.std() == 0 else float(np.corrcoef(ra, rb)[0, 1])
+
+def spearman_intra(d, col, min_posts=3):
+    partes = [(spearman(x["y"], x[col]), len(x)) for _, x in d.groupby("canal")
+              if len(x) >= min_posts]
+    return sum(r * n for r, n in partes) / sum(n for _, n in partes)
+
+corte = pd.Timestamp("2026-03-01")
+treino, teste = df[df["data_pub"] < corte], df[df["data_pub"] >= corte].copy()
+linhas, modelos = [], {}
+for nome, cols in cenarios.items():
+    m = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15,
+                          random_state=0, verbose=-1)
+    m.fit(treino[cols].astype(float), treino["y"])
+    teste["pred"] = m.predict(teste[cols].astype(float))
+    modelos[nome] = m
+    linhas.append({"cenario": nome, "MAE_log": (teste["y"] - teste["pred"]).abs().mean(),
+                   "spearman": spearman(teste["y"], teste["pred"]),
+                   "spearman_intra": spearman_intra(teste, "pred")})
+print(pd.DataFrame(linhas).round(3).to_string(index=False))
+```
+
+```text
+                cenario  MAE_log  spearman  spearman_intra
+                honesto    0.788     0.845           0.226
+          + comentários    0.289     0.983           0.818
+                + views    0.314     0.982           0.869
+mediana da base inteira    0.768     0.852           0.251
+ últimos 5 sem shift(1)    0.567     0.918           0.430
+```
+
+Leia a tabela de cima para baixo, pensando em qual alarme cada linha dispararia:
+
+- **Views e comentários**: Spearman de 0,98 e Spearman intra-canal acima de 0,8. Dispara todos os alarmes.
+- **Últimos 5 sem `shift(1)`**: 0,918 de Spearman e MAE 28% menor. Está acima da faixa da literatura, mas um aluno animado poderia acreditar. A feature inclui 1/5 do próprio alvo.
+- **Mediana da base inteira**: +0,007 de Spearman e +0,025 de intra-canal. **Nenhum alarme dispara.** O ganho é pequeno o bastante para parecer "uma feature boa", e é vazamento puro. Só a auditoria da linha do tempo pega esse caso.
+
+**Passo 4: a importância denuncia o vazamento grosseiro.**
+
+```python
+m = modelos["+ views"]
+imp = pd.Series(m.booster_.feature_importance("gain"), index=cenarios["+ views"])
+print((imp / imp.sum()).sort_values(ascending=False).head(4).round(3).to_string())
+```
+
+```text
+log_views        0.970
+mediana_canal    0.022
+log_inscritos    0.002
+duracao_s        0.001
+```
+
+**Passo 5: a mediana "madura".** A versão com `shift(1)` ainda tem o problema do alvo imaturo: ela usa a contagem final de um post publicado dias antes. A função abaixo usa só posts publicados **pelo menos 30 dias antes**, exatamente o que você saberia em produção.
+
+```python
+def mediana_madura(grupo, dias=30):
+    """Mediana dos posts do canal publicados pelo menos `dias` antes de cada post."""
+    datas = grupo["data_pub"].to_numpy()
+    acumulada = grupo["y"].expanding().median().to_numpy()  # mediana dos posts 0..i
+    ultimo = np.searchsorted(datas, datas - np.timedelta64(dias, "D"), side="right") - 1
+    valores = np.where(ultimo >= 0, acumulada[np.maximum(ultimo, 0)], np.nan)
+    return pd.Series(valores, index=grupo.index)
+
+df["mediana_madura"] = (df.groupby("canal", group_keys=False)[["data_pub", "y"]]
+                        .apply(mediana_madura))
+print(df.loc[df["canal"] == "c00", ["data_pub", "y", "mediana_canal", "mediana_madura"]]
+        .iloc[3:9].assign(data_pub=lambda d: d["data_pub"].dt.date).round(2).to_string(index=False))
+```
+
+```text
+  data_pub    y  mediana_canal  mediana_madura
+2024-09-12 4.49           5.76            5.88
+2024-09-17 6.01           5.72            5.88
+2024-09-30 4.80           5.76            5.88
+2024-10-12 5.76           5.72            5.72
+2024-10-20 4.39           5.76            5.76
+2024-10-20 6.17           5.72            5.76
+```
+
+O truque é o `searchsorted`: para cada post, ele encontra o último post do canal publicado até 30 dias antes e pega a mediana acumulada até ali. Repare nas duas últimas linhas, publicadas no mesmo dia: com `shift(1)`, o segundo post já "conhece" o resultado do primeiro, publicado horas antes. Com a versão madura, não.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Faça a auditoria da linha do tempo para os dois Shorts da Lumina, no instante em que a marca pede a previsão (antes de publicar):
+
+| Feature | Existe antes? | Observação |
+| :--- | :---: | :--- |
+| Duração (55 s vs. 22 s), horário planejado (ter 14h vs. qui 19h) | sim | vem do plano de publicação |
+| Texto na tela, rosto no gancho, nota do gancho pelo VLM | sim | extraídos do arquivo do vídeo |
+| Mediana de curtidas dos posts da Lumina com 30+ dias | sim | os posts das últimas semanas ainda estão amadurecendo |
+| Inscritos da Lumina (cerca de 180 mil) | sim | em produção, o valor de hoje é o certo; o cuidado é no **treino** |
+| Views ou curtidas das primeiras horas de A e B | **não** | só existem depois de publicar |
+| Resultado de um teste A/B pago com os dois criativos | **não** | se existisse, seria outro problema (e dispensaria o modelo) |
+
+Um detalhe fácil de perder: a "mediana de 2.300 curtidas nos últimos 90 dias" da Lumina inclui posts de 2 ou 3 semanas atrás, cuja contagem ainda vai crescer. Se no treino você usou só posts maduros, em produção faça o mesmo. **Treino e produção precisam calcular cada feature do mesmo jeito.**
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas de vazamento]
+1. **"É só uma proporção."** Curtidas/views, comentários/views: se usa uma medida do próprio post depois da publicação, vaza.
+2. **Target encoding do canal na base inteira.** É a mediana do canal com o futuro, com outro nome. Ajuste o encoder só no treino de cada fold, e com as mesmas regras de tempo.
+3. **Esquecer o `shift(1)`.** Janelas `rolling`/`expanding` sem o deslocamento incluem o próprio post.
+4. **"O PCA não vê o alvo, então pode."** Ele vê a distribuição do teste. Faça o `fit` só no treino, dentro de um `Pipeline`.
+5. **Confiar no split temporal para resolver tudo.** Features calculadas antes do split carregam o futuro para dentro do teste.
+6. **Deduplicar depois do split.** Duplicatas precisam ser detectadas antes, e as cópias ficam juntas do mesmo lado.
+7. **Tratar métrica alta como vitória.** Um Spearman acima de 0,9 antes da publicação exige explicação antes de comemoração.
+:::
+
+<Quiz
+  id="m2-a2"
+  perguntas={[
+    {
+      pergunta: 'Quais destas features **vazam** ao prever as curtidas de um Short antes de publicá-lo? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'A razão curtidas/views do próprio Short.', correta: true, explicacao: 'Usa duas medidas pós-publicação do próprio post. É vazamento de alvo.'},
+        {texto: 'A mediana das curtidas dos posts do canal publicados pelo menos 30 dias antes.', explicacao: 'Existe no momento da previsão e usa só alvos maduros. É a versão honesta.'},
+        {texto: 'A média do canal calculada com `groupby("canal")["y"].transform("mean")`.', correta: true, explicacao: 'Usa todos os posts do canal, inclusive o próprio e os futuros: vazamento temporal.'},
+        {texto: 'O horário planejado de publicação.', explicacao: 'Conhecido antes de publicar. Não vaza.'},
+        {texto: 'O número de comentários do Short após 7 dias.', correta: true, explicacao: 'Métrica pós-publicação: vazamento de alvo.'},
+      ],
+    },
+    {
+      pergunta: 'Ao adicionar uma coluna, o Spearman subiu de 0,84 para 0,98 e ela ficou com 90% da importância. Qual é o próximo passo?',
+      opcoes: [
+        {texto: 'Registrar o resultado: a coluna é muito informativa.', explicacao: 'Um salto desses, fora da faixa da literatura e concentrado numa feature, é o padrão clássico de vazamento.'},
+        {texto: 'Auditar de onde vem a coluna e quando ela existe, e retreinar sem ela para ver se a métrica volta ao nível do baseline.', correta: true, explicacao: 'Exato: auditoria da linha do tempo e o teste de remover e ver.'},
+        {texto: 'Aumentar a regularização do modelo.', explicacao: 'Regularização não resolve vazamento: a informação do futuro continua lá.'},
+      ],
+    },
+    {
+      pergunta: 'Na tabela da aula, a "mediana da base inteira" melhorou o Spearman em só 0,007. O que isso ensina?',
+      opcoes: [
+        {texto: 'Que esse tipo de vazamento é inofensivo e pode ficar.', explicacao: 'Continua sendo informação do futuro. Em outra base, ou com outro modelo, o efeito pode ser maior, e em produção ele não existe.'},
+        {texto: 'Que vazamentos sutis não disparam os alarmes de métrica e só são pegos pela auditoria coluna a coluna.', correta: true, explicacao: 'Exato. Os testes de métrica boa demais e importância dominante pegam os vazamentos grosseiros; os sutis exigem auditoria e testes de perturbação.'},
+        {texto: 'Que a mediana é robusta e por isso não vaza.', explicacao: 'A robustez da mediana reduz o tamanho do efeito, mas não muda o fato de que ela usa posts futuros.'},
+      ],
+    },
+    {
+      pergunta: 'Você ajustou um PCA com os embeddings de TODOS os vídeos e só depois separou treino e teste por data. Que vazamento é esse?',
+      opcoes: [
+        {texto: 'De alvo.', explicacao: 'O PCA não usa as curtidas; a informação que vaza é a distribuição dos vídeos de teste.'},
+        {texto: 'De pré-processamento.', correta: true, explicacao: 'Exato: uma transformação ajustada na base inteira antes do split. O fit deve rodar só no treino de cada fold.'},
+        {texto: 'Não é vazamento, porque o PCA é não supervisionado.', explicacao: 'Não supervisionado não quer dizer que não vaza: os componentes foram escolhidos olhando os vídeos do teste.'},
+      ],
+    },
+    {
+      pergunta: 'O objetivo é prever para uma marca que **não está** na sua base. Você usa `canal_id` como feature e um split aleatório. Qual é o problema principal?',
+      opcoes: [
+        {texto: 'Vazamento de grupo: o mesmo canal fica no treino e no teste, e a métrica mede memorização do canal.', correta: true, explicacao: 'Para a pergunta "canal novo", os canais do teste não podem aparecer no treino. O split certo é por canal (aula 2.3).'},
+        {texto: 'Vazamento de duplicatas.', explicacao: 'Duplicatas são o mesmo vídeo repetido. Aqui o problema é o mesmo canal dos dois lados.'},
+        {texto: 'Nenhum, se o split for estratificado por setor.', explicacao: 'Estratificar por setor não impede que o mesmo canal esteja nos dois lados.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: auditoria e o preço da honestidade]
+1. Monte a **tabela de auditoria** das features da sua base, com as colunas: feature, fonte (endpoint ou cálculo), quando o valor existe, família de risco, teste que você fez.
+2. Na base sintética (ou na sua), troque a `mediana_canal` com `shift(1)` pela `mediana_madura` e compare as métricas. Quanto custa ser estritamente honesto?
+:::
+
+<details>
+<summary>Ver um exemplo de auditoria e a solução do item 2</summary>
+
+Exemplo de linhas da auditoria:
+
+| Feature | Fonte | Quando existe | Risco | Teste |
+| :--- | :--- | :--- | :--- | :--- |
+| `mediana_madura` | `y` dos posts do canal com 30+ dias | antes da publicação | temporal | perturbar posts futuros não muda o valor |
+| `log_inscritos` | `channels.list`, coletado hoje | hoje, não na data do post | temporal (brando) | retreinar sem ela e comparar |
+| `gancho_vlm` | VLM sobre o arquivo do vídeo | antes da publicação | nenhum, se a rubrica não olhar métricas | conferir que o prompt não recebe views |
+| `log_views` | `videos.list`, `statistics` | só depois | alvo | removida |
+
+Solução do item 2 (continua o código do passo 5):
+
+```python
+treino, teste = df[df["data_pub"] < corte], df[df["data_pub"] >= corte].copy()
+versoes = {"shift(1)": base,
+           "madura (30 dias)": ["log_inscritos", "mediana_madura"] + conteudo}
+for nome, cols in versoes.items():
+    m = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15,
+                          random_state=0, verbose=-1)
+    m.fit(treino[cols].astype(float), treino["y"])
+    teste["pred"] = m.predict(teste[cols].astype(float))
+    print(f"{nome:17s} MAE={(teste['y'] - teste['pred']).abs().mean():.3f}  "
+          f"spearman={spearman(teste['y'], teste['pred']):.3f}  "
+          f"intra={spearman_intra(teste, 'pred'):.3f}")
+```
+
+```text
+shift(1)          MAE=0.788  spearman=0.845  intra=0.226
+madura (30 dias)  MAE=0.807  spearman=0.834  intra=0.223
+```
+
+A versão madura perde um pouco (MAE +0,019, Spearman −0,011) porque ignora o último mês de cada canal. Na base sintética os alvos já nascem "maduros", então essa diferença mede só a informação recente que você abre mão de usar. Na sua base real, a versão com `shift(1)` teria **também** o otimismo do alvo imaturo; a madura é a que reproduz o que o agente vai saber em produção.
+
+</details>
+
+---
+
+## Resumo
+
+- **Vazamento** é usar, no treino ou na avaliação, informação que não existe no momento da previsão. O teste é perguntar, coluna a coluna, "isso existe antes de publicar?".
+- As cinco famílias do case: **alvo** (views, comentários), **temporal** (estatísticas com o futuro, `shift` esquecido, inscritos de hoje, alvo imaturo), **grupo** (mesmo canal nos dois lados), **pré-processamento** (fit na base inteira) e **duplicatas**.
+- Vazamentos grosseiros aparecem como métrica **boa demais** e **importância dominante**; confirme com **remover e ver**.
+- Vazamentos sutis (+0,007 de Spearman) **não disparam alarme**: só a auditoria e os testes de perturbação os pegam.
+- Calcule estatísticas do canal com posts **anteriores e maduros**, do mesmo jeito no treino e em produção.
+
+## Referências
+
+- Kaufman, Rosset, Perlich e Stitelman. [*Leakage in Data Mining: Formulation, Detection, and Avoidance*](https://doi.org/10.1145/2382577.2382579). ACM TKDD, 2012. A formulação clássica do problema.
+- Kapoor e Narayanan. [*Leakage and the reproducibility crisis in machine-learning-based science*](https://doi.org/10.1016/j.patter.2023.100804). Patterns, 2023. Taxonomia de vazamentos e levantamento em várias áreas científicas.
+- scikit-learn. [Common pitfalls and recommended practices](https://scikit-learn.org/stable/common_pitfalls.html): seção sobre *data leakage* e uso de `Pipeline`.
+- Google. [YouTube Data API: recurso `channels`](https://developers.google.com/youtube/v3/docs/channels): `statistics.subscriberCount` é o valor atual do canal.
+
+**Próxima aula:** [Validação temporal e por canal](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal): como separar treino e teste para que a métrica responda à pergunta que a Galaxies vai fazer.

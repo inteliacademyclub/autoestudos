@@ -1,0 +1,552 @@
+---
+sidebar_position: 2
+sidebar_label: 'Obtendo a mídia'
+title: 'Obtendo a mídia'
+description: 'Como obter thumbnails pela API, baixar Shorts em 360p com yt-dlp em 2026 (runtime JS, PO tokens, bloqueio de IP), usar o Gemini direto na URL e lidar com os termos de uso.'
+tags: [ml-preditivo, multimodal, dados, etica]
+---
+
+# Obtendo a Mídia: Thumbnails, yt-dlp e Quando Não Baixar Nada
+
+<LessonMeta
+  tempo="45 min"
+  semana={2}
+  etapa="multimodal"
+  objetivos={[
+    'Decidir, para cada feature, se é preciso baixar o vídeo, só a thumbnail ou nada',
+    'Baixar thumbnails da API com fallback de resolução, retry e cache',
+    'Configurar o yt-dlp de 2026 (runtime JS, 360p, pausas, tratamento de bloqueio) pela API Python',
+    'Usar o Gemini com a URL pública do YouTube como alternativa sem download',
+    'Aplicar uma política de retenção compatível com os termos de uso e contornar as pegadinhas do Colab',
+  ]}
+  prerequisitos={[
+    {label: 'Anatomia de um Short e o pipeline multimodal', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short'},
+    {label: 'Documentação, ética e termos de uso', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos'},
+  ]}
+/>
+
+Você tem 3 mil `video_id`s saídos do coletor do módulo 1 e um pipeline multimodal desenhado. Falta a matéria-prima: os pixels e o som. O caminho que quase todo mundo tenta primeiro é um laço de `yt-dlp` dentro do Colab, em resolução máxima e sem pausa. Por volta do quadragésimo vídeo, aparece a mensagem *"Sign in to confirm you're not a bot"*, e a partir daí nada mais baixa.
+
+O problema não é só técnico. Baixar vídeos do YouTube fora do player oficial esbarra nos termos de uso da plataforma, e o YouTube investe ativamente em dificultar isso. Em 2026, o yt-dlp continua funcionando, mas exige um runtime JavaScript, lida com tokens de prova de origem e é bloqueado com facilidade em IPs de datacenter.
+
+A boa notícia é que boa parte das features **não precisa do vídeo**. Esta aula ensina a obter o mínimo necessário, do jeito mais barato e mais respeitoso possível.
+
+:::info[A regra desta aula]
+Baixe **o mínimo necessário**, na **menor resolução que serve**, **uma vez só**, e **apague** o arquivo depois de extrair as features. Se der para não baixar, não baixe.
+:::
+
+---
+
+## Preciso mesmo baixar o vídeo?
+
+Antes de escrever uma linha de download, pergunte o que cada feature exige.
+
+<Sketch name="m4/a2-decisao" alt="Árvore de decisão: se você não precisa de nada além de canal, tempo e texto, não baixe nada. Se basta a imagem de capa, use a thumbnail da API, sem cota extra. Se bastam atributos de um VLM, deixe o Gemini ler a URL pública do YouTube, sem download. Se precisa de pixels e áudio, use o yt-dlp em 360p, com IP residencial, pausas de 5 a 10 segundos e apagando depois; se aparecer 'Sign in to confirm you are not a bot', pare o lote. Uma nota lembra que, na previsão, o vídeo da marca ainda não está no YouTube e é processado localmente do mesmo jeito que a base." caption="Siga as setas e pare na primeira caixa que resolve o seu caso." />
+
+Três observações sobre o diagrama:
+
+- A **thumbnail** cobre boa parte do "o que aparece" (rosto, texto grande, produto) e custa praticamente nada.
+- O **VLM lendo a URL** cobre atributos semânticos (tipo de gancho, formato, presença de CTA) sem que o arquivo passe pela sua máquina.
+- O **download** só é inevitável para sinais que dependem de pixels em sequência ou do áudio bruto: cortes, movimento, energia do som e transcrição local.
+
+E a nota de baixo é a mais importante do módulo: **na hora da previsão, o Short ainda não foi publicado.** A marca entrega o MP4. O yt-dlp e a URL servem para montar a **base de treino**; o seu pipeline precisa, desde o início, aceitar também um arquivo local.
+
+---
+
+## Thumbnails pela API
+
+O `videos.list(part=snippet)` que o seu coletor já chamou devolve, em `snippet.thumbnails`, até cinco tamanhos:
+
+| Chave | Tamanho | Observação |
+| :--- | :--- | :--- |
+| `default` | 120 × 90 | sempre presente |
+| `medium` | 320 × 180 | sempre presente |
+| `high` | 480 × 360 | sempre presente |
+| `standard` | 640 × 480 | só em alguns vídeos |
+| `maxres` | 1280 × 720 | só em alguns vídeos |
+
+A documentação do recurso `videos` hoje também lista `fhd` e `qhd` para alguns vídeos. Para features, não compensa: um encoder como o SigLIP 2 redimensiona tudo para 224 × 224.
+
+Baixar a imagem (de `i.ytimg.com`) **não consome cota** da YouTube Data API: as URLs vieram na chamada que você já pagou. Duas particularidades dos Shorts:
+
+- A thumbnail de um Short costuma ser **um frame do próprio vídeo**, escolhido pelo criador ou automaticamente. Ela é informativa sobre o gancho, mas não é o gancho.
+- Os tamanhos padrão são 4:3 ou 16:9. É comum que o conteúdo vertical venha no centro, com **faixas pretas nas laterais** (*pillarbox*). Confira nas suas e recorte antes de extrair features, senão "fundo preto" vira uma característica do vídeo.
+
+O código abaixo tenta do maior para o menor tamanho, pula os que retornam 404, repete em erros transitórios (429, 5xx, rede) com espera exponencial e grava em cache:
+
+```python
+import os
+from pathlib import Path
+
+import httpx
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+ORDEM = ["maxres", "standard", "high", "medium", "default"]  # da maior para a menor
+
+
+def _transitorio(e: BaseException) -> bool:
+    if isinstance(e, httpx.TransportError):  # timeout, conexão caiu
+        return True
+    return isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (429, 500, 502, 503)
+
+
+@retry(retry=retry_if_exception(_transitorio), stop=stop_after_attempt(4),
+       wait=wait_exponential(multiplier=1, max=30), reraise=True)
+def _baixar(cliente: httpx.Client, url: str) -> bytes:
+    resp = cliente.get(url)
+    resp.raise_for_status()
+    return resp.content
+
+
+def baixar_thumbnail(video_id: str, thumbnails: dict, pasta: Path,
+                     cliente: httpx.Client) -> Path | None:
+    """`thumbnails` é o snippet.thumbnails que o coletor do módulo 1 já guardou."""
+    destino = pasta / f"{video_id}.jpg"
+    if destino.exists():  # cache: nunca baixe duas vezes
+        return destino
+    for chave in ORDEM:
+        if chave not in thumbnails:  # maxres/standard só existem se o original for grande
+            continue
+        try:
+            conteudo = _baixar(cliente, thumbnails[chave]["url"])
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                continue  # listada mas inexistente: tente a próxima
+            raise
+        pasta.mkdir(parents=True, exist_ok=True)
+        tmp = destino.with_suffix(".tmp")
+        tmp.write_bytes(conteudo)
+        os.replace(tmp, destino)
+        return destino
+    return None
+```
+
+Para testar sem tocar a internet, o `httpx` aceita um transporte falso. Aqui o "servidor" responde 404 para `maxres` e falha uma vez com 503 no `high`:
+
+```python
+import shutil
+
+pedidos = []
+
+
+def servidor_falso(req: httpx.Request) -> httpx.Response:
+    """Simula o i.ytimg.com: maxres não existe e o 'high' falha uma vez com 503."""
+    pedidos.append(req.url.path)
+    if "maxresdefault" in req.url.path:
+        return httpx.Response(404)
+    if "hqdefault" in req.url.path and pedidos.count(req.url.path) == 1:
+        return httpx.Response(503)
+    return httpx.Response(200, content=b"\xff\xd8\xff fake jpeg")
+
+
+thumbs = {  # formato do snippet.thumbnails devolvido pela API
+    "default": {"url": "https://i.ytimg.com/vi/aB3dE5fG7hI/default.jpg", "width": 120, "height": 90},
+    "high": {"url": "https://i.ytimg.com/vi/aB3dE5fG7hI/hqdefault.jpg", "width": 480, "height": 360},
+    "maxres": {"url": "https://i.ytimg.com/vi/aB3dE5fG7hI/maxresdefault.jpg", "width": 1280, "height": 720},
+}
+shutil.rmtree("thumbs", ignore_errors=True)
+with httpx.Client(transport=httpx.MockTransport(servidor_falso), timeout=10) as cliente:
+    print(baixar_thumbnail("aB3dE5fG7hI", thumbs, Path("thumbs"), cliente), pedidos)
+    pedidos.clear()
+    print(baixar_thumbnail("aB3dE5fG7hI", thumbs, Path("thumbs"), cliente), pedidos)
+```
+
+```text
+thumbs/aB3dE5fG7hI.jpg ['/vi/aB3dE5fG7hI/maxresdefault.jpg', '/vi/aB3dE5fG7hI/hqdefault.jpg', '/vi/aB3dE5fG7hI/hqdefault.jpg']
+thumbs/aB3dE5fG7hI.jpg []
+```
+
+Na primeira chamada: 404 no `maxres`, 503 e nova tentativa no `high`, sucesso. Na segunda, nenhum pedido, porque veio do cache. Em produção, troque o transporte falso por `httpx.Client(timeout=10)` e faça uma pausa curta entre vídeos.
+
+Para o recorte das faixas pretas, procure as colunas e linhas que têm conteúdo. O limiar tolera o ruído de compressão do JPEG:
+
+```python
+import numpy as np
+
+
+def remover_barras(img: np.ndarray, limiar: int = 24, fracao: float = 0.05) -> np.ndarray:
+    """Recorta faixas pretas (pillarbox/letterbox) em volta do conteúdo."""
+    claro = img.max(axis=2) > limiar             # pixel "com conteúdo"
+    cols = np.where(claro.mean(axis=0) > fracao)[0]  # tolera ruído de JPEG na faixa
+    lins = np.where(claro.mean(axis=1) > fracao)[0]
+    if len(cols) == 0:                         # imagem toda preta: devolve como veio
+        return img
+    return img[lins[0]:lins[-1] + 1, cols[0]:cols[-1] + 1]
+
+
+# simula uma thumbnail "high" (480x360) de um Short: conteúdo 9:16 no meio
+rng = np.random.default_rng(0)
+thumb = rng.integers(0, 12, (360, 480, 3), dtype=np.uint8)  # faixa "preta" com ruído
+thumb[:, 139:341] = rng.integers(30, 255, (360, 202, 3))
+recorte = remover_barras(thumb)
+print(thumb.shape, "->", recorte.shape, f"proporção {recorte.shape[1] / recorte.shape[0]:.3f}")
+```
+
+```text
+(360, 480, 3) -> (360, 202, 3) proporção 0.561
+```
+
+A proporção volta a ~9:16. Cuidado com vídeos de fundo escuro: se a borda do conteúdo também é quase preta, o recorte come parte dela. Olhe uma amostra antes de rodar na base inteira.
+
+---
+
+## yt-dlp em 2026: o que mudou
+
+O [yt-dlp](https://github.com/yt-dlp/yt-dlp) continua sendo a ferramenta de referência, mas o YouTube mudou o jogo em três frentes.
+
+**1. Runtime JavaScript obrigatório.** Para montar as URLs dos formatos, o yt-dlp precisa resolver desafios escritos em JavaScript pelo player do YouTube. Hoje isso é feito por scripts externos (o pacote `yt-dlp-ejs`), executados num runtime JS instalado na máquina; eles substituíram o interpretador JavaScript interno que o yt-dlp usava antes. O padrão é o **Deno**, com versão mínima suportada 2.3.0; Node, Bun e QuickJS também são aceitos, mas precisam ser habilitados explicitamente. Na prática:
+
+```bash
+pip install -U "yt-dlp[default]"          # inclui o yt-dlp-ejs
+pip install -U "yt-dlp[default,deno]"     # idem + o Deno pelo PyPI (útil no Colab)
+yt-dlp -v 2>&1 | grep "JS runtimes"       # confira se ele achou o runtime
+```
+
+```text
+[debug] JS runtimes: deno-2.9.7
+```
+
+Se essa linha vier vazia, o download falha ou vem sem formatos de vídeo. O `yt-dlp-ejs` precisa ser atualizado junto com o yt-dlp: por isso o `-U` e o extra `[default]`.
+
+**2. PO tokens.** O YouTube passou a exigir um *Proof of Origin token* para alguns clientes. Segundo o [guia oficial do yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide), os clientes `web` e `mweb` precisam dele para os formatos de vídeo, enquanto outros (como `tv` e `android_vr`) ainda não. O yt-dlp escolhe clientes automaticamente. Se aparecerem erros 403 ou formatos faltando, leia o guia. Com quatro semanas de projeto, não mergulhe em provedores de PO token: se o seu ambiente exigir isso, prefira as rotas sem download.
+
+**3. Bloqueio por IP.** A mensagem *"Sign in to confirm you're not a bot"* aparece com muito mais frequência em **IPs de datacenter**, que é exatamente o que Colab, Kaggle e máquinas de nuvem usam. Insistir só piora. O que funciona:
+
+- rodar o download num **IP residencial** (o seu computador em casa) e subir os arquivos para o Drive;
+- **pausas** aleatórias de 5 a 10 s entre vídeos e **concorrência de 1 a 2**, nunca 16;
+- **360p**, que basta para todas as features deste módulo e reduz tempo e tráfego.
+
+E sobre cookies: a [wiki do yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/Extractors) avisa que usar a sua conta com o yt-dlp traz o risco de ela ser banida, temporária ou permanentemente. Esta trilha recomenda **não** usar cookies da sua conta pessoal. Vídeos públicos não precisam de login.
+
+:::warning[360p num vídeo vertical não é `height<=360`]
+O filtro clássico `-f "bv*[height<=360]+ba/b[height<=360]"` olha a **altura em pixels**. Num Short vertical, o formato "360p" tem 360 × 640, ou seja, altura 640, e o filtro acaba escolhendo o de 144 × 256. Para pedir "o lado menor até 360", ordene por `res`, que o yt-dlp define como a menor dimensão: `-f "bv*+ba/b" -S "res:360"`. Testamos as duas formas contra uma lista de formatos verticais: a primeira escolheu 144 × 256; a segunda, 360 × 640.
+:::
+
+A versão de linha de comando, para um vídeo:
+
+```bash
+yt-dlp -f "bv*+ba/b" -S "res:360" --merge-output-format mp4 \
+  --sleep-interval 5 --max-sleep-interval 10 --sleep-requests 1 \
+  -o "videos/%(id)s.%(ext)s" "https://www.youtube.com/shorts/VIDEO_ID"
+```
+
+Para a base inteira, use a API Python. Ela deixa você tratar cada tipo de erro de um jeito:
+
+```python
+# requer rede e, de preferência, IP residencial; validado sem acessar o YouTube (abaixo)
+import json
+import time
+from pathlib import Path
+
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
+PASTA = Path("videos")          # no Colab: uma pasta no Google Drive
+FALHAS = PASTA / "_falhas.json"
+OPCOES = {
+    "format": "bv*+ba/b",
+    "format_sort": ["res:360"],      # lado MENOR <= 360: 360x640 num Short vertical
+    "merge_output_format": "mp4",    # junta vídeo+áudio (precisa de ffmpeg)
+    "outtmpl": "%(id)s.%(ext)s",
+    "paths": {"home": str(PASTA)},
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "sleep_interval": 5,             # pausa aleatória de 5 a 10 s antes de cada download
+    "max_sleep_interval": 10,
+    "sleep_interval_requests": 1,    # e 1 s entre requisições da extração
+    "retries": 3,
+    "js_runtimes": {"deno": {}},     # o padrão; explícito para lembrar que o Deno é necessário
+}
+BLOQUEIO = ("not a bot", "Sign in to confirm", "HTTP Error 429")
+PERMANENTE = ("Video unavailable", "Private video", "removed", "members-only")
+
+
+class BloqueadoPeloYouTube(RuntimeError):
+    """Pare o lote: insistir só piora o bloqueio do seu IP."""
+
+
+def _registrar_falha(video_id: str, motivo: str) -> None:
+    falhas = json.loads(FALHAS.read_text()) if FALHAS.exists() else {}
+    falhas[video_id] = motivo[:200]
+    FALHAS.write_text(json.dumps(falhas, indent=1))
+
+
+def baixar_video(video_id: str, tentativas: int = 2) -> Path | None:
+    PASTA.mkdir(parents=True, exist_ok=True)
+    if (PASTA / f"{video_id}.mp4").exists():   # cache
+        return PASTA / f"{video_id}.mp4"
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    for tentativa in range(1, tentativas + 1):
+        try:
+            with YoutubeDL(OPCOES) as ydl:
+                info = ydl.extract_info(url, download=True)
+            return Path(info["requested_downloads"][0]["filepath"])
+        except DownloadError as e:
+            msg = str(e)
+            if any(s in msg for s in BLOQUEIO):
+                raise BloqueadoPeloYouTube(msg) from e
+            if any(s in msg for s in PERMANENTE) or tentativa == tentativas:
+                _registrar_falha(video_id, msg)
+                return None
+            time.sleep(60 * tentativa)  # erro transitório: espere e tente de novo
+    return None
+```
+
+Três decisões de desenho estão aí. **Bloqueio** levanta uma exceção que para o lote inteiro: continuar só queima o seu IP. **Falha permanente** (vídeo removido ou privado) é registrada e nunca mais tentada. **Erro transitório** espera e tenta de novo. A concorrência fica em 1 porque o laço é sequencial; se quiser 2, use dois processos com listas de IDs separadas, nunca uma thread pool grande.
+
+Para validar a lógica sem acessar o YouTube, substitua o `extract_info` por respostas falsas e confira também o seletor de formatos contra uma lista típica de um Short vertical:
+
+```python
+import shutil
+
+from yt_dlp.utils import FormatSorter
+
+shutil.rmtree(PASTA, ignore_errors=True)
+respostas = {
+    "okok": {"requested_downloads": [{"filepath": "videos/okok.mp4"}]},
+    "sumiu": DownloadError("ERROR: [youtube] sumiu: Video unavailable"),
+    "bot": DownloadError("ERROR: [youtube] bot: Sign in to confirm you're not a bot."),
+}
+
+
+def extract_info_falso(self, url, download=True):
+    r = respostas[url.rsplit("/", 1)[-1]]
+    if isinstance(r, Exception):
+        raise r
+    return r
+
+
+YoutubeDL.extract_info = extract_info_falso  # só no teste!
+print(baixar_video("okok"))
+print(baixar_video("sumiu"), FALHAS.read_text())
+try:
+    baixar_video("bot")
+except BloqueadoPeloYouTube as e:
+    print("parou o lote:", type(e).__name__)
+
+ydl = YoutubeDL(OPCOES)
+formatos = [  # num Short vertical, "height" é o lado MAIOR
+    {"format_id": "160", "ext": "mp4", "width": 144, "height": 256, "vcodec": "avc1", "acodec": "none", "url": "x", "tbr": 100},
+    {"format_id": "134", "ext": "mp4", "width": 360, "height": 640, "vcodec": "avc1", "acodec": "none", "url": "x", "tbr": 300},
+    {"format_id": "136", "ext": "mp4", "width": 720, "height": 1280, "vcodec": "avc1", "acodec": "none", "url": "x", "tbr": 1500},
+    {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "url": "x", "abr": 128, "tbr": 128},
+]
+formatos.sort(key=FormatSorter(ydl, OPCOES["format_sort"]).calculate_preference)
+escolha = ydl._select_formats(formatos, ydl.build_format_selector(OPCOES["format"]))
+print("escolhido:", [f["format_id"] for f in escolha])
+```
+
+```text
+videos/okok.mp4
+None {
+ "sumiu": "ERROR: [youtube] sumiu: Video unavailable"
+}
+parou o lote: BloqueadoPeloYouTube
+escolhido: ['134+140']
+```
+
+O formato escolhido foi `134+140`: vídeo 360 × 640 mais áudio M4A, unidos pelo ffmpeg. O `_select_formats` é um método interno, usado aqui só para testar; no uso real, quem chama é o próprio `extract_info`.
+
+---
+
+## Alternativa: o Gemini lê a URL
+
+Para a etapa de VLM, você pode pular o download inteiro: a API do Gemini aceita a **URL pública de um vídeo do YouTube** como entrada. As regras, segundo a [documentação de vídeo](https://ai.google.dev/gemini-api/docs/video-understanding):
+
+- só vídeos **públicos** (não privados, não "não listados");
+- no free tier, até **8 horas de vídeo do YouTube por dia**;
+- no free tier, os dados **podem ser usados pelo Google e lidos por revisores humanos**. Para vídeos públicos isso incomoda pouco; para o MP4 inédito de uma marca, incomoda muito;
+- o custo em tokens: 1 frame por segundo, com 66 tokens por frame em resolução baixa (258 no padrão), mais 32 tokens por segundo de áudio. Um Short de 30 s em resolução baixa custa cerca de 30 × (66 + 32) ≈ 2.940 tokens; no padrão, cerca de 8.700.
+
+```python
+# requer GEMINI_API_KEY no ambiente
+from google import genai
+from google.genai import types
+
+cliente = genai.Client()
+resposta = cliente.models.generate_content(
+    model="gemini-3.5-flash-lite",
+    contents=types.Content(parts=[
+        types.Part(
+            file_data=types.FileData(file_uri="https://www.youtube.com/watch?v=VIDEO_ID"),
+            video_metadata=types.VideoMetadata(start_offset="0s", end_offset="3s"),  # só o gancho
+        ),
+        types.Part(text="Nos primeiros 3 segundos aparece um rosto humano? Responda 'sim' ou 'não'."),
+    ]),
+    config=types.GenerateContentConfig(media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW),
+)
+print(resposta.text)
+```
+
+Validamos esse trecho contra o `google-genai` 2.25.0 com uma chave inválida: a requisição foi montada e chegou ao servidor, que respondeu `400 API_KEY_INVALID`, o esperado. A rubrica completa, com saída estruturada em Pydantic, é o assunto da [aula 4.7](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado).
+
+Os limites dessa rota: ela não entrega pixels para o OpenCV nem áudio para o librosa, e **não serve para o vídeo inédito da marca**, que não tem URL pública. Para ele, o caminho é enviar o arquivo à API, o que a 4.7 também cobre.
+
+---
+
+## Termos de uso: o que a trilha recomenda
+
+As [Políticas para Desenvolvedores do YouTube](https://developers.google.com/youtube/terms/developer-policies) proíbem *scraping* (seção III.E.6), limitam o armazenamento de dados não autorizados a 30 dias, com atualização, e restringem métricas derivadas (III.E.4.h). O yt-dlp é, na prática, scraping. Trate isto como uma discussão ética e de risco, não como aconselhamento jurídico.
+
+A postura desta trilha, coerente com o [data card do módulo 1](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos):
+
+1. **Uso educacional e não comercial**, declarado no README.
+2. **Mínimo necessário**: thumbnail e URL primeiro; download só para os sinais que exigem pixels ou áudio, em 360p.
+3. **Apague o vídeo depois de extrair as features.** Guarde só o `video_id` e as colunas derivadas.
+4. **Nunca redistribua** vídeos, áudios ou frames, nem publique a base com mídia.
+5. **Respeite remoções**: vídeo que ficou privado ou foi removido sai da base na próxima atualização.
+
+O item 3 vira código com poucas linhas. O arquivo só é apagado quando **todas** as etapas deram certo; se alguma falhar, ele fica para a próxima tentativa:
+
+```python
+def extrair_e_apagar(video_id: str, etapas: list) -> bool:
+    """Baixa, roda todas as etapas cacheadas e só então apaga o MP4."""
+    caminho = baixar_video(video_id)
+    if caminho is None:
+        return False
+    try:
+        for etapa in etapas:  # cada etapa usa @cache_por_video (aula 4.1)
+            etapa(video_id, str(caminho))
+    except Exception as e:
+        print(f"{video_id}: {e!r}; mantenho o arquivo para tentar de novo")
+        return False
+    caminho.unlink()  # sobram só as features e o video_id
+    return True
+```
+
+Isso tem uma consequência de planejamento: depois de apagar, uma **etapa nova** exige baixar de novo. Por isso vale fechar a lista de etapas da camada mínima antes de processar a base inteira.
+
+---
+
+## Pegadinhas do Colab
+
+- **A sessão cai.** O Colab gratuito encerra sessões longas (por volta de 12 h no máximo) e desconecta antes se ficar ocioso. Com o cache da aula 4.1 isso vira um incômodo, não uma tragédia: o laço recomeça de onde parou.
+- **O disco é efêmero.** Tudo em `/content` some com a sessão. Monte o Drive (`from google.colab import drive; drive.mount("/content/drive")`) e aponte para lá a `RAIZ_CACHE` e a pasta de vídeos.
+- **O Drive detesta milhares de arquivos pequenos.** Listar e ler dezenas de milhares de JSONs pelo Drive é lento. Consolide cada etapa em parquet assim que ela terminar.
+- **O IP é de datacenter.** Por isso o yt-dlp é bloqueado rápido. Uma divisão que funciona: **baixe em casa**, suba os MP4 de 360p para o Drive e rode no Colab só as etapas que precisam de GPU (embeddings, Whisper, VLM local).
+- **A GPU não é garantida.** A T4 gratuita pode não estar disponível na hora. Tudo neste módulo roda em CPU, só mais devagar; planeje o processamento em lotes cacheados, não numa corrida de uma noite.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Os Shorts A e B **ainda não foram publicados**: não têm `video_id`, não têm URL e não têm thumbnail na API. A Lumina entrega dois arquivos, provavelmente em 1080 × 1920 e exportados do editor.
+
+Para que as colunas de A e B signifiquem o mesmo que as da base de treino, passe os arquivos pelo **mesmo caminho**: converta para o lado menor = 360, como o yt-dlp fez com a base, e só então extraia as features.
+
+```bash
+ffmpeg -i lumina_B_final.mov -vf "scale='if(gt(iw,ih),-2,360)':'if(gt(iw,ih),360,-2)'" \
+  -c:v libx264 -crf 28 -c:a aac -b:a 128k lumina_B_360p.mp4
+```
+
+Testado com um vídeo sintético 1080 × 1920: saiu 360 × 640; um 1920 × 1080 sai 640 × 360.
+
+A "thumbnail" de A e B também precisa de um substituto: use o frame que a marca pretende escolher como capa, ou o primeiro frame, e **documente a escolha**. Se na base você usou a thumbnail da API e em A/B usar o primeiro frame, a coluna muda de significado. Nesse caso, prefira treinar também com o primeiro frame.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Baixar em resolução máxima.** 1080p não melhora nenhuma feature deste módulo e multiplica tempo, disco e chance de bloqueio.
+2. **Usar `height<=360` em vídeo vertical.** Você recebe 144 × 256. Use `-S "res:360"`.
+3. **Insistir depois do "not a bot".** Cada tentativa extra piora a reputação do IP. Pare, troque de rede, reduza o ritmo.
+4. **Usar os cookies da sua conta pessoal.** A própria wiki do yt-dlp alerta para risco de banimento.
+5. **Guardar os vídeos "para depois".** Extraia, confira e apague. O que fica é `video_id` + features.
+6. **Tratar a thumbnail atual como a da publicação.** O criador pode trocá-la depois. Para Shorts isso é raro, mas registre no data card que a thumbnail foi coletada na data X.
+:::
+
+<Quiz
+  id="m4-a2"
+  perguntas={[
+    {
+      pergunta: 'Você quer só uma coluna `rosto_na_capa` (há um rosto na imagem de capa?). Qual é a rota mais barata?',
+      opcoes: [
+        {texto: 'Baixar o vídeo com yt-dlp e pegar o primeiro frame.', explicacao: 'Funciona, mas é a rota mais cara e arriscada para uma informação que a API já entrega.'},
+        {texto: 'Baixar a thumbnail pelas URLs de `snippet.thumbnails`, sem cota extra.', correta: true, explicacao: 'Isso. As URLs vieram no videos.list que você já fez, e baixar a imagem não consome cota.'},
+        {texto: 'Pedir ao Gemini que assista o vídeo inteiro.', explicacao: 'Gasta tokens e cota diária de vídeo para algo que uma imagem resolve.'},
+      ],
+    },
+    {
+      pergunta: 'Seu laço de yt-dlp no Colab começou a devolver "Sign in to confirm you are not a bot". O que fazer?',
+      opcoes: [
+        {texto: 'Aumentar a concorrência para terminar antes do bloqueio piorar.', explicacao: 'O contrário: mais requisições pioram a reputação do IP.'},
+        {texto: 'Exportar os cookies da sua conta pessoal e continuar.', explicacao: 'A wiki do yt-dlp alerta para risco de banimento da conta. Não use a conta pessoal.'},
+        {texto: 'Parar o lote, mover o download para um IP residencial e reduzir o ritmo (pausas de 5–10 s, 1–2 em paralelo).', correta: true, explicacao: 'Exato. IPs de datacenter são os mais bloqueados; o cache garante que você retoma de onde parou.'},
+      ],
+    },
+    {
+      pergunta: 'Por que `-f "bv*[height<=360]"` é uma armadilha para Shorts?',
+      opcoes: [
+        {texto: 'Porque Shorts não têm formato de 360p.', explicacao: 'Têm, mas em 360 × 640.'},
+        {texto: 'Porque num vídeo vertical a altura é o lado maior; o filtro exclui o 360 × 640 e escolhe algo como 144 × 256.', correta: true, explicacao: 'Isso. Use `-S "res:360"`: o yt-dlp define `res` como a menor dimensão.'},
+        {texto: 'Porque o filtro exige cookies.', explicacao: 'Filtros de formato não têm relação com autenticação.'},
+      ],
+    },
+    {
+      pergunta: 'Quais afirmações sobre usar o Gemini com a URL do YouTube estão corretas? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Só funciona com vídeos públicos.', correta: true, explicacao: 'Privados e não listados não são aceitos.'},
+        {texto: 'Serve para o vídeo inédito da Lumina antes da publicação.', explicacao: 'Não: o vídeo inédito não tem URL pública. Para ele, envie o arquivo (aula 4.7).'},
+        {texto: 'No free tier, os dados podem ser usados pelo Google.', correta: true, explicacao: 'Sim, e por isso vale pensar duas vezes antes de mandar material inédito de uma marca pelo free tier.'},
+        {texto: 'Entrega os pixels para calcular optical flow no OpenCV.', explicacao: 'Não: o Gemini devolve texto. Para sinais de pixel, você precisa do arquivo.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: o plano de mídia da sua base]
+1. Para cada coluna multimodal que você planeja (liste pelo menos 8), marque a rota: **nada**, **thumbnail**, **URL no Gemini** ou **download**.
+2. Baixe as thumbnails de 50 vídeos da sua base com `baixar_thumbnail` e rode `remover_barras`. Quantas tinham faixas pretas? Alguma foi recortada de forma errada?
+3. Se o seu plano tiver colunas de download: rode `baixar_video` em 10 vídeos, **do seu IP residencial**, e anote o tempo médio por vídeo e o tamanho médio do MP4. Estime quanto tempo a base inteira levaria.
+:::
+
+<details>
+<summary>Ver uma resposta de referência</summary>
+
+Um plano típico para a camada mínima:
+
+| Coluna | Rota |
+| :--- | :--- |
+| `duracao_s` | nada (a API já entrega) |
+| `vertical`, `tem_audio` | download (ffprobe) |
+| `rosto_na_capa`, `texto_na_capa`, `sonda_*_capa` | thumbnail |
+| `tipo_gancho`, `tem_cta`, `formato` | URL no Gemini (base) / upload do arquivo (A e B) |
+| `cortes_por_s`, `movimento_gancho`, `brilho_gancho` | download |
+| `palavras_por_s`, `energia_rms` | download (só o áudio basta: `-f "ba"`) |
+
+Para a estimativa do item 3, some o tempo de download à pausa média entre vídeos (7,5 s com 5–10 s). Só as pausas, em 3 mil vídeos, já somam 3.000 × 7,5 s ≈ 6,3 h. É por isso que o download roda em lotes, com cache, ao longo de alguns dias, e não numa noite.
+
+Sobre as faixas pretas: se o recorte comeu parte do conteúdo em vídeos de fundo escuro, aumente `fracao` (por exemplo, 0,15) ou reduza `limiar`, e confira de novo numa amostra.
+
+</details>
+
+---
+
+## Resumo
+
+- Nem toda feature exige o vídeo: **thumbnail** (API, sem cota extra) e **URL no Gemini** cobrem boa parte; o **download** fica para cortes, movimento e áudio.
+- O **yt-dlp de 2026** precisa de um runtime JS (Deno ≥ 2.3) e do `yt-dlp-ejs` (`pip install -U "yt-dlp[default]"`); lida com **PO tokens** e sofre **bloqueio em IPs de datacenter**.
+- Baixe em **360p pelo lado menor** (`-S "res:360"`), com **pausas de 5–10 s** e concorrência de 1–2, trate bloqueio parando o lote e registre falhas permanentes.
+- Os **termos de uso** proíbem scraping: uso educacional, mínimo necessário, **apagar após extrair**, nunca redistribuir.
+- Na **previsão**, o vídeo da marca não está no YouTube: processe o MP4 local **pelo mesmo caminho** da base.
+
+## Referências
+
+- [YouTube Data API: recurso thumbnails](https://developers.google.com/youtube/v3/docs/thumbnails) e [recurso videos](https://developers.google.com/youtube/v3/docs/videos).
+- [YouTube API Services: Developer Policies](https://developers.google.com/youtube/terms/developer-policies).
+- yt-dlp: [README](https://github.com/yt-dlp/yt-dlp), [guia do EJS (runtime JS)](https://github.com/yt-dlp/yt-dlp/wiki/EJS), [PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) e [notas do extrator do YouTube](https://github.com/yt-dlp/yt-dlp/wiki/Extractors).
+- [Gemini API: video understanding](https://ai.google.dev/gemini-api/docs/video-understanding).
+- [Troubleshooting do projeto Galaxies](/projetos/galaxies/troubleshooting).
+
+**Próxima aula:** [Frames, cortes e sinais de baixo nível](/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais): como escolher 8 frames entre 660 e medir ritmo, luz e movimento com OpenCV.

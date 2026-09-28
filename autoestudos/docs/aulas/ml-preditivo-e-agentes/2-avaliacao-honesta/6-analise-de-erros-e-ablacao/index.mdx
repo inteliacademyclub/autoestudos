@@ -1,0 +1,527 @@
+---
+sidebar_position: 6
+sidebar_label: 'Análise de erros e ablação'
+title: 'Análise de erros e ablação'
+description: 'Resíduos por corte, inspeção dos piores erros, ablação por blocos de features (cumulativa, deixa-um-de-fora e controle de ruído) e bootstrap pareado por canal para saber se uma diferença pequena entre modelos é real.'
+tags: [ml-preditivo, avaliacao, ablacao, bootstrap]
+---
+
+# Análise de Erros e Ablação: Onde o Modelo Falha e Quanto Cada Bloco Vale
+
+<LessonMeta
+  tempo="55 min"
+  semana={2}
+  etapa="avaliacao"
+  objetivos={[
+    'Analisar resíduos por corte (setor, tamanho, duração, histórico do canal, horário) sem se enganar com grupos pequenos',
+    'Inspecionar os piores erros e transformá-los em hipóteses',
+    'Desenhar uma ablação por blocos com ordem cumulativa, remoção de um bloco e controle de ruído',
+    'Comparar dois modelos com bootstrap pareado por canal e interpretar o intervalo da diferença',
+  ]}
+  prerequisitos={[
+    {label: 'Métricas de erro e de ordenação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao'},
+    {label: 'Experimentos rastreáveis com MLflow', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis'},
+  ]}
+/>
+
+Você passa uma semana extraindo embeddings dos frames, roda o modelo com o bloco visual e o Spearman intra-canal sobe de 0,14 para 0,17. O README ganha uma frase: *"as features visuais melhoram a previsão"*.
+
+Melhoram mesmo? A literatura espera que o conteúdo visual some algo entre +0,02 e +0,04 de Spearman antes da publicação. No código desta aula, duas colunas de **puro ruído** acrescentadas a um modelo produzem uma diferença cujo intervalo de confiança vai de −0,057 a +0,058 no Spearman intra-canal. Ou seja: com um teste desse tamanho, um ganho de +0,03 é indistinguível do acaso, a menos que você o meça do jeito certo.
+
+Esta aula fecha o módulo com as duas ferramentas que transformam "o número subiu" em evidência: a **análise de erros**, que mostra onde o modelo falha e sugere a próxima hipótese, e a **ablação** com **bootstrap pareado**, que diz quanto cada bloco de features vale e com que segurança.
+
+:::info[Ideia central]
+Métrica agregada responde "quanto"; análise de erros responde "onde" e "por quê". A <Termo id="ablacao">ablação</Termo> mede a contribuição de cada bloco de features, e o <Termo id="bootstrap">bootstrap</Termo> pareado por canal diz se a diferença entre dois modelos é maior do que o acaso do conjunto de teste.
+:::
+
+---
+
+## Resíduos por corte
+
+O <Termo id="residuo">resíduo</Termo> de um post é $$e_i = y_i - \hat{y}_i$$. Neste projeto, com $$y$$ em log, $$e_i > 0$$ quer dizer que o modelo **subestimou**. Para cada grupo de um corte, calcule duas coisas:
+
+- o **MAE do grupo**, que diz onde o modelo erra mais;
+- o **viés** (a média de $$e_i$$), que diz se ele erra sempre para o mesmo lado.
+
+Os cortes que o briefing pede, e o que cada um costuma revelar:
+
+| Corte | Pergunta |
+| :--- | :--- |
+| setor (moda, beleza, automotivo) | o modelo aprendeu um setor melhor que os outros? |
+| tamanho do canal (terços de inscritos) | ele funciona para canais pequenos, onde o ruído é maior? |
+| duração | Shorts muito curtos ou longos são tratados de forma diferente? |
+| idade do canal (posts anteriores ou dias desde o primeiro post) | quanto o cold start custa? |
+| horário de publicação | há um período sistematicamente subestimado? |
+
+**O cuidado estatístico.** O viés de um grupo é uma média, com erro-padrão aproximado de $$s/\sqrt{n}$$, em que $$s$$ é o desvio-padrão dos resíduos. No código, $$s \approx 0{,}94$$: num grupo de 150 posts, um viés de ±0,08 é só um erro-padrão, ou seja, ruído. E posts do mesmo canal não são independentes: um grupo de 70 posts vindos de 8 canais tem bem menos informação do que parece. Somando os cortes, você olha 15 grupos ou mais; algum vai parecer estranho por acaso. Trate a análise por corte como **gerador de hipóteses**, confirmadas depois com um experimento próprio.
+
+No código, o sinal mais claro é o do **histórico**: canais com menos de 10 posts anteriores têm MAE de 0,89 (contra 0,70 nos canais com 30 ou mais) e viés de +0,31, isto é, o modelo subestima canais novos em cerca de 36% ($$e^{0{,}31} \approx 1{,}36$$). Há um mecanismo plausível (sem histórico, o modelo cai no nível médio dados os inscritos) e o efeito é grande. É uma hipótese que vale um experimento: uma feature de "idade do canal" ou um tratamento específico para o cold start.
+
+---
+
+## Os piores erros: abra os vídeos
+
+Ordene o teste por $$|e_i|$$ e **assista** aos 20 primeiros. É onde a métrica vira entendimento. Anote uma categoria para cada um:
+
+| Categoria | Sinal | O que fazer |
+| :--- | :--- | :--- |
+| viral de verdade | subestimação enorme; trend, meme, colaboração | aceitar: é a cauda longa. Talvez uma feature de trend |
+| canal novo | poucos posts anteriores | melhorar o cold start |
+| problema de dado | curtidas ocultas, vídeo privado ou removido, não é Short, reupload | corrigir a coleta ou filtrar |
+| alvo imaturo | post recente demais no momento da coleta | revisar a regra de 30 dias |
+| impulsionamento | post pago ou com campanha externa | documentar como limitação |
+
+No código, o pior erro é o **primeiro post de um canal novo com 600 mil inscritos**, que teve 520 mil curtidas contra 2.276 previstas. Ele junta duas categorias, canal novo e viral, e nenhum modelo pré-publicação acertaria esse número. O papel da inspeção é separar erros que o modelo **poderia** evitar (dado errado, cold start mal tratado) dos que ele **não poderia** (virais genuínos). Só os primeiros viram trabalho; os segundos viram frase honesta no README.
+
+Na base sintética, sabemos a resposta: o gerador sorteia 3% de posts com um bônus de viralização. Na sua base, quem descobre é você, olhando os vídeos.
+
+---
+
+## Ablação por blocos
+
+A ablação mede quanto cada **bloco** de features contribui, treinando o mesmo modelo com e sem ele. No case, os blocos seguem a arquitetura do projeto:
+
+| Bloco | Na base sintética | No seu projeto |
+| :--- | :--- | :--- |
+| canal | inscritos, mediana e média recente, nº de posts anteriores | o mesmo |
+| tempo | hora, dia da semana, dias desde o post anterior | o mesmo, mais calendário |
+| texto | tamanho da legenda, título com pergunta | embeddings do título ([módulo 3](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto)) |
+| visual | duração, rosto, texto na tela, cortes | embeddings e detectores ([módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais)) |
+| VLM | nota do gancho | respostas da rubrica do VLM ([módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado)) |
+
+Há três desenhos, e cada um responde a uma pergunta:
+
+1. **Cumulativa**: só canal, depois + tempo, + texto, + visual, + VLM. Responde "quanto cada bloco soma **dados os anteriores**" e é o formato do briefing. Problema: depende da ordem; um bloco que chega cedo pode levar o crédito de algo que outro também explicaria.
+2. **Deixa um de fora**: o completo contra o completo sem o bloco X. Responde "quanto se perde **sem** X". Não depende de ordem, mas subestima blocos redundantes (se visual e VLM medem coisas parecidas, tirar um só custa pouco).
+3. **Controle negativo**: acrescente colunas de puro ruído. Responde "que tamanho de diferença o acaso produz neste teste". É o desenho mais barato e o mais esquecido.
+
+Rode os três. Uma contribuição só é sólida se aparecer na cumulativa **e** na remoção, com intervalo de confiança que exclua zero, e bem acima do que o controle negativo produz.
+
+<Sketch name="m2/ablacao" alt="Dois painéis com dados sintéticos da aula. À esquerda, ablação cumulativa do par-a-par intra-canal, com eixo começando em 0,45: canal 0,472; mais tempo 0,471; mais texto 0,486; mais visual 0,528; mais VLM 0,550; linha tracejada vermelha na moeda, 0,50. Nota: a ordem importa, o texto parece somar aqui mas quase não tem efeito real. À direita, gráfico de intervalos da variação ao tirar um bloco do modelo completo, com IC de 95%: ruído (controle) +0,007 de −0,010 a +0,025; tempo −0,008 de −0,024 a +0,006; texto −0,004 de −0,013 a +0,006; visual +0,020 de −0,005 a +0,049; VLM +0,023 de +0,004 a +0,043. Nota: só o VLM tem o IC inteiro acima de zero, o visual fica no limite, e o controle de ruído mostra o tamanho do acaso neste teste." caption="Ablação cumulativa (esquerda) e remoção de um bloco com bootstrap pareado (direita)." />
+
+---
+
+## Bootstrap pareado: a diferença é real?
+
+Na aula [2.4](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao), cada modelo ganhou seu próprio IC. Para **comparar** dois modelos, isso não basta: dois ICs que se sobrepõem não provam que os modelos são iguais. O que interessa é a distribuição da **diferença**, calculada nos **mesmos** canais reamostrados:
+
+1. sorteie, com reposição, tantos canais do teste quantos existem;
+2. calcule a métrica do modelo A e a do modelo B **nessa mesma amostra**;
+3. guarde $$\Delta^{*} = M_B - M_A$$;
+4. repita 2.000 vezes e use os percentis 2,5 e 97,5 de $$\Delta^{*}$$ como IC de 95%.
+
+Por que parear funciona? Os dois modelos erram nos mesmos posts difíceis. Quando um canal "difícil" entra duas vezes na reamostra, ele derruba A e B juntos, e a diferença quase não mexe. Em termos de variância:
+
+$$
+\operatorname{Var}(M_B - M_A) = \operatorname{Var}(M_A) + \operatorname{Var}(M_B) - 2\operatorname{Cov}(M_A, M_B)
+$$
+
+A covariância positiva encolhe a incerteza da diferença, e é por isso que o teste pareado enxerga diferenças que os ICs separados escondem. O bootstrap pareado é a ferramenta padrão para comparar sistemas em processamento de linguagem desde Koehn (2004); aqui, a unidade reamostrada é o **canal**, pelos motivos da aula 2.4.
+
+A saída também traz $$P(\Delta^{*} \le 0)$$, a fração de reamostras em que B não superou A. Use-a como indicador de direção, não como um p-valor formal.
+
+**O limite do bootstrap pareado.** Ele mede a incerteza que vem do **conjunto de teste**: quais canais caíram lá. Ele não mede a instabilidade do **treino**: outra seed, outra ordem de features ou outra janela de treino podem mudar o modelo. Para conclusões importantes, repita com várias seeds (o exercício faz isso) e em vários folds do walk-forward.
+
+---
+
+## O que esperar da literatura
+
+O briefing resume a expectativa: as features do canal dominam, e o conteúdo visual soma cerca de +0,02 a +0,04 de Spearman antes da publicação. Duas consequências práticas para a sua ablação:
+
+- **Ganhos desse tamanho exigem o teste pareado.** No código, o controle negativo mostra que, com 60 canais no teste, o IC de uma diferença nula tem meia-largura perto de 0,06 no Spearman intra-canal e perto de 0,02 no par-a-par. Um efeito de +0,03 pode ficar dentro disso. Para enxergar melhor: mais canais no teste (a unidade de reamostragem é o canal, então mais posts do mesmo canal ajudam pouco), agregação dos folds do walk-forward e hipótese registrada antes.
+- **O ganho do conteúdo aparece no intra-canal.** Na tabela de ablação, cada bloco de conteúdo mexe no Spearman global na terceira casa decimal (de 0,852 para 0,865 somando todos), enquanto o intra-canal vai de −0,09 para +0,15. Se você só olhar o global, vai concluir que o vídeo não importa.
+
+---
+
+## Na prática (código)
+
+O código importa o `metricas.py` da aula [2.4](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao) (salve-o na mesma pasta, ou importe de `galaxies.metricas` na estrutura da aula 2.5).
+
+<details>
+<summary>Passo 1: o gerador da base sintética (o mesmo em todo o módulo)</summary>
+
+```python
+import numpy as np
+import pandas as pd
+
+
+def gerar_base(n_canais=60, seed=42):
+    """Shorts sintéticos: nível próprio por canal + tendência lenta + ruído."""
+    rng = np.random.default_rng(seed)
+    efeito_rosto = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}
+    partes = []
+    for c in range(n_canais):
+        setor = ["moda", "beleza", "automotivo"][c % 3]
+        inscritos = int(np.exp(np.clip(rng.normal(11.3, 1.3), 8, 15.5)))
+        nivel = 0.85 * np.log(inscritos) - 4.2 + rng.normal(0, 0.55)
+        tendencia = np.cumsum(rng.normal(rng.normal(0, 0.03), 0.09, 32))  # por mês
+        inicio = rng.integers(0, 400) if rng.random() < 0.85 else rng.integers(700, 900)
+        n = max(8, int((960 - inicio) / rng.uniform(6, 20)))  # 1 post a cada 6-20 dias
+        dia = np.sort(rng.integers(inicio, 960, n))
+        hora = np.where(rng.random(n) < 0.4, rng.integers(18, 23, n), rng.integers(7, 24, n))
+        duracao = np.clip(rng.normal(38 if setor == "automotivo" else 28, 12, n), 8, 90).round()
+        rosto = rng.random(n) < (0.35 if setor == "automotivo" else 0.7)
+        texto_tela = rng.random(n) < 0.5
+        cortes_10s = np.clip(rng.normal(2.5, 1.0, n), 0, 6).round(1)
+        pergunta = rng.random(n) < 0.3
+        gancho = np.clip(rng.normal(5, 2, n), 0, 10).round()  # nota do VLM, 0-10
+        conteudo = (0.09 * (gancho - 5) + efeito_rosto[setor] * rosto + 0.15 * texto_tela
+                    + 0.05 * (cortes_10s - 2.5) - 0.05 * (duracao - 30) / 10
+                    + 0.06 * pergunta + 0.12 * ((hora >= 18) & (hora <= 22)))
+        viral = rng.random(n) < 0.03
+        y = (nivel + tendencia[dia // 30] + conteudo + rng.normal(0, 0.7, n)
+             + viral * rng.normal(1.5, 0.4, n))
+        curtidas = np.maximum(0, np.round(np.expm1(y)))
+        regime = np.where(dia >= 455, 1.7, 1.0)  # replays contam desde 31/03/2025
+        views = np.round((curtidas + 1) * np.exp(rng.normal(np.log(35), 0.35, n)) * regime)
+        partes.append(pd.DataFrame({
+            "canal": f"c{c:02d}", "setor": setor, "inscritos": inscritos,
+            "data_pub": pd.Timestamp("2024-01-01") + pd.to_timedelta(dia, "D")
+                        + pd.to_timedelta(hora, "h"),
+            "hora": hora, "duracao_s": duracao, "rosto": rosto, "texto_tela": texto_tela,
+            "cortes_10s": cortes_10s, "titulo_pergunta": pergunta,
+            "legenda_chars": np.clip(rng.normal(90, 45, n), 0, None).round(),
+            "gancho_vlm": gancho, "curtidas": curtidas, "views": views,
+            "comentarios": rng.poisson(curtidas * 0.02),
+        }))
+    df = pd.concat(partes, ignore_index=True)
+    df["y"] = np.log1p(df["curtidas"])
+    return df.sort_values(["data_pub", "canal"]).reset_index(drop=True)
+```
+
+</details>
+
+**Passo 2: features, blocos e uma função de treino.** As duas colunas `ruido_*` são o controle negativo: não têm relação nenhuma com o alvo.
+
+```python
+import lightgbm as lgb
+from metricas import (mae_log, pairwise_accuracy, por_canal, spearman_global,
+                      spearman_intra_canal)
+
+df = gerar_base().sort_values(["canal", "data_pub"]).reset_index(drop=True)
+g = df.groupby("canal")
+df["log_inscritos"] = np.log(df["inscritos"])
+df["mediana_canal"] = g["y"].transform(lambda s: s.shift(1).expanding().median())
+df["media_ult5"] = g["y"].transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+df["n_anteriores"] = g.cumcount()
+df["dia_semana"] = df["data_pub"].dt.dayofweek
+df["dias_desde_anterior"] = g["data_pub"].diff().dt.days
+ruido = np.random.default_rng(0).normal(size=(2, len(df)))
+df["ruido_1"], df["ruido_2"] = ruido  # controle negativo: não têm efeito nenhum
+
+BLOCOS = {
+    "canal": ["log_inscritos", "mediana_canal", "media_ult5", "n_anteriores"],
+    "tempo": ["hora", "dia_semana", "dias_desde_anterior"],
+    "texto": ["legenda_chars", "titulo_pergunta"],
+    "visual": ["duracao_s", "rosto", "texto_tela", "cortes_10s"],
+    "vlm": ["gancho_vlm"],
+}
+treino = df[df["data_pub"] < "2026-03-01"]
+teste = df[df["data_pub"] >= "2026-03-01"].copy()
+
+def treinar_prever(cols):
+    m = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15,
+                          n_jobs=1, random_state=0, verbose=-1)
+    m.fit(treino[cols].astype(float), treino["y"])
+    return m.predict(teste[cols].astype(float))
+```
+
+**Passo 3: resíduos por corte, com o modelo completo.**
+
+```python
+teste["pred"] = treinar_prever(sum(BLOCOS.values(), []))  # modelo completo
+teste["residuo"] = teste["y"] - teste["pred"]  # > 0: o modelo subestimou
+teste["tamanho"] = pd.qcut(teste["inscritos"], 3, labels=["pequeno", "médio", "grande"])
+teste["faixa_duracao"] = pd.cut(teste["duracao_s"], [0, 20, 40, 90])
+teste["periodo"] = pd.cut(teste["hora"], [0, 12, 18, 24], right=False,
+                          labels=["manhã", "tarde", "noite"])
+teste["historico"] = pd.cut(teste["n_anteriores"], [-1, 9, 29, 1000],
+                            labels=["<10 posts", "10-29", "30+"])
+
+for corte in ["setor", "tamanho", "faixa_duracao", "periodo", "historico"]:
+    t = teste.groupby(corte, observed=True).agg(
+        n=("residuo", "size"), MAE=("residuo", lambda r: r.abs().mean()),
+        vies=("residuo", "mean"))
+    print(t.round(2).to_string(), "\n")
+```
+
+```text
+              n   MAE  vies
+setor                      
+automotivo  264  0.76  0.01
+beleza      323  0.72 -0.12
+moda        275  0.69  0.00 
+
+           n   MAE  vies
+tamanho                 
+pequeno  292  0.73 -0.06
+médio    284  0.68  0.02
+grande   286  0.75 -0.10 
+
+                 n   MAE  vies
+faixa_duracao                 
+(0, 20]        182  0.71 -0.00
+(20, 40]       453  0.74 -0.06
+(40, 90]       227  0.71 -0.05 
+
+           n   MAE  vies
+periodo                 
+manhã    142  0.76  0.07
+tarde    170  0.69 -0.12
+noite    550  0.72 -0.05 
+
+             n   MAE  vies
+historico                 
+<10 posts   70  0.89  0.31
+10-29       44  0.74  0.04
+30+        748  0.70 -0.08 
+```
+
+Fora o histórico, os vieses ficam entre −0,12 e +0,07. O maior, o de beleza (−0,12 em 323 posts), daria pouco mais de dois erros-padrão se os posts fossem independentes; como eles vêm de 20 canais, a evidência é mais fraca do que parece. Merece uma anotação no caderno de hipóteses, não uma conclusão.
+
+**Passo 4: os piores erros.**
+
+```python
+cols = ["canal", "data_pub", "inscritos", "curtidas", "pred", "residuo", "duracao_s", "gancho_vlm"]
+piores = teste.reindex(teste["residuo"].abs().sort_values(ascending=False).index)
+print(piores[cols].head(6).assign(pred_curtidas=lambda d: np.expm1(d["pred"]).round(),
+                                  data_pub=lambda d: d["data_pub"].dt.date)
+      .drop(columns="pred").round(2).to_string(index=False))
+```
+
+```text
+canal   data_pub  inscritos  curtidas  residuo  duracao_s  gancho_vlm  pred_curtidas
+  c09 2026-06-10     601786  520544.0     5.43       43.0         4.0         2276.0
+  c18 2026-05-18      21469    5443.0     3.13       35.0         6.0          237.0
+  c09 2026-08-03     601786   66472.0     3.12       19.0         1.0         2934.0
+  c48 2026-07-07       9937    4909.0     2.95       33.0         7.0          257.0
+  c58 2026-06-20      26437    2153.0     2.83        8.0         4.0          126.0
+  c34 2026-08-05     245844   37279.0     2.70       31.0         4.0         2511.0
+```
+
+Os seis piores são **subestimações** (resíduo positivo), de 15 a 230 vezes. É a assinatura da cauda longa: o modelo aprende o típico e é surpreendido pelos virais. Dois dos seis são do mesmo canal novo, `c09`.
+
+**Passo 5: as três ablações.**
+
+```python
+def avaliar(cols):
+    p = treinar_prever(cols)
+    y, c = teste["y"], teste["canal"]
+    return p, {"n_feat": len(cols), "MAE_log": mae_log(y, p),
+               "spearman": spearman_global(y, p),
+               "spearman_intra": spearman_intra_canal(y, p, c),
+               "par_a_par_intra": pairwise_accuracy(y, p, c)}
+
+preds, linhas, cols = {}, {}, []
+for bloco, novas in BLOCOS.items():  # 1) ablação cumulativa, na ordem do briefing
+    cols = cols + novas
+    nome = bloco if bloco == "canal" else "+ " + bloco
+    preds[nome], linhas[nome] = avaliar(cols)
+
+# 2) controle negativo: o mesmo modelo "só canal" + duas colunas de puro ruído
+preds["canal + ruído"], linhas["canal + ruído"] = avaliar(BLOCOS["canal"] + ["ruido_1", "ruido_2"])
+
+completo = sum(BLOCOS.values(), [])  # 3) deixa um bloco de fora por vez
+for bloco in list(BLOCOS)[1:]:
+    nome = f"completo - {bloco}"
+    preds[nome], linhas[nome] = avaliar([c for c in completo if c not in BLOCOS[bloco]])
+
+print(pd.DataFrame(linhas).T.round(3).to_string())
+```
+
+```text
+                   n_feat  MAE_log  spearman  spearman_intra  par_a_par_intra
+canal                 4.0    0.756     0.852          -0.092            0.472
++ tempo               7.0    0.749     0.853          -0.087            0.471
++ texto               9.0    0.740     0.858          -0.030            0.486
++ visual             13.0    0.726     0.862           0.073            0.528
++ vlm                14.0    0.722     0.865           0.150            0.550
+canal + ruído         6.0    0.752     0.855          -0.091            0.479
+completo - tempo     11.0    0.722     0.865           0.168            0.559
+completo - texto     12.0    0.721     0.865           0.150            0.554
+completo - visual    10.0    0.723     0.862           0.097            0.529
+completo - vlm       13.0    0.726     0.862           0.073            0.528
+```
+
+Compare as duas leituras do **texto**. Na cumulativa, ele leva o Spearman intra-canal de −0,087 para −0,030 (+0,057). Na remoção, tirá-lo do modelo completo não muda nada (0,150 com e sem). No gerador, o efeito verdadeiro do texto é pequeno: +0,06 em log, só para títulos com pergunta, e zero para o tamanho da legenda. A leitura prudente é que o degrau da cumulativa veio da ordem e da instabilidade do treino, não do texto. Visual e VLM, ao contrário, aparecem nas duas leituras.
+
+**Passo 6: bootstrap pareado por canal.** Como na aula 2.4, `por_canal` resume cada canal numa linha, e cada linha da matriz `k` é uma reamostra de canais aplicada **aos dois modelos**.
+
+```python
+def bootstrap_pareado(p_a, p_b, n_boot=2000, seed=0):
+    """Delta (B - A) das métricas intra-canal, reamostrando os MESMOS canais para A e B."""
+    ta = por_canal(teste["y"], p_a, teste["canal"])
+    tb = por_canal(teste["y"], p_b, teste["canal"])
+    k = np.random.default_rng(seed).integers(0, len(ta), size=(n_boot, len(ta)))
+    w = np.where(ta["n"] >= 3, ta["n"], 0).astype(float)[k]
+    sp = lambda t: (t["spearman"].to_numpy()[k] * w).sum(axis=1) / w.sum(axis=1)
+    pw = lambda t: t["acertos"].to_numpy()[k].sum(axis=1) / t["pares"].to_numpy()[k].sum(axis=1)
+    linha = {}
+    for nome, f in [("spearman_intra", sp), ("par_a_par_intra", pw)]:
+        dif = f(tb) - f(ta)
+        lo, hi = np.percentile(dif, [2.5, 97.5])
+        linha[nome] = f"{dif.mean():+.3f} [{lo:+.3f}, {hi:+.3f}]"
+    return linha
+
+comparacoes = {
+    "ruído vs. nada (controle)": ("canal", "canal + ruído"),
+    "tempo (completo vs. sem)": ("completo - tempo", "+ vlm"),
+    "texto (completo vs. sem)": ("completo - texto", "+ vlm"),
+    "visual (completo vs. sem)": ("completo - visual", "+ vlm"),
+    "VLM (completo vs. sem)": ("completo - vlm", "+ vlm"),
+}
+res = {nome: bootstrap_pareado(preds[a], preds[b]) for nome, (a, b) in comparacoes.items()}
+print(pd.DataFrame(res).T.to_string())
+```
+
+```text
+                                    spearman_intra          par_a_par_intra
+ruído vs. nada (controle)  +0.000 [-0.057, +0.058]  +0.007 [-0.010, +0.025]
+tempo (completo vs. sem)   -0.017 [-0.053, +0.015]  -0.008 [-0.024, +0.006]
+texto (completo vs. sem)   -0.001 [-0.024, +0.022]  -0.004 [-0.013, +0.006]
+visual (completo vs. sem)  +0.052 [+0.001, +0.108]  +0.020 [-0.005, +0.049]
+VLM (completo vs. sem)     +0.078 [+0.028, +0.132]  +0.023 [+0.004, +0.043]
+```
+
+(O `+ vlm` da cumulativa é o modelo completo, com os cinco blocos.) A tabela conta a história com honestidade:
+
+- **VLM**: ganho com IC inteiro acima de zero nas duas métricas. Evidência sólida.
+- **Visual**: acima de zero no Spearman intra-canal, por pouco; no par-a-par, o IC encosta no zero. Evidência moderada: vale confirmar com mais folds.
+- **Tempo e texto**: indistinguíveis de zero. No gerador, o horário nobre tem efeito real (+0,12 em log), mas pequeno demais para este teste enxergar. "Não detectado" não é "não existe".
+- **Controle**: o ruído não mudou nada, mas o IC dele mostra a resolução do teste.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+O agente vai explicar a previsão para a Lumina com frases como *"B deve render mais porque tem gancho forte, texto grande na tela e sai às 19h"*. A ablação diz quais dessas razões têm lastro:
+
+- **gancho forte** vem do bloco VLM, que teve ganho com IC acima de zero: a razão tem evidência;
+- **texto na tela e rosto** vêm do bloco visual, com evidência moderada: vale citar com cautela;
+- **quinta às 19h** vem do bloco de tempo, que não se distinguiu de zero neste teste: na sua base, se o resultado for o mesmo, o agente **não deve** usar o horário como argumento principal.
+
+Na aula de [SHAP](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica), você vai ver quanto cada feature pesou na previsão de A e de B. A ablação responde a uma pergunta anterior: se aquele tipo de feature ajuda **em geral**. Uma explicação só é honesta quando as duas concordam.
+
+A análise de erros também entra na resposta. A Lumina é um canal de beleza com histórico longo. Nos dados da aula, o setor de beleza tem MAE de 0,72 e viés de −0,12 (leve superestimação), ainda como hipótese. Se a sua base confirmar isso, o agente pode acrescentar: "para canais de beleza, o modelo tende a errar um pouco para cima".
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas de análise e ablação]
+1. **Só a ablação cumulativa.** O resultado depende da ordem; confirme com a remoção de cada bloco.
+2. **Sem controle negativo.** Sem ele, você não sabe o tamanho do acaso no seu teste.
+3. **Comparar ICs separados.** Sobreposição de ICs não prova igualdade. Use o bootstrap pareado.
+4. **Reamostrar posts em vez de canais.** Os ICs ficam estreitos demais e diferenças de acaso parecem reais.
+5. **Declarar vitória com +0,01.** Diferenças desse tamanho só contam com IC pareado acima de zero e repetidas em seeds e folds.
+6. **Caçar cortes.** Com 15 grupos, algum parece anormal por acaso. Trate cortes como hipóteses e teste-as de novo.
+7. **Ler piores erros só em números.** Abra os vídeos: dado quebrado e viral genuíno pedem ações opostas.
+:::
+
+<Quiz
+  id="m2-a6"
+  perguntas={[
+    {
+      pergunta: 'Os ICs de 95% do par-a-par dos modelos A e B se sobrepõem. O que dá para concluir?',
+      opcoes: [
+        {texto: 'Que os modelos são equivalentes.', explicacao: 'Sobreposição de ICs separados não prova igualdade: ela ignora que os dois modelos erram nos mesmos posts.'},
+        {texto: 'Nada, ainda: é preciso o IC da diferença, com bootstrap pareado nos mesmos canais.', correta: true, explicacao: 'Exato. O pareamento remove a variação comum aos dois modelos e costuma revelar diferenças que os ICs separados escondem.'},
+        {texto: 'Que B é melhor, se a média dele for maior.', explicacao: 'A média maior pode ser acaso do conjunto de teste.'},
+      ],
+    },
+    {
+      pergunta: 'Na ablação cumulativa, o bloco de texto somou +0,057 de Spearman intra-canal; na remoção a partir do modelo completo, −0,001 com IC entre −0,024 e +0,022. Qual é a leitura correta?',
+      opcoes: [
+        {texto: 'O texto ajuda muito; a remoção é que está errada.', explicacao: 'A remoção não depende de ordem. Um ganho que só aparece numa ordem específica não é robusto.'},
+        {texto: 'A contribuição do texto não é robusta: o degrau da cumulativa depende da ordem e da instabilidade do treino.', correta: true, explicacao: 'Exato. Uma contribuição sólida aparece nas duas leituras, com IC acima de zero.'},
+        {texto: 'O texto piora o modelo e deve ser removido.', explicacao: 'O IC da remoção inclui zero: não há evidência de piora, nem de ganho.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o bootstrap pareado reamostra canais, e não posts?',
+      opcoes: [
+        {texto: 'Porque posts do mesmo canal são correlacionados; a unidade independente é o canal.', correta: true, explicacao: 'Exato. Reamostrar posts trataria cada post como independente e produziria ICs estreitos demais.'},
+        {texto: 'Porque há menos canais do que posts, e o cálculo fica mais rápido.', explicacao: 'A velocidade é um efeito colateral; o motivo é estatístico.'},
+        {texto: 'Porque as métricas globais não podem ser calculadas por post.', explicacao: 'Podem. O ponto é a dependência entre posts do mesmo canal.'},
+      ],
+    },
+    {
+      pergunta: 'O controle de ruído deu IC de −0,057 a +0,058 no Spearman intra-canal. Um bloco novo soma +0,03, com IC pareado de −0,02 a +0,08. O que fazer?',
+      opcoes: [
+        {texto: 'Anunciar que o bloco melhora o modelo em 0,03.', explicacao: 'O IC inclui zero e o ganho está dentro do que o acaso produz neste teste.'},
+        {texto: 'Descartar o bloco, porque não tem efeito.', explicacao: 'Não detectado não é não existe. O teste pode ser pequeno demais para um efeito desse tamanho.'},
+        {texto: 'Registrar como inconclusivo e aumentar a resolução: mais canais no teste, folds do walk-forward e várias seeds.', correta: true, explicacao: 'Exato. É a resposta honesta para um efeito do tamanho que a literatura espera do conteúdo visual.'},
+      ],
+    },
+    {
+      pergunta: 'O que o bootstrap pareado **não** captura?',
+      opcoes: [
+        {texto: 'A variação causada por quais canais caíram no teste.', explicacao: 'Essa é exatamente a variação que ele captura.'},
+        {texto: 'A instabilidade do treino: outra seed, outra ordem de features ou outra janela de treino.', correta: true, explicacao: 'Exato. Para isso, repita o experimento com várias seeds e em vários folds.'},
+        {texto: 'A correlação entre os erros dos dois modelos.', explicacao: 'Ele a captura, e é justamente por isso que o pareamento funciona.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: a ablação sobrevive à seed?]
+Ligue a aleatoriedade do LightGBM (`subsample=0.8`, `subsample_freq=1`, `colsample_bytree=0.8`) e repita a ablação "deixa um de fora" para texto, visual e VLM com 5 seeds diferentes. Os sinais dos ganhos se mantêm? Qual bloco é mais estável?
+:::
+
+<details>
+<summary>Ver uma solução (continua o código do passo 5)</summary>
+
+```python
+def treinar_prever_seed(cols, seed):
+    m = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15,
+                          subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+                          n_jobs=1, random_state=seed, verbose=-1)
+    m.fit(treino[cols].astype(float), treino["y"])
+    return m.predict(teste[cols].astype(float))
+
+y, c = teste["y"], teste["canal"]
+for bloco in ["texto", "visual", "vlm"]:
+    sem = [col for col in completo if col not in BLOCOS[bloco]]
+    deltas = [spearman_intra_canal(y, treinar_prever_seed(completo, s), c)
+              - spearman_intra_canal(y, treinar_prever_seed(sem, s), c) for s in range(5)]
+    print(f"{bloco:6s} delta intra por seed: {np.round(deltas, 3)}  média={np.mean(deltas):+.3f}")
+```
+
+```text
+texto  delta intra por seed: [ 0.021 -0.005 -0.007 -0.005 -0.016]  média=-0.003
+visual delta intra por seed: [0.072 0.053 0.078 0.035 0.05 ]  média=+0.058
+vlm    delta intra por seed: [0.114 0.108 0.113 0.115 0.098]  média=+0.110
+```
+
+O texto oscila em torno de zero, trocando de sinal entre seeds: confirma que não há contribuição robusta. Visual e VLM são positivos nas 5 seeds, e o VLM é o mais estável (de 0,098 a 0,115). Repare que a variação entre seeds do visual (de 0,035 a 0,078) é da mesma ordem que o próprio efeito: sem repetir, uma única rodada poderia subestimá-lo ou superestimá-lo bastante.
+
+</details>
+
+---
+
+## Resumo
+
+- **Resíduos por corte** (setor, tamanho, duração, histórico, horário) mostram onde o modelo erra e para que lado; trate-os como **hipóteses**, lembrando do erro-padrão e dos grupos pequenos.
+- **Abra os piores erros**: separe o que o modelo poderia evitar (dado ruim, cold start) do que não poderia (viral genuíno).
+- Faça a **ablação** de três jeitos: **cumulativa** (a do briefing), **deixa um de fora** e **controle negativo**; só conte contribuições que aparecem nas três leituras.
+- Compare modelos com **bootstrap pareado por canal**: o IC da **diferença**, não dois ICs separados.
+- Ganhos do tamanho que a literatura espera do visual (+0,02 a +0,04) exigem teste pareado, **vários folds e várias seeds**.
+
+## Referências
+
+- Koehn. [*Statistical Significance Tests for Machine Translation Evaluation*](https://aclanthology.org/W04-3250/). EMNLP, 2004. O bootstrap pareado para comparar sistemas.
+- Berg-Kirkpatrick, Burkett e Klein. [*An Empirical Investigation of Statistical Significance in NLP*](https://aclanthology.org/D12-1091/). EMNLP-CoNLL, 2012. Quando ganhos pequenos são reais.
+- Dror, Baumer, Shlomov e Reichart. [*The Hitchhiker's Guide to Testing Statistical Significance in Natural Language Processing*](https://aclanthology.org/P18-1128/). ACL, 2018.
+- Meyes, Lu, de Puiseau e Meisen. [*Ablation Studies in Artificial Neural Networks*](https://arxiv.org/abs/1901.08644). arXiv, 2019.
+- Efron e Tibshirani. *An Introduction to the Bootstrap*. Chapman & Hall, 1993.
+- Gupta et al. [*Understanding Virality*](https://arxiv.org/abs/2512.21402) (arXiv:2512.21402): importâncias SHAP por atributo, um exemplo do que confrontar com a sua ablação.
+
+**Próxima aula:** [Árvores de decisão por dentro](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao): o módulo 3 abre a caixa-preta do LightGBM, começando pela árvore que ele soma centenas de vezes.

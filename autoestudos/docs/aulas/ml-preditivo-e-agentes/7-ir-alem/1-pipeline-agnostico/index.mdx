@@ -1,0 +1,859 @@
+---
+sidebar_position: 1
+sidebar_label: 'Pipeline agnóstico: treinar para a base de um cliente'
+title: 'Pipeline agnóstico: treinar para a base de um cliente'
+description: 'Como transformar o seu pipeline em uma função que recebe a base de qualquer cliente, valida o esquema, treina, avalia e registra um modelo candidato, exposta como tool MCP com as travas certas.'
+tags: [ml-preditivo, ir-alem, pipeline, mlops, mcp]
+---
+
+# Pipeline Agnóstico: Treinar para a Base de Qualquer Cliente
+
+<LessonMeta
+  tempo="55 min"
+  semana="4+"
+  etapa={['dados', 'modelo', 'mcp']}
+  opcional
+  objetivos={[
+    'Definir um contrato de entrada com pandera (esquema da base) e Pydantic (configuração em YAML)',
+    'Gerar só as features que as colunas do cliente permitem e registrar o que ficou de fora',
+    'Automatizar split temporal, baseline, GBM com quantis, métricas, versão e model card',
+    'Registrar o resultado no MLflow como candidato, deixando a promoção para uma pessoa',
+    'Expor o treino como tool MCP assíncrona, com validação de entrada e limite de recursos',
+  ]}
+  prerequisitos={[
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+    {label: 'Experimentos rastreáveis com MLflow', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis'},
+    {label: 'MCP do zero', to: '/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero'},
+  ]}
+/>
+
+O seu modelo funciona. Ele vence o baseline na validação temporal, tem intervalo e explica as previsões. Só que ele funciona para **a sua base**: os nomes de coluna que você escolheu, o corte de data que você olhou no gráfico e decidiu, a célula do notebook que precisa rodar antes da outra.
+
+Agora imagine o cenário que o briefing da Galaxies descreve como extensão: uma marca chega com um CSV de 2 mil Shorts dos próprios canais e pergunta *"dá para treinar um modelo para nós?"*. A base dela não tem as colunas de vídeo que você extraiu, o fuso é outro, metade das legendas está vazia e há posts publicados ontem. Se a resposta depender de você abrir o notebook e ajustar à mão, o produto não escala. E, pior, ninguém consegue auditar o que foi feito.
+
+O difícil aqui não é treinar. É transformar cada decisão que você tomou à mão em uma **regra explícita, validada e registrada**.
+
+:::info[A ideia central]
+Um pipeline agnóstico tem quatro peças:
+1. um **contrato** de entrada (esquema da base e configuração), validado antes de qualquer treino;
+2. **decisões automáticas documentadas**: quais features dá para gerar, onde cortar o teste, qual baseline usar;
+3. **artefatos versionados** com um *model card* que diz o que o modelo sabe e o que não sabe;
+4. **promoção humana**: a automação cria candidatos, e uma pessoa decide o que vai para produção.
+:::
+
+:::info[Ambiente deste módulo]
+Os trechos do módulo 7 foram testados em Python 3.12 com estas versões:
+
+```bash
+uv add pandas==3.0.6 numpy==2.5.3 scipy==1.18.1 scikit-learn==1.9.1 lightgbm==4.7.0 \
+  pandera==0.33.1 pydantic==2.13.5 pyyaml==6.0.3 mlflow==3.16.1 \
+  fastmcp==3.4.7 mcp==1.30.0 mapie==1.5.0 langchain==1.4.2 langchain-core==1.6.5 \
+  transformers==5.17.0 torch==2.14.0
+```
+
+As aulas do módulo são independentes: instale só o que a aula que você escolheu usar.
+:::
+
+---
+
+## O contrato: o que o cliente precisa mandar
+
+<Sketch name="m7/pipeline-agnostico" alt="Fluxo do pipeline agnóstico: a tool MCP treinar_modelo recebe a base do cliente e o config.yaml; o passo 1 valida esquema com pandera e config com Pydantic, e uma base inválida gera um erro legível sem treino; o passo 2 gera as features que as colunas permitem (canal, tempo, texto e vídeo só se as colunas existirem); o passo 3 faz split temporal, baseline, GBM e quantis; o passo 4 salva artefatos versionados pelo hash da base e da config; o passo 5 registra no MLflow uma versão candidata; o passo 6 é uma pessoa lendo o model card e promovendo o alias champion, que é o único carregado pela tool de previsão." caption="O treino é automático; a promoção para produção, não." />
+
+O briefing define um **esquema mínimo** para a base de um cliente. Tudo além dele é opcional, e o pipeline precisa funcionar só com o mínimo.
+
+| Coluna | O que é | Regra no esquema |
+| :--- | :--- | :--- |
+| `post_id` | identificador do Short | texto, único |
+| `channel_id` | canal que publicou | texto |
+| `published_at` | data e hora de publicação | data com fuso, convertida para UTC |
+| `caption` | legenda | texto, pode ser nula |
+| `media_ref` | caminho ou URL da mídia | texto, pode ser nula |
+| `metric_target` | a métrica-alvo (aqui, curtidas) | número maior ou igual a 0; nula se oculta |
+| `channel_stats_at_collection` | estatística do canal no dia da coleta (aqui, inscritos) | número maior ou igual a 0 |
+| `sector` | setor (moda, beleza, automotivo...) | texto |
+
+Repare na penúltima linha. `channel_stats_at_collection` é uma foto do canal **no dia da coleta**, e não no dia de cada post. Para um Short de um ano atrás, o número de inscritos de hoje inclui o crescimento que aquele próprio Short ajudou a causar. Usar isso como *feature* é um <Termo id="leakage">vazamento</Termo> discreto, e por isso o pipeline deixa esse bloco **desligado por padrão**. A coluna continua obrigatória porque serve para auditoria e filtros, não para treino.
+
+O contrato tem duas metades. A base é validada com **pandera**, que descreve um DataFrame como uma classe (`DataFrameModel`). A configuração vem de um YAML e é validada com **Pydantic**. Salve os cinco blocos a seguir, em ordem, num único arquivo `pipeline_cliente.py`.
+
+```python
+# pipeline_cliente.py (parte 1/5) — o contrato: esquema da base e configuração
+from typing import Literal
+
+import pandas as pd
+import pandera.pandas as pa
+import yaml
+from pandera.typing.pandas import Series
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
+
+
+class BaseMinima(pa.DataFrameModel):
+    """Esquema mínimo do briefing. Colunas extras são permitidas (strict=False)."""
+    post_id: Series[str] = pa.Field(unique=True)
+    channel_id: Series[str]
+    published_at: Series[pd.DatetimeTZDtype] = pa.Field(dtype_kwargs={"unit": "us", "tz": "UTC"})
+    caption: Series[str] = pa.Field(nullable=True)
+    media_ref: Series[str] = pa.Field(nullable=True)
+    metric_target: Series[float] = pa.Field(ge=0, nullable=True)   # likes ocultos = nulo
+    channel_stats_at_collection: Series[float] = pa.Field(ge=0, nullable=True)
+    sector: Series[str]
+
+    class Config:
+        coerce = True     # "123" vira 123.0; texto que não converte vira erro de esquema
+        strict = False
+
+
+class Blocos(BaseModel):
+    historico_canal: bool = True   # mediana e contagem dos posts ANTERIORES do canal
+    tempo: bool = True             # hora local e dia da semana planejados
+    texto: bool = True             # atributos simples da legenda
+    video: bool = True             # colunas opcionais extraídas do vídeo (se existirem)
+    snapshot_canal: bool = False   # inscritos NA COLETA: posterior aos posts antigos, vaza
+
+
+class ConfigTreino(BaseModel):
+    cliente: str = Field(pattern=r"^[a-z0-9-]{3,40}$")   # vira nome de pasta: nada de "../"
+    alvo: Literal["log1p", "relativo_canal"] = "relativo_canal"
+    data_coleta: AwareDatetime                           # exige fuso: "2026-09-20T00:00:00Z"
+    idade_minima_dias: int = Field(30, ge=0)             # likes ainda crescendo = alvo imaturo
+    defasagem_historico_dias: int = Field(7, ge=0)       # histórico só com posts "maduros"
+    fuso: str = "America/Sao_Paulo"
+    colunas_video: list[str] = []
+    blocos: Blocos = Blocos()
+    frac_teste: float = Field(0.2, gt=0.05, lt=0.5)
+    quantis: tuple[float, float] = (0.1, 0.9)
+    min_linhas_teste: int = 50
+
+    @field_validator("quantis")
+    @classmethod
+    def quantis_validos(cls, q: tuple[float, float]) -> tuple[float, float]:
+        if not 0 < q[0] < 0.5 < q[1] < 1:
+            raise ValueError("use (q_baixo, q_alto) com 0 < q_baixo < 0,5 < q_alto < 1")
+        return q
+
+
+def carregar_config(texto_yaml: str) -> ConfigTreino:
+    return ConfigTreino.model_validate(yaml.safe_load(texto_yaml))   # nunca yaml.load
+```
+
+Três escolhas merecem comentário:
+
+- **`coerce=True` com `lazy=True` na validação** (você vai ver no bloco 5): o pandera tenta converter cada coluna para o tipo declarado e, em vez de parar no primeiro problema, junta **todos** os erros numa tabela. É isso que permite devolver ao cliente uma lista útil ("a linha 3 tem uma data que não é data") em vez de um *traceback*.
+- **`AwareDatetime`**: uma data de coleta sem fuso é ambígua (é 00h de Brasília ou de UTC?). O Pydantic recusa a config em vez de adivinhar.
+- **`pattern` no nome do cliente**: o nome vira pasta de artefatos. Um cliente chamado `../producao` não pode ser aceito. Essa validação é segurança, não estética.
+
+---
+
+## Degradação graciosa: as features que as colunas permitem
+
+O pipeline organiza as features em **blocos**. Cada bloco é ligado na config, mas só entra se as colunas necessárias existirem. Quando um bloco não pode entrar, isso **não é um erro**: o treino segue e o relatório registra o motivo. Isso se chama degradação graciosa.
+
+```python
+# pipeline_cliente.py (parte 2/5) — alvo e features conforme as colunas disponíveis
+import numpy as np
+
+
+def _historico(g: pd.DataFrame, defasagem: pd.Timedelta) -> pd.DataFrame:
+    """Mediana e contagem dos posts do canal publicados até t - defasagem (nunca o futuro)."""
+    t = g["published_at"].dt.tz_convert(None).to_numpy()
+    y = np.log1p(g["metric_target"].to_numpy())
+    k = np.searchsorted(t, t - defasagem.to_timedelta64(), side="right")
+    med = [np.median(y[:j]) if j >= 3 else np.nan for j in k]
+    return pd.DataFrame({"hist_mediana": med, "hist_n": k}, index=g.index)
+
+
+def montar_features(df: pd.DataFrame, cfg: ConfigTreino):
+    df = df.sort_values(["channel_id", "published_at"]).reset_index(drop=True)
+    defas = pd.Timedelta(days=cfg.defasagem_historico_dias)
+    hist = pd.concat([_historico(g, defas) for _, g in df.groupby("channel_id")]).sort_index()
+    X = pd.DataFrame({"setor": df["sector"].astype("category")})
+    usados, ignorados = ["setor"], {}
+
+    if cfg.blocos.historico_canal:
+        X["hist_mediana"], X["hist_n"] = hist["hist_mediana"], hist["hist_n"]
+        gap = df.groupby("channel_id")["published_at"].diff().dt.total_seconds() / 86400
+        X["dias_desde_ultimo"] = gap
+        usados.append("historico_canal")
+    if cfg.blocos.tempo:
+        local = df["published_at"].dt.tz_convert(cfg.fuso)
+        X["hora"], X["dia_semana"] = local.dt.hour, local.dt.dayofweek
+        usados.append("tempo")
+    if cfg.blocos.texto:
+        leg = df["caption"].fillna("")
+        X["legenda_chars"] = leg.str.len()
+        X["legenda_hashtags"] = leg.str.count("#")
+        X["legenda_pergunta"] = leg.str.contains("?", regex=False).astype(int)
+        usados.append("texto")
+    if cfg.blocos.video:
+        presentes = [c for c in cfg.colunas_video if c in df.columns]
+        if presentes:
+            X[presentes] = df[presentes].apply(pd.to_numeric, errors="coerce")
+            usados.append("video")
+            faltam = sorted(set(cfg.colunas_video) - set(presentes))
+            if faltam:
+                ignorados["video_parcial"] = f"colunas ausentes: {faltam}"
+        else:
+            ignorados["video"] = "nenhuma coluna de vídeo na base; modelo usa texto + canal + tempo"
+    if cfg.blocos.snapshot_canal:
+        X["log_inscritos_coleta"] = np.log1p(df["channel_stats_at_collection"])
+        usados.append("snapshot_canal")
+
+    y = np.log1p(df["metric_target"])
+    if cfg.alvo == "relativo_canal":
+        y = y - hist["hist_mediana"]          # quanto o post rende acima da mediana do canal
+    ok = y.notna().to_numpy()                 # sem histórico suficiente não há alvo relativo
+    meta = df[["post_id", "channel_id", "published_at"]].assign(hist_mediana=hist["hist_mediana"])
+    fica = lambda d: d[ok].reset_index(drop=True)  # noqa: E731
+    return fica(X), fica(y), fica(meta), usados, ignorados
+```
+
+A função `_historico` é o ponto mais delicado. Para cada post, ela calcula a mediana de $$\log(1+\text{curtidas})$$ dos posts do mesmo canal publicados até $$t - d$$, em que $$d$$ é a defasagem (7 dias por padrão). Por que não usar todos os posts anteriores? Porque um post publicado ontem ainda não tem as curtidas "finais" no momento da previsão, mas na base coletada ele aparece com o valor de 30 dias depois. A defasagem é uma aproximação honesta do que se sabia na hora. O mesmo cuidado aparece em `idade_minima_dias`: posts com menos de 30 dias na data da coleta ainda estão acumulando curtidas e saem do treino.
+
+Com o <Termo id="alvo-relativo">alvo relativo ao canal</Termo>, o baseline natural é prever zero ("o post vai render a mediana do canal"). Posts sem pelo menos 3 anteriores maduros não têm alvo relativo definido e ficam de fora.
+
+---
+
+## Decisões automáticas: split, baseline e quantis
+
+No seu projeto, você escolheu a data de corte olhando a distribuição dos posts. Aqui, a regra precisa ser automática e defensável: os 20% de posts **mais recentes** vão para o teste (um <Termo id="split-temporal">split temporal</Termo> pelo quantil das datas). Se sobrar pouco teste, o pipeline se recusa a reportar métricas.
+
+```python
+# pipeline_cliente.py (parte 3/5) — split temporal, modelos e métricas
+from lightgbm import LGBMRegressor
+from scipy.stats import spearmanr
+
+PARAMS = dict(n_estimators=300, learning_rate=0.03, num_leaves=15, min_child_samples=20,
+              subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=42, verbose=-1)
+
+
+def split_temporal(meta: pd.DataFrame, frac_teste: float):
+    corte = meta["published_at"].quantile(1 - frac_teste)   # tudo antes do corte é treino
+    treino = (meta["published_at"] < corte).to_numpy()
+    return treino, ~treino, corte
+
+
+def par_a_par_intra_canal(y, p, canal) -> float:
+    """Fração de pares do MESMO canal em que o modelo acerta quem rendeu mais (empate = 0,5)."""
+    acertos, total = 0.0, 0
+    for c in np.unique(canal):
+        m = canal == c
+        dy, dp = np.subtract.outer(y[m], y[m]), np.subtract.outer(p[m], p[m])
+        par = np.triu(np.ones_like(dy, dtype=bool), 1) & (dy != 0)
+        acertos += (np.sign(dy[par]) == np.sign(dp[par])).sum() + 0.5 * (dp[par] == 0).sum()
+        total += par.sum()
+    return float(acertos / total)
+
+
+def metricas(y, p, canal) -> dict[str, float]:
+    return {"mae": float(np.mean(np.abs(y - p))),
+            "spearman": float(spearmanr(y, p).statistic) if np.std(p) > 0 else 0.0,
+            "par_a_par": par_a_par_intra_canal(y, p, canal)}
+
+
+def treinar_e_avaliar(X, y, meta, cfg: ConfigTreino):
+    tr, te, corte = split_temporal(meta, cfg.frac_teste)
+    if te.sum() < cfg.min_linhas_teste:
+        raise ValueError(f"só {te.sum()} posts no teste; mínimo é {cfg.min_linhas_teste}")
+    yte, canal = y[te].to_numpy(), meta.loc[te, "channel_id"].to_numpy()
+
+    # baseline: "o post vai render a mediana do canal"
+    base = (np.zeros(te.sum()) if cfg.alvo == "relativo_canal"
+            else meta.loc[te, "hist_mediana"].fillna(y[tr].median()).to_numpy())
+    modelos = {a: LGBMRegressor(objective="quantile", alpha=a, **PARAMS).fit(X[tr], y[tr])
+               for a in (cfg.quantis[0], 0.5, cfg.quantis[1])}
+    lo, p50, hi = (modelos[a].predict(X[te]) for a in (cfg.quantis[0], 0.5, cfg.quantis[1]))
+    lo, hi = np.minimum(lo, p50), np.maximum(hi, p50)          # evita quantis cruzados
+
+    resultado = {
+        "baseline": metricas(yte, base, canal),
+        "gbm": metricas(yte, p50, canal),
+        "intervalo": {"nominal": cfg.quantis[1] - cfg.quantis[0],
+                      "cobertura": float(np.mean((yte >= lo) & (yte <= hi))),
+                      "largura_media": float(np.mean(hi - lo))},
+    }
+    return modelos, resultado, int(tr.sum()), int(te.sum()), corte
+```
+
+Os hiperparâmetros são fixos e conservadores de propósito: um pipeline sem supervisão que faz busca agressiva num teste pequeno acaba ajustado ao próprio teste. Se quiser tuning, valide **dentro do treino**, com *walk-forward*, e compare sempre com o <Termo id="baseline">baseline</Termo>.
+
+---
+
+## Versão, relatório e model card
+
+Cada treino produz uma pasta `artefatos/<cliente>/<versao>/`. A versão é o *hash* do conteúdo da base mais a config. Então a mesma base com a mesma config gera sempre a mesma versão, e chamar a função duas vezes não treina duas vezes. Num projeto real, inclua também o commit do código no hash.
+
+```python
+# pipeline_cliente.py (parte 4/5) — o relatório e o model card
+import hashlib
+import json
+from pathlib import Path
+
+
+class ErroDeEsquema(ValueError):
+    def __init__(self, problemas: list[dict]):
+        self.problemas = problemas
+        super().__init__(f"{len(problemas)} problema(s) de esquema na base")
+
+
+class RelatorioTreino(BaseModel):
+    cliente: str
+    versao: str
+    pasta: str
+    n_treino: int
+    n_teste: int
+    corte_teste: str
+    blocos_usados: list[str]
+    blocos_ignorados: dict[str, str]
+    avisos: list[str]
+    metricas: dict[str, dict[str, float]]
+
+
+def model_card(rel: RelatorioTreino, cfg: ConfigTreino) -> str:
+    m, iv = rel.metricas, rel.metricas["intervalo"]
+    return "\n".join([
+        f"# Model card: {rel.cliente} (versão {rel.versao})",
+        f"- Alvo: `{cfg.alvo}`. Intervalo nominal de {iv['nominal']:.0%}.",
+        f"- Treino: {rel.n_treino} posts. Teste: {rel.n_teste} posts a partir de {rel.corte_teste[:10]}.",
+        f"- Blocos usados: {', '.join(rel.blocos_usados)}.",
+        *[f"- Bloco ignorado ({k}): {v}." for k, v in rel.blocos_ignorados.items()],
+        "", "| modelo | MAE | Spearman | par-a-par |", "| --- | --- | --- | --- |",
+        *[f"| {k} | {v['mae']:.3f} | {v['spearman']:.3f} | {v['par_a_par']:.3f} |"
+          for k, v in m.items() if k != "intervalo"],
+        "", f"Cobertura do intervalo no teste: {iv['cobertura']:.1%} (nominal {iv['nominal']:.0%}).",
+        "", "## Limitações", *[f"- {a}" for a in rel.avisos],
+        "- Um único corte temporal: confirme com walk-forward antes de promover.",
+        "- Relações aprendidas são correlacionais: não sustentam afirmações causais.",
+    ])
+```
+
+E, finalmente, a função que junta tudo e que a tool vai chamar:
+
+```python
+# pipeline_cliente.py (parte 5/5) — a função que a tool vai chamar
+def treinar_para_cliente(caminho_base: str | Path, cfg: ConfigTreino,
+                         raiz: Path = Path("artefatos")) -> RelatorioTreino:
+    caminho_base = Path(caminho_base)
+    versao = hashlib.sha256(caminho_base.read_bytes() + cfg.model_dump_json().encode()).hexdigest()[:10]
+    pasta = raiz / cfg.cliente / versao
+    if (pasta / "relatorio.json").exists():            # mesma base + mesma config = mesma versão
+        return RelatorioTreino.model_validate_json((pasta / "relatorio.json").read_text())
+
+    bruto = pd.read_csv(caminho_base) if caminho_base.suffix == ".csv" else pd.read_parquet(caminho_base)
+    try:
+        df = BaseMinima.validate(bruto, lazy=True)
+    except pa.errors.SchemaErrors as e:
+        fc = e.failure_cases.head(20)
+        raise ErroDeEsquema(fc[["column", "check", "failure_case"]].astype(str).to_dict("records")) from None
+
+    sem_alvo = int(df["metric_target"].isna().sum())
+    limite = pd.Timestamp(cfg.data_coleta).tz_convert("UTC") - pd.Timedelta(days=cfg.idade_minima_dias)
+    imaturos = int((df["published_at"] > limite).sum())
+    df = df[df["metric_target"].notna() & (df["published_at"] <= limite)]
+    avisos = [f"{sem_alvo} posts sem likes públicos removidos",
+              f"{imaturos} posts com menos de {cfg.idade_minima_dias} dias na coleta removidos"]
+
+    X, y, meta, usados, ignorados = montar_features(df, cfg)
+    modelos, res, n_tr, n_te, corte = treinar_e_avaliar(X, y, meta, cfg)
+    if res["gbm"]["par_a_par"] <= res["baseline"]["par_a_par"]:
+        avisos.append("GBM NÃO venceu o baseline em par-a-par: não promova esta versão")
+    if res["intervalo"]["cobertura"] < res["intervalo"]["nominal"] - 0.1:
+        avisos.append("intervalo subcobre no teste: recalibre (conformal) antes de expor")
+
+    pasta.mkdir(parents=True, exist_ok=True)           # uma execução anterior pode ter caído no meio
+    for alfa, m in modelos.items():
+        m.booster_.save_model(pasta / f"modelo_q{round(alfa * 100):02d}.txt")
+    (pasta / "config.yaml").write_text(yaml.safe_dump(cfg.model_dump(mode="json"), allow_unicode=True))
+    (pasta / "features.json").write_text(json.dumps(
+        {"colunas": list(X.columns), "setores": list(X["setor"].cat.categories)}, ensure_ascii=False))
+    rel = RelatorioTreino(cliente=cfg.cliente, versao=versao, pasta=str(pasta), n_treino=n_tr,
+                          n_teste=n_te, corte_teste=str(corte), blocos_usados=usados,
+                          blocos_ignorados=ignorados, avisos=avisos, metricas=res)
+    (pasta / "relatorio.json").write_text(rel.model_dump_json(indent=2))
+    (pasta / "MODEL_CARD.md").write_text(model_card(rel, cfg))
+    return rel
+```
+
+Os **avisos** são a parte mais importante do relatório. A função não decide se o modelo é bom. Ela escreve, em linguagem direta, os motivos para **não** confiar nele: não venceu o baseline, o intervalo cobre menos que o prometido, faltam colunas. O *model card* (Mitchell et al., 2019) é essa mesma informação no formato que uma pessoa lê antes de promover.
+
+---
+
+## Na prática: duas bases, um código
+
+Para testar sem dados reais, gere uma base sintética no esquema mínimo, com os mesmos efeitos do simulador da trilha: gancho, rosto, texto na tela, energia, duração e horário nobre. São 9 canais de moda, beleza e automotivo, de jan/2025 a set/2026. O gerador também salva uma segunda versão, **sem as colunas de vídeo**, como a de um cliente que ainda não rodou a extração do módulo 4.
+
+<details>
+<summary>Ver o gerador da base sintética (<code>gerar_base.py</code>)</summary>
+
+```python
+# gerar_base.py — base sintética no esquema mínimo do briefing (+ colunas de vídeo opcionais)
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+ROSTO = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}  # mesmos efeitos do simulador da trilha
+FRASES = ["Pele natural em 5 passos", "1 produto, 20 segundos", "Look de inverno barato",
+          "SUV por dentro", "Teste de frenagem", "Antes e depois", "Tendência da semana"]
+TAGS = ["#shorts", "#make", "#moda", "#carros", "#skincare", "#ootd", "#review"]
+
+linhas = []
+for c in range(9):
+    setor = ["moda", "beleza", "automotivo"][c % 3]
+    inscritos = float(np.exp(np.clip(rng.normal(11.3, 1.5), 7.5, 16)))
+    nivel = 0.85 * np.log(inscritos) - 4.2 + rng.normal(0, 0.55)
+    tendencia = np.cumsum(rng.normal(0, 0.09, 24))            # passeio aleatório mensal
+    n = int(rng.integers(50, 90))
+    dias = np.sort(rng.integers(0, 618, n))                     # 01/01/2025 a ~10/09/2026
+    for k, dia in enumerate(dias):
+        hora = int(rng.integers(18, 23)) if rng.random() < 0.4 else int(rng.integers(7, 24))
+        dur = float(np.clip(rng.normal(38 if setor == "automotivo" else 28, 12), 8, 90))
+        gancho = float(np.clip(round(rng.normal(5, 2)), 0, 10))
+        rosto = rng.random() < (0.35 if setor == "automotivo" else 0.7)
+        texto = rng.random() < 0.5
+        energia = float(np.clip(round(rng.normal(5, 2.2)), 0, 10))
+        sinal = (nivel + tendencia[dia // 30] + 0.09 * (gancho - 5) + ROSTO[setor] * rosto
+                 + 0.15 * texto + 0.05 * (energia - 5) - 0.05 * (dur - 30) / 10
+                 + 0.12 * (18 <= hora <= 22))
+        curtidas = float(max(0, round(np.exp(sinal + rng.normal(0, 0.5)) - 1)))
+        local = pd.Timestamp("2025-01-01", tz="America/Sao_Paulo") + pd.Timedelta(days=int(dia), hours=hora)
+        legenda = f"{rng.choice(FRASES)} " + " ".join(rng.choice(TAGS, int(rng.integers(0, 5)), replace=False))
+        linhas.append({
+            "post_id": f"c{c}-p{k}", "channel_id": f"c{c}",
+            "published_at": local.tz_convert("UTC").isoformat(),
+            "caption": legenda.strip(), "media_ref": f"s3://midia/c{c}/p{k}.mp4",
+            "metric_target": np.nan if rng.random() < 0.02 else curtidas,  # likes ocultos viram nulo
+            "channel_stats_at_collection": round(inscritos), "sector": setor,
+            "duracao_s": round(dur, 1), "gancho": gancho, "rosto_no_gancho": int(rosto),
+            "texto_na_tela": int(texto), "energia_audio": energia,
+        })
+
+base = pd.DataFrame(linhas)
+base.to_csv("base_cliente.csv", index=False)
+video = ["duracao_s", "gancho", "rosto_no_gancho", "texto_na_tela", "energia_audio"]
+sem_video = base.drop(columns=video).assign(media_ref=None)   # cliente que só tem texto e canal
+sem_video.to_csv("base_sem_video.csv", index=False)
+print(base.shape, base["channel_id"].nunique(), "canais")
+# (657, 13) 9 canais
+```
+
+</details>
+
+A configuração do cliente fica num YAML. Tudo o que muda de cliente para cliente mora aqui, e não no código:
+
+```yaml
+# config_lumina.yaml — o que muda de cliente para cliente fica aqui, não no código
+cliente: lumina
+alvo: relativo_canal          # ou log1p
+data_coleta: 2026-09-20T00:00:00Z
+idade_minima_dias: 30
+colunas_video: [duracao_s, gancho, rosto_no_gancho, texto_na_tela, energia_audio]
+blocos:
+  snapshot_canal: false       # inscritos na coleta vazam para posts antigos
+frac_teste: 0.2
+quantis: [0.1, 0.9]
+```
+
+Agora, o mesmo código com as duas bases:
+
+```python
+# teste_pipeline.py
+from pathlib import Path
+from pipeline_cliente import carregar_config, treinar_para_cliente
+
+cfg = carregar_config(Path("config_lumina.yaml").read_text())
+for arquivo in ["base_cliente.csv", "base_sem_video.csv"]:
+    rel = treinar_para_cliente(arquivo, cfg)
+    print(f"== {arquivo} -> versão {rel.versao} ({rel.n_treino} treino / {rel.n_teste} teste)")
+    print("   blocos:", rel.blocos_usados, "| ignorados:", rel.blocos_ignorados)
+    for nome in ("baseline", "gbm", "intervalo"):
+        print(f"   {nome:9s}", {k: round(v, 3) for k, v in rel.metricas[nome].items()})
+    print("   avisos:", rel.avisos)
+```
+
+```text
+== base_cliente.csv -> versão dca9db3b8a (470 treino / 118 teste)
+   blocos: ['setor', 'historico_canal', 'tempo', 'texto', 'video'] | ignorados: {}
+   baseline  {'mae': 0.465, 'spearman': 0.0, 'par_a_par': 0.5}
+   gbm       {'mae': 0.405, 'spearman': 0.43, 'par_a_par': 0.635}
+   intervalo {'nominal': 0.8, 'cobertura': 0.602, 'largura_media': 0.948}
+   avisos: ['13 posts sem likes públicos removidos', '23 posts com menos de 30 dias na coleta removidos', 'intervalo subcobre no teste: recalibre (conformal) antes de expor']
+== base_sem_video.csv -> versão 8fbbffabc1 (470 treino / 118 teste)
+   blocos: ['setor', 'historico_canal', 'tempo', 'texto'] | ignorados: {'video': 'nenhuma coluna de vídeo na base; modelo usa texto + canal + tempo'}
+   baseline  {'mae': 0.465, 'spearman': 0.0, 'par_a_par': 0.5}
+   gbm       {'mae': 0.428, 'spearman': 0.353, 'par_a_par': 0.578}
+   intervalo {'nominal': 0.8, 'cobertura': 0.636, 'largura_media': 1.04}
+   avisos: ['13 posts sem likes públicos removidos', '23 posts com menos de 30 dias na coleta removidos', 'intervalo subcobre no teste: recalibre (conformal) antes de expor']
+```
+
+Leia a saída com calma:
+
+- **As duas versões vencem o baseline** em <Termo id="pairwise">acerto par-a-par</Termo>: 0,635 com vídeo e 0,578 sem vídeo, contra 0,5. O baseline tem Spearman zero porque, com alvo relativo, ele prevê a mesma coisa para todos os posts.
+- **O bloco de vídeo vale mais aqui do que na literatura.** Spearman sobe de 0,353 para 0,430 (+0,08), acima dos +0,02 a +0,04 esperados pelo briefing. O motivo é que o simulador tem efeitos de conteúdo fortes por construção. Não prometa esse ganho a um cliente real antes de medir.
+- **O intervalo de 80% cobriu só 60% a 64% do teste.** A regressão quantílica com poucos dados costuma subcobrir, e o pipeline não escondeu isso: o aviso manda recalibrar antes de expor, como na aula de [predição conformal](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal).
+
+E quando a base vem quebrada? Remova a coluna `sector`, escreva "ontem à noite" numa data e coloque curtidas negativas numa linha:
+
+```python
+# teste_erros.py
+import pandas as pd
+from pydantic import ValidationError
+from pipeline_cliente import ErroDeEsquema, carregar_config, treinar_para_cliente
+
+# 1) base quebrada: sem a coluna sector, uma data inválida e likes negativos
+ruim = pd.read_csv("base_cliente.csv").drop(columns=["sector"]).head(40)
+ruim.loc[3, "published_at"] = "ontem à noite"
+ruim.loc[5, "metric_target"] = -10
+ruim.to_csv("base_quebrada.csv", index=False)
+cfg = carregar_config(open("config_lumina.yaml").read())
+try:
+    treinar_para_cliente("base_quebrada.csv", cfg)
+except ErroDeEsquema as e:
+    print(e)
+    for p in e.problemas:
+        print("  ", p)
+
+# 2) config inválida: quantis trocados e nome de cliente perigoso
+try:
+    carregar_config("cliente: ../prod\ndata_coleta: 2026-09-20\nquantis: [0.9, 0.1]")
+except ValidationError as e:
+    for err in e.errors():
+        print("config:", err["loc"], "->", err["msg"])
+```
+
+```text
+4 problema(s) de esquema na base
+   {'column': 'BaseMinima', 'check': 'column_in_dataframe', 'failure_case': 'sector'}
+   {'column': 'published_at', 'check': "coerce_dtype('datetime64[us, UTC]')", 'failure_case': 'ontem à noite'}
+   {'column': 'published_at', 'check': "dtype('datetime64[us, UTC]')", 'failure_case': 'ontem à noite'}
+   {'column': 'metric_target', 'check': 'greater_than_or_equal_to(0)', 'failure_case': '-10.0'}
+config: ('cliente',) -> String should match pattern '^[a-z0-9-]{3,40}$'
+config: ('data_coleta',) -> Input should have timezone info
+config: ('quantis',) -> Value error, use (q_baixo, q_alto) com 0 < q_baixo < 0,5 < q_alto < 1
+```
+
+Nenhum modelo foi treinado, e cada problema diz coluna, regra e valor. É esse tipo de resposta que um LLM consegue repassar ao cliente sem inventar nada.
+
+---
+
+## Registro no MLflow: candidato, nunca produção
+
+A função salva artefatos em disco. Para rastrear versões ao longo do tempo, registre cada treino no **Model Registry do MLflow**, com uma regra simples: a automação só cria versões com a tag `status=candidato`. Quem aponta o alias `@champion` para uma versão é uma pessoa, depois de ler o *model card*.
+
+```python
+# registro.py — registra a versão como CANDIDATA no MLflow; promover é decisão humana
+import lightgbm as lgb
+import mlflow
+from mlflow import MlflowClient
+
+from pipeline_cliente import RelatorioTreino
+
+
+def registrar_candidato(rel: RelatorioTreino, tracking_uri: str = "sqlite:///mlflow.db") -> str:
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(f"galaxies-{rel.cliente}")
+    nome = f"galaxies-{rel.cliente}"
+    with mlflow.start_run(run_name=rel.versao):
+        mlflow.log_params({"versao": rel.versao, "blocos": ",".join(rel.blocos_usados),
+                           "n_treino": rel.n_treino, "corte_teste": rel.corte_teste[:10]})
+        for grupo, valores in rel.metricas.items():
+            mlflow.log_metrics({f"{grupo}_{k}": v for k, v in valores.items()})
+        mlflow.log_artifacts(rel.pasta, artifact_path="pacote")   # q10/q50/q90, card, config
+        info = mlflow.lightgbm.log_model(
+            lgb.Booster(model_file=f"{rel.pasta}/modelo_q50.txt"), name="modelo_q50",
+            registered_model_name=nome, pip_requirements=["lightgbm==4.7.0"])
+    versao = info.registered_model_version
+    cliente = MlflowClient()
+    cliente.set_model_version_tag(nome, versao, "status", "candidato")
+    cliente.set_model_version_tag(nome, versao, "avisos", " | ".join(rel.avisos)[:500])
+    return f"models:/{nome}/{versao}"
+```
+
+```python
+# teste_registro.py
+import time
+from pathlib import Path
+from mlflow import MlflowClient
+from pipeline_cliente import carregar_config, treinar_para_cliente
+from registro import registrar_candidato
+
+t0 = time.perf_counter()
+rel = treinar_para_cliente("base_cliente.csv", carregar_config(Path("config_lumina.yaml").read_text()))
+print("versão", rel.versao, f"({time.perf_counter() - t0:.2f}s, reaproveitada)")
+uri = registrar_candidato(rel)
+print("registrado:", uri, f"({time.perf_counter() - t0:.0f}s)")
+mv = MlflowClient().get_model_version("galaxies-lumina", uri.rsplit("/", 1)[1])
+print("tags:", mv.tags, "| aliases:", mv.aliases)
+# promoção MANUAL, depois de ler o MODEL_CARD.md:
+# MlflowClient().set_registered_model_alias("galaxies-lumina", "champion", mv.version)
+```
+
+```text
+Successfully registered model 'galaxies-lumina'.
+Created version '1' of model 'galaxies-lumina'.
+versão dca9db3b8a (0.00s, reaproveitada)
+registrado: models:/galaxies-lumina/1 (3s)
+tags: {'status': 'candidato', 'avisos': '13 posts sem likes públicos removidos | 23 posts com menos de 30 dias na coleta removidos | intervalo subcobre no teste: recalibre (conformal) antes de expor'} | aliases: []
+```
+
+Dois detalhes do MLflow 3: `name=` substituiu `artifact_path` no `log_model`, e o `pip_requirements` explícito evita a inferência de dependências (no nosso teste, cerca de 2 minutos contra 3 segundos). A versão registrada fica **sem alias**. Como a tool de previsão do módulo 6 carrega `models:/galaxies-lumina@champion`, nada muda para a persona até alguém promover.
+
+---
+
+## Expondo como tool MCP: `treinar_modelo`
+
+Expor treino como tool é bem diferente de expor previsão. Prever custa milissegundos e não muda nada. Treinar custa minutos, consome CPU e memória, lê arquivos e cria artefatos. Estes são os cuidados, e onde cada um aparece no código:
+
+| Risco | O que pode dar errado | Trava |
+| :--- | :--- | :--- |
+| Tempo | o treino passa do *timeout* do cliente MCP | a tool devolve um `job_id` na hora; `status_treino` consulta |
+| Recursos | três treinos simultâneos derrubam o servidor | fila com um *worker* (`max_workers=1`) |
+| Entrada | caminho `../../`, arquivo gigante, YAML malicioso | pasta única de uploads, limite de tamanho, `yaml.safe_load` + Pydantic |
+| Produção | um treino ruim substitui o modelo em uso | a tool só cria candidatos; `@champion` é promovido por uma pessoa |
+| Rastreio | "qual modelo gerou esta previsão?" | versão = hash da base e da config; relatório e card salvos |
+
+```python
+# servidor_treino.py — tool MCP treinar_modelo (fastmcp 3.4.7) com as travas necessárias
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from pydantic import ValidationError
+
+from pipeline_cliente import ErroDeEsquema, carregar_config, treinar_para_cliente
+
+UPLOADS = Path("uploads").resolve()            # a tool só lê bases daqui
+LIMITE_MB = 200
+FILA = ThreadPoolExecutor(max_workers=1)       # um treino por vez: CPU e memória são finitas
+JOBS: dict[str, Future] = {}
+mcp = FastMCP("galaxies-treino")
+
+
+def _resolver(nome_arquivo: str) -> Path:
+    caminho = (UPLOADS / nome_arquivo).resolve()
+    if not caminho.is_relative_to(UPLOADS) or caminho.suffix not in {".csv", ".parquet"}:
+        raise ToolError("arquivo fora da pasta de uploads ou formato não suportado (.csv/.parquet)")
+    if not caminho.is_file():
+        raise ToolError(f"arquivo {nome_arquivo!r} não encontrado em uploads/")
+    if caminho.stat().st_size > LIMITE_MB * 2**20:
+        raise ToolError(f"arquivo maior que {LIMITE_MB} MB")
+    return caminho
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False,
+                       "idempotentHint": True, "openWorldHint": False})
+def treinar_modelo(nome_arquivo: str, config_yaml: str) -> dict:
+    """Treina e avalia um modelo para a base de um cliente, em segundo plano.
+    Devolve um job_id; acompanhe com status_treino. Nunca altera o modelo em produção."""
+    caminho = _resolver(nome_arquivo)
+    try:
+        cfg = carregar_config(config_yaml)
+    except ValidationError as e:
+        raise ToolError(f"config inválida: {e.errors(include_url=False)}") from None
+    job_id = uuid.uuid4().hex[:8]
+    JOBS[job_id] = FILA.submit(treinar_para_cliente, caminho, cfg)
+    return {"status": "enfileirado", "job_id": job_id}
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def status_treino(job_id: str) -> dict:
+    """Consulta um treino iniciado por treinar_modelo."""
+    job = JOBS.get(job_id)
+    if job is None:
+        raise ToolError(f"job {job_id!r} não existe")
+    if not job.done():
+        return {"status": "rodando"}
+    if (erro := job.exception()) is not None:
+        detalhe = erro.problemas if isinstance(erro, ErroDeEsquema) else str(erro)
+        return {"status": "falhou", "erro": detalhe}
+    return {"status": "concluido", "relatorio": job.result().model_dump(),
+            "proximo_passo": "revisar MODEL_CARD.md; promover a champion é decisão humana"}
+
+
+if __name__ == "__main__":
+    mcp.run()   # stdio
+```
+
+Para testar sem subir processo nenhum, o `Client` do FastMCP conversa com o servidor em memória. Copie as duas bases para `uploads/` antes:
+
+```python
+# teste_mcp.py
+import asyncio
+from pathlib import Path
+from fastmcp import Client
+from servidor_treino import mcp
+
+CONFIG = Path("config_lumina.yaml").read_text()
+
+
+async def main():
+    async with Client(mcp) as c:                      # cliente em memória, sem subprocesso
+        print("tools:", [t.name for t in await c.list_tools()])
+        r = await c.call_tool("treinar_modelo", {"nome_arquivo": "../../etc/passwd",
+                                                 "config_yaml": CONFIG}, raise_on_error=False)
+        print("tentativa maliciosa ->", r.is_error, r.content[0].text)
+        r = await c.call_tool("treinar_modelo", {"nome_arquivo": "base_sem_video.csv",
+                                                 "config_yaml": CONFIG})
+        job = {"job_id": r.data["job_id"]}
+        print("enfileirado ->", r.data)
+        while (s := (await c.call_tool("status_treino", job)).data)["status"] == "rodando":
+            await asyncio.sleep(0.5)
+        rel = s["relatorio"]
+        print(s["status"], "| versão", rel["versao"], "| ignorados:", rel["blocos_ignorados"])
+        print("gbm:", {k: round(v, 3) for k, v in rel["metricas"]["gbm"].items()})
+        print(s["proximo_passo"])
+
+asyncio.run(main())
+```
+
+```text
+tools: ['treinar_modelo', 'status_treino']
+tentativa maliciosa -> True arquivo fora da pasta de uploads ou formato não suportado (.csv/.parquet)
+enfileirado -> {'status': 'enfileirado', 'job_id': '5ac1a327'}
+concluido | versão 8fbbffabc1 | ignorados: {'video': 'nenhuma coluna de vídeo na base; modelo usa texto + canal + tempo'}
+gbm: {'mae': 0.428, 'spearman': 0.353, 'par_a_par': 0.578}
+revisar MODEL_CARD.md; promover a champion é decisão humana
+```
+
+A versão `8fbbffabc1` é a mesma do teste anterior: mesmo conteúdo, mesmo hash, nenhum treino repetido. O `ToolError` volta como resultado com `is_error=True`, e o LLM pode ler a mensagem e corrigir a chamada.
+
+:::warning[Por que um job, e não só um timeout?]
+O FastMCP 3.4.7 aceita `@mcp.tool(timeout=...)` e roda funções síncronas numa *thread*. Só que, quando o tempo estoura, o cliente recebe erro, mas **a thread continua treinando**, porque uma thread Python não pode ser morta. O padrão `job_id` + `status_treino` funciona com qualquer cliente MCP.
+
+A alternativa nativa do protocolo são as *tasks* da spec do MCP (revisão 2026-07-28), que o FastMCP expõe com `@mcp.tool(task=True)` e o extra `fastmcp[tasks]`. Antes de adotar, confira se o seu cliente suporta. Em produção, troque a `ThreadPoolExecutor` por um processo ou fila separados, que podem ser cancelados de verdade.
+
+Lembre também a pegadinha de versões da trilha: o FastMCP 4.x e o SDK `mcp` 2.x não funcionam com o `langchain-mcp-adapters` 0.3.2. Fique em `fastmcp==3.4.7` + `mcp==1.30.0`.
+:::
+
+As `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`) ajudam o cliente a decidir se pede confirmação antes de chamar a tool, mas são **dicas**, não controle de acesso. Quem protege a produção é o código.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Suponha que a Lumina mande a base dos próprios Shorts e de três concorrentes, mas **sem nenhuma coluna extraída do vídeo**. O pipeline treina mesmo assim, com canal, tempo e texto, e registra `blocos_ignorados: {"video": ...}`.
+
+O que isso muda para A vs. B? Quase tudo o que diferencia os dois criativos está no bloco desligado: o gancho forte de B, o texto na tela, os 22 s contra 55 s, a música animada. O modelo sem vídeo só enxerga que B sai numa quinta às 19h, A numa terça às 14h, e as legendas. Ele pode até preferir B, mas pelo motivo errado, o horário nobre. Na base sintética, essa versão acerta 57,8% dos pares, contra 63,5% da versão com vídeo.
+
+Por isso, a resposta do agente precisa carregar o `blocos_ignorados`. Algo como: *"esta comparação não avaliou o conteúdo visual dos vídeos"*. O próximo passo honesto é rodar a extração do módulo 4 nos vídeos da Lumina e treinar de novo. A nova versão entra como candidata, e alguém compara os dois *model cards* antes de promover.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas do pipeline agnóstico]
+1. **Validar só os nomes das colunas.** Uma coluna `published_at` cheia de "ontem à noite" passa num checklist de nomes e quebra o treino lá na frente. Valide tipo, faixa e unicidade, com `lazy=True` para listar tudo de uma vez.
+2. **Usar `channel_stats_at_collection` como feature.** É uma foto de depois dos posts antigos, e por isso vaza. Se usar, documente no card e compare com e sem.
+3. **Transformar coluna ausente em erro fatal.** Cliente sem vídeo não é base inválida: é um modelo com menos blocos, dito explicitamente no relatório.
+4. **Deixar a tool promover o próprio modelo.** Um treino automático com teste pequeno pode "vencer" por sorte. Candidato automático, promoção humana.
+5. **Treinar de forma síncrona dentro da chamada MCP.** Funciona na demo com 600 linhas e estoura o *timeout* com a base real. Use job e fila.
+6. **Aceitar qualquer caminho de arquivo.** `nome_arquivo` vem de um LLM, que por sua vez pode ter recebido texto de um usuário. Restrinja a uma pasta e resolva o caminho antes de checar.
+:::
+
+<Quiz
+  id="m7-a1"
+  perguntas={[
+    {
+      pergunta: 'Um cliente envia uma base sem nenhuma coluna de vídeo. Qual é o comportamento correto do pipeline agnóstico?',
+      opcoes: [
+        {texto: 'Recusar a base com erro de esquema, porque faltam features importantes.', explicacao: 'As colunas de vídeo não fazem parte do esquema mínimo. Recusar impediria o cliente de ter qualquer modelo.'},
+        {texto: 'Treinar com canal, tempo e texto e registrar no relatório que o bloco de vídeo foi ignorado, e por quê.', correta: true, explicacao: 'Isso é degradação graciosa: o modelo existe, mas o relatório e o agente deixam claro o que ele não avaliou.'},
+        {texto: 'Preencher as colunas de vídeo com a média da base de treino da Galaxies.', explicacao: 'Isso inventa informação e faz o modelo parecer avaliar conteúdo que nunca viu.'},
+        {texto: 'Pedir ao LLM que estime gancho e energia a partir da legenda.', explicacao: 'Seriam features sem validação e com viés do LLM. Se quiser atributos de vídeo, rode a extração do módulo 4 no vídeo de verdade.'},
+      ],
+    },
+    {
+      pergunta: 'Por que `channel_stats_at_collection` (inscritos no dia da coleta) fica desligado por padrão como *feature*?',
+      opcoes: [
+        {texto: 'Porque inscritos não têm relação com curtidas.', explicacao: 'Têm relação, e forte. O problema é o momento em que o número foi medido.'},
+        {texto: 'Porque é uma medida posterior aos posts antigos e inclui o crescimento que eles causaram: é vazamento.', correta: true, explicacao: 'No treino, cada post precisa ver o que se sabia na data dele. Uma foto tirada meses depois não respeita isso.'},
+        {texto: 'Porque o pandera não valida números grandes.', explicacao: 'O pandera valida sem problema. A questão é temporal, não de tipo.'},
+      ],
+    },
+    {
+      pergunta: 'A tool `treinar_modelo` terminou. O GBM teve 0,64 de acerto par-a-par, contra 0,50 do baseline, e o intervalo de 80% cobriu 60% do teste. O que deve acontecer em seguida?',
+      opcoes: [
+        {texto: 'A tool promove automaticamente a versão a @champion, porque venceu o baseline.', explicacao: 'Promoção automática é justamente o que o desenho evita. E o intervalo subcobre, o que é um problema para a persona.'},
+        {texto: 'A versão fica registrada como candidata; uma pessoa lê o model card, vê o aviso de subcobertura, recalibra o intervalo e só então decide promover.', correta: true, explicacao: 'O relatório levanta os motivos para desconfiar, e a decisão de produção é humana.'},
+        {texto: 'Descartar a versão, porque o intervalo não cobre 80%.', explicacao: 'O ponto central é útil (vence o baseline). O intervalo pode ser recalibrado com conformal, sem jogar o modelo fora.'},
+      ],
+    },
+    {
+      pergunta: 'Quais travas fazem sentido numa tool MCP que treina modelos? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Devolver um `job_id` imediatamente e consultar o progresso com outra tool.', correta: true, explicacao: 'Evita estourar o timeout do cliente e funciona com qualquer cliente MCP.'},
+        {texto: 'Limitar a leitura a uma pasta de uploads e resolver o caminho antes de checar.', correta: true, explicacao: 'O argumento vem de um LLM e pode conter `../`. Resolver e checar impede ler arquivos fora da pasta.'},
+        {texto: 'Marcar a tool com `readOnlyHint: true` para que ninguém consiga alterar arquivos.', explicacao: 'Além de ser falso (a tool cria artefatos), anotações são dicas para o cliente, não controle de acesso.'},
+        {texto: 'Uma fila com número limitado de workers.', correta: true, explicacao: 'Treinos simultâneos disputam CPU e memória. A fila torna o consumo previsível.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: recuse canais sem histórico suficiente]
+O alvo relativo precisa de histórico. Um canal com 6 posts gera poucos exemplos e métricas instáveis. Adicione ao contrato uma checagem **de nível de DataFrame**: cada canal precisa ter pelo menos 10 posts com curtidas públicas. Teste com a base sintética mais um canal novo de 6 posts e confira quantas linhas são reprovadas.
+
+Dica: o pandera tem `@pa.dataframe_check`, e você pode herdar de `BaseMinima`.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import pandas as pd
+import pandera.pandas as pa
+from pipeline_cliente import BaseMinima
+
+
+class BaseComHistorico(BaseMinima):
+    @pa.dataframe_check(error="canal com menos de 10 posts com likes públicos")
+    def canal_tem_historico(cls, df: pd.DataFrame) -> pd.Series:
+        return df.groupby("channel_id")["metric_target"].transform("count") >= 10
+
+
+base = pd.read_csv("base_cliente.csv")
+novato = base[base["channel_id"] == "c0"].head(6).assign(channel_id="canal-novo",
+                                                         post_id=lambda d: d["post_id"] + "-n")
+try:
+    BaseComHistorico.validate(pd.concat([base, novato], ignore_index=True), lazy=True)
+except pa.errors.SchemaErrors as e:
+    fc = e.failure_cases
+    print(fc["check"].unique().tolist(), "| linhas reprovadas:", fc["index"].nunique())
+# ['canal com menos de 10 posts com likes públicos'] | linhas reprovadas: 6
+```
+
+Repare no `fc["index"].nunique()`: numa checagem de DataFrame, o pandera lista a falha **por célula** (6 linhas × 13 colunas = 78 registros). Contar índices distintos dá o número de linhas. Um próximo passo razoável é não recusar a base inteira: remover os canais reprovados e registrar isso nos `avisos`, no mesmo espírito da degradação graciosa.
+
+</details>
+
+---
+
+## Resumo
+
+- Um **pipeline agnóstico** troca decisões manuais por um **contrato** (pandera para a base, Pydantic para a config em YAML) e por regras automáticas documentadas.
+- **Degradação graciosa**: blocos de features entram quando as colunas existem; o que ficou de fora vai para `blocos_ignorados` e para a resposta do agente.
+- Split temporal, baseline, GBM com quantis e métricas saem da mesma função, com **versão por hash** e um **model card** cujos avisos dizem por que *não* confiar.
+- A automação registra **candidatos** no MLflow; o alias **`@champion`** é promovido por uma pessoa, e só ele é usado pela tool de previsão.
+- Como **tool MCP**, treino exige job assíncrono, fila, validação do caminho e da config, e nenhum poder sobre produção.
+
+## Referências
+
+- [pandera: DataFrame Models](https://pandera.readthedocs.io/en/stable/dataframe_models.html). Documentação oficial da API `DataFrameModel`, `Field` e `dataframe_check`.
+- [Pydantic: Models](https://docs.pydantic.dev/latest/concepts/models/) e [tipos como `AwareDatetime`](https://docs.pydantic.dev/latest/api/types/).
+- [MLflow Model Registry](https://mlflow.org/docs/latest/ml/model-registry/): versões, tags e aliases.
+- [FastMCP: Tools](https://gofastmcp.com/servers/tools) e [FastMCP: Background Tasks](https://gofastmcp.com/servers/tasks).
+- Especificação do MCP, revisão 2026-07-28: [Tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) e [Tasks](https://modelcontextprotocol.io/specification/2026-07-28/basic/utilities/tasks).
+- Mitchell et al. [*Model Cards for Model Reporting*](https://arxiv.org/abs/1810.03993). FAT\*, 2019.
+- Gebru et al. [*Datasheets for Datasets*](https://arxiv.org/abs/1803.09010). Communications of the ACM, 2021.
+
+**Próxima aula:** [What-if: otimizando legenda, horário e gancho](/aulas/ml-preditivo-e-agentes/ir-alem/what-if). Use o modelo treinado para comparar variações de um criativo sem sair do suporte dos dados.

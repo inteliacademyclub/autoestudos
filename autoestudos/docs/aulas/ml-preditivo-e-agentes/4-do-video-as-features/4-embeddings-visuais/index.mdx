@@ -1,0 +1,460 @@
+---
+sidebar_position: 4
+sidebar_label: 'Embeddings visuais: CLIP e SigLIP 2'
+title: 'Embeddings visuais: CLIP e SigLIP 2'
+description: 'Aprendizado contrastivo, CLIP vs. SigLIP 2, sondas de texto zero-shot como features interpretáveis, pooling de frames e PCA ajustado só no treino, com código testado em CPU.'
+tags: [ml-preditivo, multimodal, embeddings, siglip]
+---
+
+import EmbeddingMap from '@site/src/components/interativos/EmbeddingMap';
+
+# Embeddings Visuais: CLIP e SigLIP 2 como Olhos Congelados do Modelo
+
+<LessonMeta
+  tempo="50 min"
+  semana={3}
+  etapa="multimodal"
+  objetivos={[
+    'Explicar a intuição do aprendizado contrastivo e por que ele coloca imagem e texto no mesmo espaço',
+    'Comparar CLIP e SigLIP 2 (perda softmax vs. sigmoide, idiomas, licença) e escolher um encoder para CPU ou T4',
+    'Criar sondas de texto zero-shot que viram colunas interpretáveis',
+    'Agregar embeddings de frames por vídeo (média, gancho, thumbnail) e comprimi-los com PCA ajustado só no treino',
+    'Distinguir redução para feature (PCA) de redução para visualização (UMAP, t-SNE)',
+  ]}
+  prerequisitos={[
+    {label: 'Frames, cortes e sinais de baixo nível', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais'},
+    {label: 'Embeddings (RAG e rerankers)', to: '/aulas/rag-e-rerankers/embeddings'},
+    {label: 'Features de texto', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto'},
+  ]}
+/>
+
+A aula anterior mediu **como** o Short é editado: cortes, luz, movimento. Nenhuma daquelas colunas sabe dizer **o que** aparece na tela. Para o OpenCV, um close de batom e um farol de carro vermelho podem ter o mesmo brilho, a mesma saturação e a mesma cor dominante.
+
+Você já conhece a solução do lado do texto: na [aula de embeddings do módulo de RAG](/aulas/rag-e-rerankers/embeddings), frases viram vetores e frases parecidas ficam próximas. Existe a mesma ideia para imagens, com um bônus que muda o jogo: modelos como **CLIP** e **SigLIP** colocam imagens e textos **no mesmo espaço**. Isso permite perguntar a um frame, em português, "você parece um close de batom?" e receber um número.
+
+Nesta aula você transforma frames em <Termo id="embedding">embeddings</Termo> com um encoder congelado, cria **sondas de texto** que viram colunas legíveis e comprime o resto com <Termo id="pca">PCA</Termo>, sem deixar o teste vazar para o treino.
+
+:::info[A ideia central]
+Um encoder contrastivo (<Termo id="clip">CLIP / SigLIP</Termo>) transforma cada frame num vetor em que **imagens e frases comparáveis ficam próximas**. Desse vetor saem dois tipos de coluna: **sondas** (a similaridade com frases escolhidas por você, legíveis e explicáveis) e **componentes de PCA** (um resumo compacto de todo o resto, ajustado só no treino).
+:::
+
+---
+
+## Aprendizado contrastivo em uma imagem
+
+O CLIP (Radford et al., 2021) foi treinado com 400 milhões de pares imagem–legenda coletados da web. A arquitetura tem duas torres: um **encoder de imagem** (um Vision Transformer) e um **encoder de texto**. Cada um produz um vetor, e os dois vetores vivem no mesmo espaço.
+
+O treino é um jogo de correspondência. Num lote com $$N$$ pares, há $$N$$ combinações certas (a imagem $$i$$ com a legenda $$i$$) e $$N^2 - N$$ erradas. O objetivo é aproximar os pares certos e afastar os errados. Com vetores normalizados $$x_i$$ (imagem) e $$y_j$$ (texto), a similaridade é o produto escalar, que é o cosseno. O CLIP usa uma **softmax** sobre o lote, nos dois sentidos:
+
+$$
+\mathcal{L}_{\text{CLIP}} = -\frac{1}{2N}\sum_{i=1}^{N}\left[\log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j} e^{t\,x_i\cdot y_j}} + \log\frac{e^{t\,x_i\cdot y_i}}{\sum_{j} e^{t\,x_j\cdot y_i}}\right]
+$$
+
+em que $$t$$ é uma temperatura aprendida. Em palavras: para cada imagem, "qual das $$N$$ legendas é a sua?", e vice-versa.
+
+<Sketch name="m4/a4-espaco" alt="Frames do Short e a thumbnail passam por um encoder de imagem congelado; frases como 'um close de batom' e 'um carro andando' passam por um encoder de texto congelado. Os dois produzem pontos num espaço compartilhado de 768 dimensões, em que o frame de batom fica perto da frase 'close de batom' e o frame de estrada fica perto de 'carro andando'. Do espaço saem duas famílias de colunas: a média dos frames (e do gancho, separada) comprimida por PCA para 16 a 32 componentes, e as sondas, que são o cosseno entre o frame e cada frase. As duas vão para o GBM junto com as colunas do canal. Uma nota lembra que o treino contrastivo foi feito por quem publicou o modelo e que UMAP e t-SNE servem só para visualizar." caption="Dois encoders congelados, um espaço compartilhado e duas famílias de colunas." />
+
+O resultado prático é o que interessa aqui: depois do treino, "perto" no espaço significa "parecido em conteúdo", tanto entre duas imagens quanto entre uma imagem e uma frase. Você **não treina nada disso**. Só usa as duas torres prontas.
+
+---
+
+## CLIP vs. SigLIP 2
+
+O **SigLIP** (Zhai et al., 2023) trocou a softmax por uma **sigmoide aplicada a cada par**, tratado como uma classificação binária independente: "esta imagem e este texto combinam, sim ou não?". Com $$z_{ij} = 1$$ para os pares certos e $$z_{ij} = -1$$ para os errados:
+
+$$
+\mathcal{L}_{\text{SigLIP}} = -\frac{1}{N}\sum_{i=1}^{N}\sum_{j=1}^{N}\log\sigma\big(z_{ij}\,(t\,x_i\cdot y_j + b)\big)
+$$
+
+A diferença parece pequena, mas tem consequências. A softmax precisa normalizar sobre o lote inteiro, o que cria dependência entre todos os pares; a sigmoide não, o que simplifica o treino em lotes grandes e funciona melhor em lotes pequenos, segundo os autores. Para você, a consequência prática é outra: o SigLIP devolve, para cada par imagem–frase, uma pontuação **independente das outras frases**. Isso casa bem com sondas, em que um frame pode ter rosto **e** texto ao mesmo tempo.
+
+O **SigLIP 2** (Tschannen et al., 2025) mantém a perda sigmoide e acrescenta objetivos de legenda, autodestilação e predição mascarada, além de dados multilíngues. O resultado é um encoder melhor em compreensão semântica e localização, e com suporte a outros idiomas além do inglês.
+
+| | CLIP (OpenAI) | SigLIP 2 |
+| :--- | :--- | :--- |
+| Perda | softmax sobre o lote | sigmoide por par |
+| Idiomas | inglês | multilíngue |
+| Licença | MIT | Apache-2.0 |
+| Modelo sugerido | ViT-B/32 | `google/siglip2-base-patch16-224` |
+| Dimensão do vetor | 512 (ViT-B/32) | 768 (base) |
+
+A trilha usa o `google/siglip2-base-patch16-224`: 375 milhões de parâmetros no total (93 milhões na torre de imagem; na de texto, a maior parte é a tabela de um vocabulário multilíngue de 256 mil tokens), cerca de 1,5 GB de pesos, e roda em CPU e numa T4. Duas variantes merecem nota:
+
+- As versões `naflex` preservam a **proporção original** da imagem. A versão 224 redimensiona cada frame 9:16 para um quadrado, esticando-o. Para a maioria das features isso é aceitável; se o texto na tela for importante, teste a `google/siglip2-base-patch16-naflex`.
+- O **DINOv2** (Oquab et al., 2023; Apache-2.0) é um encoder só de imagem, treinado sem texto. Ele não serve para sondas, mas descreve estrutura visual (formas, texturas, composição) sem depender de legendas, o que o torna uma opção para colunas de estilo e para similaridade entre vídeos. É uma camada opcional: some as colunas dele só se a ablação da [aula 4.8](/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao) mostrar ganho.
+
+---
+
+## Na prática: do frame ao vetor
+
+O código abaixo carrega o modelo com `transformers` 5.17 e define duas funções. **Atenção a uma mudança do transformers 5**: `get_image_features` e `get_text_features` devolvem um objeto de saída, não um tensor. O vetor está em `.pooler_output`. O exemplo do model card no Hugging Face, que imprime `.shape` direto, é da versão 4.
+
+```python
+# testado em CPU (Apple M2) com o modelo base; o download tem ~1,5 GB
+import numpy as np
+import torch
+from transformers import AutoModel, AutoProcessor
+
+CKPT = "google/siglip2-base-patch16-224"  # ~1,5 GB; roda em CPU e em T4
+modelo = AutoModel.from_pretrained(CKPT).eval()
+proc = AutoProcessor.from_pretrained(CKPT)
+
+
+@torch.inference_mode()
+def embed_imagens(imagens: list) -> np.ndarray:
+    """Lista de PIL.Image (ou arrays RGB) -> matriz (n, 768) com norma 1."""
+    entradas = proc(images=imagens, return_tensors="pt")
+    saida = modelo.get_image_features(**entradas)  # transformers 5: objeto, não tensor
+    return torch.nn.functional.normalize(saida.pooler_output, dim=-1).numpy()
+
+
+@torch.inference_mode()
+def embed_textos(textos: list[str]) -> np.ndarray:
+    # SigLIP foi treinado com texto minúsculo e padding fixo de 64 tokens
+    entradas = proc(text=[t.lower() for t in textos], padding="max_length",
+                    max_length=64, truncation=True, return_tensors="pt")
+    saida = modelo.get_text_features(**entradas)
+    return torch.nn.functional.normalize(saida.pooler_output, dim=-1).numpy()
+```
+
+Dois detalhes do texto vêm do próprio modelo: o tokenizer do SigLIP 2 está configurado para **minúsculas**, e a pipeline oficial de classificação zero-shot do transformers usa `padding="max_length"` com `max_length=64` para modelos SigLIP. Sem isso, as similaridades mudam.
+
+Os dois vetores saem com **norma 1**. Assim, o produto escalar entre uma imagem e um texto é exatamente o cosseno entre eles.
+
+---
+
+## Sondas zero-shot: colunas que você consegue ler
+
+Uma **sonda** é uma frase que descreve algo que você suspeita importar: "um close do rosto de uma pessoa", "texto grande escrito na tela". A coluna é a similaridade entre o frame e a frase. Diferente de um componente de PCA, ela tem nome e significado, e o SHAP da [aula 5.6](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica) vai poder dizer "a sonda de rosto no gancho puxou a previsão para cima".
+
+Para testar, use quatro fotos públicas do COCO (as mesmas que a documentação do Hugging Face usa nos exemplos) e dois frames dos vídeos sintéticos da aula 4.3: o logo do "A" e o texto "DEPOIS" do "B".
+
+```python
+import pandas as pd
+from PIL import Image
+from transformers.image_utils import load_image
+
+SONDAS = {  # nome da coluna -> frase (teste também em inglês: veja o texto)
+    "rosto": "um close do rosto de uma pessoa",
+    "carros": "carros em uma rua",
+    "comida": "comida sobre uma mesa",
+    "terno": "um homem de terno e gravata",
+    "logo": "um logotipo com o nome de uma marca",
+    "texto": "texto grande escrito na tela",
+}
+
+
+def sondas_relativas(emb_img, emb_txt):
+    """Similaridade com cada sonda menos a média das sondas na mesma imagem."""
+    sim = emb_img @ emb_txt.T  # cosseno, pois tudo tem norma 1
+    return sim - sim.mean(axis=1, keepdims=True)
+
+
+COCO = "http://images.cocodataset.org/val2017/{:012d}.jpg"
+imagens = {
+    "rosto": load_image(COCO.format(1296)), "carros": load_image(COCO.format(1532)),
+    "bolo": load_image(COCO.format(2157)), "gravata": load_image(COCO.format(4395)),
+    "logo_A": Image.open("frame_logo_a.png").convert("RGB"),   # frames dos vídeos
+    "texto_B": Image.open("frame_texto_b.png").convert("RGB"),  # sintéticos da aula 4.3
+}
+emb_img = embed_imagens(list(imagens.values()))
+emb_txt = embed_textos(list(SONDAS.values()))
+bruto = pd.DataFrame(emb_img @ emb_txt.T, index=list(imagens), columns=list(SONDAS))
+relativo = pd.DataFrame(sondas_relativas(emb_img, emb_txt), index=list(imagens), columns=list(SONDAS))
+print("similaridade bruta:\n", bruto.round(3).to_string())
+print("sonda relativa:\n", relativo.round(3).to_string())
+```
+
+Os dois frames sintéticos saem de `ffmpeg -ss 0.5 -i sintetico_a.mp4 -frames:v 1 frame_logo_a.png` e `ffmpeg -ss 2.5 -i sintetico_b.mp4 -frames:v 1 frame_texto_b.png`.
+
+```text
+similaridade bruta:
+          rosto  carros  comida  terno   logo  texto
+rosto    0.058  -0.033  -0.032 -0.006  0.016  0.031
+carros  -0.029   0.034  -0.047 -0.025  0.010  0.043
+bolo    -0.028  -0.045   0.087 -0.013 -0.011 -0.004
+gravata  0.065  -0.049  -0.033  0.107  0.009  0.013
+logo_A   0.058   0.002   0.004  0.038  0.084  0.070
+texto_B  0.083   0.056   0.047  0.062  0.103  0.102
+sonda relativa:
+          rosto  carros  comida  terno   logo  texto
+rosto    0.052  -0.038  -0.038 -0.012  0.010  0.026
+carros  -0.027   0.036  -0.045 -0.022  0.012  0.046
+bolo    -0.025  -0.042   0.089 -0.011 -0.009 -0.002
+gravata  0.046  -0.068  -0.052  0.088 -0.010 -0.005
+logo_A   0.015  -0.040  -0.039 -0.004  0.041  0.028
+texto_B  0.008  -0.019  -0.028 -0.013  0.027  0.026
+```
+
+Há quatro lições nessa tabela, todas de uma execução real:
+
+1. **Os cossenos são pequenos** (entre −0,07 e 0,11). Isso é normal no SigLIP. O que importa é a **ordem** dentro de cada coluna, e o GBM só usa a ordem.
+2. **A similaridade bruta engana.** Na coluna `rosto`, o frame sintético `texto_B` (0,083) passa na frente da foto de rosto (0,058). Imagens com muito texto ou gráfico "parecem" um pouco com qualquer frase. Subtraindo a média das sondas da mesma imagem (a **sonda relativa**), a coluna `rosto` fica ordenada como deveria: rosto (0,052), gravata (0,046, que também é um rosto), e os frames sintéticos lá embaixo.
+3. **Sondas medem o que está na imagem, não o que você quis dizer.** A sonda `texto` deu o maior valor para a foto de **carros**. Ela não errou: a foto tem placas de trânsito grandes, com texto. Em Shorts reais, legendas automáticas, marcas d'água e embalagens vão acionar a mesma sonda.
+4. **A probabilidade sigmoide não serve de feature aqui.** Aplicando a escala e o viés do próprio modelo, todas as combinações em português ficaram abaixo de 0,01. Para coluna, use o cosseno (ou a sonda relativa), que preserva a ordem sem esmagar os valores.
+
+E o idioma? O SigLIP 2 é multilíngue, e as frases em português funcionaram. Repetindo o teste com as mesmas frases em inglês, no formato "this is a photo of ...", a similaridade do par certo foi maior em 4 dos 5 casos (carros, por exemplo, subiu de 0,034 para 0,093). Com 6 imagens, isso é uma pista, não uma conclusão: **valide as suas sondas nos dois idiomas** com frames da sua base.
+
+Uma lista inicial de sondas para os setores do case, **a validar** com o exercício no fim da aula:
+
+| Setor | Sondas sugeridas |
+| :--- | :--- |
+| Beleza | "um close do rosto de uma pessoa", "uma pessoa aplicando maquiagem", "um close de batom nos lábios", "um produto de beleza na mão" |
+| Moda | "uma pessoa mostrando uma roupa de corpo inteiro", "roupas penduradas em uma arara", "um close de um tênis" |
+| Automotivo | "um carro em movimento na estrada", "o interior de um carro, com painel e volante", "um close da roda de um carro" |
+| Todos | "texto grande escrito na tela", "um logotipo com o nome de uma marca", "uma pessoa falando para a câmera" |
+
+---
+
+## Do frame ao vídeo: pooling
+
+Um Short tem 8 frames amostrados e uma thumbnail; o GBM precisa de **uma linha por vídeo**. A agregação (*pooling*) mais simples e robusta é a média, com dois cuidados:
+
+- **Normalize de novo depois da média.** A média de vetores de norma 1 tem norma menor que 1, tanto menor quanto mais diferentes forem os frames.
+- **Não misture tudo.** A thumbnail é o que o usuário vê **antes** do play; o gancho é o que ele vê nos primeiros 3 s; o resto é o vídeo "em média". São três vetores diferentes, com papéis diferentes.
+
+```python
+import numpy as np
+
+
+def _media_normalizada(m: np.ndarray) -> np.ndarray:
+    v = m.mean(axis=0)
+    return v / np.linalg.norm(v)  # a média de vetores unitários não tem norma 1
+
+
+def embeddings_do_video(caminho: str, thumb=None) -> dict[str, np.ndarray]:
+    # instantes_amostragem, extrair_frames e duracao_s vêm da aula 4.3
+    frames = extrair_frames(caminho, instantes_amostragem(duracao_s(caminho)))
+    rotulos, emb = list(frames), embed_imagens(list(frames.values()))
+    no_gancho = [i for i, r in enumerate(rotulos) if r.startswith("gancho")]
+    saida = {
+        "emb_video": _media_normalizada(emb),              # o vídeo "em média"
+        "emb_gancho": _media_normalizada(emb[no_gancho]),  # os primeiros 3 s
+    }
+    if thumb is not None:
+        saida["emb_thumb"] = embed_imagens([thumb])[0]     # o que aparece no feed
+    return saida
+
+
+for nome in ("sintetico_a.mp4", "sintetico_b.mp4"):
+    e = embeddings_do_video(nome)
+    rel = sondas_relativas(e["emb_gancho"][None, :], emb_txt)[0]
+    print(nome, {k: v.shape for k, v in e.items()},
+          "\n  gancho:", {s: round(float(r), 3) for s, r in zip(SONDAS, rel)})
+```
+
+```text
+sintetico_a.mp4 {'emb_video': (768,), 'emb_gancho': (768,)} 
+  gancho: {'rosto': 0.017, 'carros': -0.044, 'comida': -0.037, 'terno': -0.008, 'logo': 0.039, 'texto': 0.033}
+sintetico_b.mp4 {'emb_video': (768,), 'emb_gancho': (768,)} 
+  gancho: {'rosto': 0.008, 'carros': -0.03, 'comida': -0.029, 'terno': -0.015, 'logo': 0.029, 'texto': 0.037}
+```
+
+No gancho do vídeo "A", a sonda mais alta é `logo` (0,039); no do "B", é `texto` (0,037). É o que se esperava dos dois vídeos sintéticos: um abre com "LUMINA" parado, o outro com "ANTES" e "DEPOIS" em letras grandes.
+
+Quanto custa? Na nossa máquina de teste (Apple M2, só CPU, com outros processos rodando), embedar os 9 frames de um vídeo levou entre 6 e 9 s. Para 3 mil vídeos, isso dá horas de CPU; numa T4 é bem mais rápido, mas meça no seu ambiente antes de planejar. É exatamente o tipo de etapa que precisa do cache da aula 4.1: guarde `emb_video`, `emb_gancho` e `emb_thumb` por `video_id` e nunca mais recalcule.
+
+---
+
+## De 768 para 16: PCA, só no treino
+
+Três vetores de 768 dimensões são 2.304 colunas, muito mais do que os seus poucos milhares de exemplos aguentam. A saída é a mesma da [aula de features de texto](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto): **PCA para 16 a 32 componentes**, mais as sondas, que já são poucas e legíveis.
+
+A regra de ouro é a de sempre: **o PCA é ajustado só no conjunto de treino**, com o mesmo corte temporal do módulo 2, e depois aplicado ao treino, ao teste e aos Shorts novos. Ajustar no conjunto inteiro deixa a estrutura dos vídeos de teste moldar as colunas do treino, um <Termo id="leakage">vazamento</Termo> discreto, mas real.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+
+# 600 vídeos SINTÉTICOS: 3 "estilos" latentes + ruído, em 768 dimensões com norma 1
+rng = np.random.default_rng(0)
+estilos = rng.normal(size=(3, 768))
+mistura = rng.dirichlet([0.5, 0.5, 0.5], size=600)
+emb = mistura @ estilos + rng.normal(scale=0.6, size=(600, 768))
+emb /= np.linalg.norm(emb, axis=1, keepdims=True)
+df = pd.DataFrame({"video_id": [f"v{i:03d}" for i in range(600)],
+                   "publicado_em": pd.date_range("2026-01-01", periods=600, freq="8h")})
+
+corte = pd.Timestamp("2026-06-01")               # o mesmo corte temporal do módulo 2
+treino = (df["publicado_em"] < corte).to_numpy()
+pca = PCA(n_components=16, random_state=0).fit(emb[treino])  # ajusta SÓ no treino
+print("variância explicada acumulada (4, 8, 16 comps):",
+      pca.explained_variance_ratio_.cumsum()[[3, 7, 15]].round(3))
+
+colunas = [f"emb_video_pc{i:02d}" for i in range(16)]
+feats = pd.DataFrame(pca.transform(emb), columns=colunas, index=df["video_id"])  # treino e teste
+print(feats.shape, "| treino:", treino.sum(), "teste:", (~treino).sum())
+print(feats.iloc[:2, :4].round(3))
+```
+
+```text
+variância explicada acumulada (4, 8, 16 comps): [0.402 0.419 0.449]
+(600, 16) | treino: 453 teste: 147
+          emb_video_pc00  emb_video_pc01  emb_video_pc02  emb_video_pc03
+video_id                                                                
+v000              -0.306           0.611           0.109           0.042
+v001              -0.330          -0.504           0.049           0.011
+```
+
+Os dados são sintéticos, com 3 estilos latentes enterrados em ruído, e o PCA mostra isso: os primeiros componentes capturam a estrutura, e os seguintes quase não somam variância. Com embeddings reais, a curva costuma ser mais suave. Olhe a curva **no seu treino** e escolha entre 16 e 32 componentes; a ablação da 4.8 decide se vale a pena. Guarde o objeto `pca` (com `joblib`, junto do modelo): os Shorts A e B precisam passar **pela mesma transformação**.
+
+Três observações práticas:
+
+- Faça um PCA **por família de vetor** (vídeo, gancho, thumbnail), não um único para tudo.
+- Não precisa padronizar os componentes: árvores não ligam para escala.
+- As sondas **não** passam pelo PCA. Elas entram direto como colunas nomeadas.
+
+---
+
+## UMAP e t-SNE: só para olhar
+
+UMAP e t-SNE projetam os embeddings em 2D preservando vizinhanças locais. São ótimos para **ver** se os vídeos de beleza se separam dos automotivos, ou se os virais formam algum grupo. São péssimos como feature:
+
+- o **t-SNE** não tem uma transformação para pontos novos: para projetar o Short B, você teria de refazer o mapa inteiro;
+- os dois são **estocásticos** e sensíveis a hiperparâmetros, então o mesmo vídeo cai em lugares diferentes a cada execução;
+- as **distâncias globais** no mapa não têm significado: dois grupos distantes no desenho podem não ser distantes no espaço original;
+- ajustados sobre a base inteira, **vazam** o teste para o treino.
+
+Use-os para explorar e explicar. Para o modelo, fique com PCA e sondas.
+
+No mapa abaixo, cada ponto é um criativo projetado em 2D. Explore os vizinhos mais próximos de um ponto no espaço original: é a mesma ideia que a [aula 6.4](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/comparaveis) usa para buscar comparáveis. **Os pontos são simulados**, gerados pelo simulador da trilha.
+
+<EmbeddingMap />
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+As sondas são a parte do embedding que conversa com a marca. Aplicadas ao **gancho** dos Shorts reais, espere algo como:
+
+- **Short A**: sonda `logo` alta e sonda `rosto` baixa nos frames do gancho, porque ele abre com o logo parado. A thumbnail, se for o rosto da apresentadora, conta outra história, e por isso ela tem vetor próprio.
+- **Short B**: sondas `rosto` e `texto` altas logo no gancho: metade do rosto sem maquiagem e texto grande na tela.
+
+Os vídeos sintéticos da aula já mostraram essa direção (`logo` no gancho do "A", `texto` no do "B"). Nos reais, confirme com os números e não com a sua expectativa.
+
+Os componentes de PCA também ajudam, de outro jeito: A (tutorial com voiceover) e B (antes/depois) devem cair em vizinhanças diferentes do espaço. Na aula 6.4, o agente vai usar exatamente essa vizinhança para mostrar à Lumina **Shorts parecidos com B que já foram publicados** e quanto eles renderam, um argumento concreto para acompanhar o número da previsão.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Tratar o retorno de `get_image_features` como tensor.** No transformers 5, o vetor está em `.pooler_output`.
+2. **Esquecer `padding="max_length"` e minúsculas no texto do SigLIP.** As similaridades mudam, e as sondas deixam de ser comparáveis com as de quem seguiu o padrão.
+3. **Ajustar o PCA na base inteira.** Ajuste só no treino (corte temporal) e reaplique a mesma transformação em teste e nos Shorts novos.
+4. **Usar coordenadas de UMAP ou t-SNE como feature.** São instáveis, não projetam pontos novos de forma confiável e vazam o teste.
+5. **Confiar numa sonda sem validá-la.** A sonda `texto` disparou numa foto de carros por causa das placas. Valide cada sonda com frames rotulados da sua base.
+6. **Misturar thumbnail, gancho e vídeo num único vetor.** Eles respondem perguntas diferentes; mantenha vetores e PCAs separados.
+:::
+
+<Quiz
+  id="m4-a4"
+  perguntas={[
+    {
+      pergunta: 'O que muda, na prática, entre a perda do CLIP (softmax) e a do SigLIP (sigmoide)?',
+      opcoes: [
+        {texto: 'O SigLIP não usa pares imagem–texto no treino.', explicacao: 'Usa, sim. A diferença está em como a perda trata esses pares.'},
+        {texto: 'O SigLIP avalia cada par imagem–texto como uma decisão binária independente, sem normalizar sobre o lote.', correta: true, explicacao: 'Exato. Por isso a pontuação de uma frase não depende das outras frases, o que combina com sondas não excludentes (rosto E texto).'},
+        {texto: 'O CLIP produz vetores maiores e, por isso, melhores.', explicacao: 'O tamanho do vetor depende da variante do modelo, não da perda.'},
+      ],
+    },
+    {
+      pergunta: 'Na coluna `rosto`, um frame cheio de texto teve similaridade bruta maior que uma foto de rosto. Qual é a correção proposta na aula?',
+      opcoes: [
+        {texto: 'Aplicar a sigmoide do modelo para virar probabilidade.', explicacao: 'No teste, todas as probabilidades ficaram abaixo de 0,01; a sigmoide não corrige a ordem.'},
+        {texto: 'Subtrair, de cada sonda, a média das sondas na mesma imagem (sonda relativa).', correta: true, explicacao: 'Isso. Imagens que "parecem com tudo" perdem a vantagem, e a coluna volta a ordenar pelo conteúdo.'},
+        {texto: 'Padronizar a coluna pela média e desvio no treino.', explicacao: 'Uma transformação monotônica por coluna não muda a ordem dentro da coluna, e o GBM só usa a ordem.'},
+      ],
+    },
+    {
+      pergunta: 'Você ajustou o PCA dos embeddings com todos os 3 mil vídeos (treino e teste) antes do split temporal. Qual é o problema?',
+      opcoes: [
+        {texto: 'Nenhum: o PCA não usa o alvo, então não vaza.', explicacao: 'Não usa o alvo, mas usa a estrutura dos dados de teste para definir as colunas do treino. É um vazamento discreto.'},
+        {texto: 'Os vídeos de teste influenciam as colunas que o modelo aprende; ajuste só no treino e reaplique no teste.', correta: true, explicacao: 'Exato. É a mesma regra do TF-IDF e dos embeddings de texto do módulo 3.'},
+        {texto: 'O PCA precisa de pelo menos 768 vídeos por componente.', explicacao: 'Não existe essa regra. O problema aqui é de vazamento, não de tamanho.'},
+      ],
+    },
+    {
+      pergunta: 'Quais destes vetores ou colunas devem entrar no GBM? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Componentes de PCA do embedding médio do vídeo (ajustado no treino).', correta: true, explicacao: 'Sim, é o resumo compacto do conteúdo visual.'},
+        {texto: 'Sondas relativas calculadas no gancho.', correta: true, explicacao: 'Sim: poucas, nomeadas e explicáveis via SHAP.'},
+        {texto: 'Coordenadas x e y de um UMAP ajustado na base inteira.', explicacao: 'Não: instáveis, sem transformação confiável para pontos novos e com vazamento.'},
+        {texto: 'Componentes de PCA do embedding da thumbnail, com PCA próprio.', correta: true, explicacao: 'Sim: thumbnail, gancho e vídeo têm papéis diferentes e merecem vetores separados.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: valide as suas sondas]
+1. Escolha 8 sondas para o seu setor (use a tabela da aula como ponto de partida).
+2. Separe **pelo menos 30 frames** da sua base e rotule à mão, para cada sonda, se o conceito aparece (1) ou não (0).
+3. Calcule a **AUC** de cada sonda relativa contra os rótulos. Fique com as que passam de ~0,7; reescreva ou descarte as outras. Teste as reescritas também em inglês.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+
+
+def validar_sondas(emb_frames, rotulos: pd.DataFrame, sondas: dict) -> pd.Series:
+    """AUC de cada sonda relativa contra rótulos manuais (1 = o conceito aparece)."""
+    rel = sondas_relativas(emb_frames, embed_textos(list(sondas.values())))
+    return pd.Series({nome: roc_auc_score(rotulos[nome], rel[:, j])
+                      for j, nome in enumerate(sondas)}).round(2)
+
+
+# rótulos manuais das 6 imagens do exemplo (poucas demais: use >= 30 frames seus)
+rotulos = pd.DataFrame({
+    "rosto":  [1, 0, 0, 1, 0, 0],
+    "carros": [0, 1, 0, 0, 0, 0],
+    "texto":  [0, 1, 0, 0, 1, 1],  # a foto de carros tem placas com texto
+}, index=list(imagens))
+print(validar_sondas(emb_img, rotulos, {k: SONDAS[k] for k in rotulos.columns}))
+```
+
+```text
+rosto     1.00
+carros    1.00
+texto     0.89
+dtype: float64
+```
+
+Com 6 imagens, qualquer AUC é frágil; o objetivo aqui é só mostrar o mecanismo. Na sua base, preste atenção nas sondas que "vazam" para conceitos vizinhos (texto × logo, rosto × pessoa de corpo inteiro): às vezes a melhor correção é trocar a frase por uma mais específica, e às vezes é aceitar que as duas sondas medem quase a mesma coisa e ficar com uma.
+
+</details>
+
+---
+
+## Resumo
+
+- O **aprendizado contrastivo** treina um encoder de imagem e um de texto para que pares certos fiquem próximos: depois disso, cosseno alto significa conteúdo parecido, entre imagens ou entre imagem e frase.
+- **SigLIP 2** usa perda **sigmoide por par**, é **multilíngue** e **Apache-2.0**; o `google/siglip2-base-patch16-224` roda em CPU e T4. No transformers 5, o vetor sai em `.pooler_output`.
+- **Sondas** (cosseno com frases escolhidas, de preferência **relativas** à média da imagem) viram colunas legíveis; valide cada uma com frames rotulados.
+- **Pooling** pela média normalizada, com vetores separados para **vídeo**, **gancho** e **thumbnail**; **PCA** de 16–32 componentes ajustado **só no treino**.
+- **UMAP e t-SNE** servem para visualizar, nunca como feature.
+
+## Referências
+
+- Radford et al. [*Learning Transferable Visual Models From Natural Language Supervision*](https://arxiv.org/abs/2103.00020) (CLIP). ICML, 2021.
+- Zhai et al. [*Sigmoid Loss for Language Image Pre-Training*](https://arxiv.org/abs/2303.15343) (SigLIP). ICCV, 2023.
+- Tschannen et al. [*SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features*](https://arxiv.org/abs/2502.14786). 2025.
+- [Model card do `google/siglip2-base-patch16-224`](https://huggingface.co/google/siglip2-base-patch16-224).
+- Oquab et al. [*DINOv2: Learning Robust Visual Features without Supervision*](https://arxiv.org/abs/2304.07193). 2023.
+- McInnes, Healy e Melville. [*UMAP: Uniform Manifold Approximation and Projection for Dimension Reduction*](https://arxiv.org/abs/1802.03426). 2018.
+- [Embeddings (módulo de RAG)](/aulas/rag-e-rerankers/embeddings).
+
+**Próxima aula:** [Áudio e fala](/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala): transcrição com faster-whisper, energia e ritmo com librosa, e o que o som de um Short diz antes de qualquer imagem.

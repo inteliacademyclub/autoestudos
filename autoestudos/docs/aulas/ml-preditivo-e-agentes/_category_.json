@@ -1,0 +1,10 @@
+{
+  "label": "ML Preditivo e Agentes",
+  "position": 5,
+  "link": {
+    "type": "generated-index",
+    "slug": "/aulas/ml-preditivo-e-agentes",
+    "title": "Trilha: ML Preditivo e Agentes",
+    "description": "Do dado bruto ao agente com MCP: como prever, antes da publicação, a performance de um criativo — com validação honesta, intervalos de confiança e explicações. Trilha construída para o case Galaxies, mas útil para qualquer problema de ML preditivo."
+  }
+}

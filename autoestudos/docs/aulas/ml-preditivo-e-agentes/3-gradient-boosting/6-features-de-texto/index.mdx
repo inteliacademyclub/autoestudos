@@ -1,0 +1,480 @@
+---
+sidebar_position: 6
+sidebar_label: 'Features de texto'
+title: 'Features de texto'
+description: 'Como transformar título, descrição e tags em colunas: features manuais, TF-IDF com SVD e embeddings multilíngues com PCA ajustado só no treino, com cache e uma forma honesta de medir se o texto ajuda.'
+tags: [ml-preditivo, gradient-boosting, features, texto, embeddings]
+---
+
+# Features de Texto: o Que o Título Diz e o Que o MAE Não Mostra
+
+<LessonMeta
+  tempo="50 min"
+  semana={2}
+  etapa="modelo"
+  objetivos={[
+    'Extrair features manuais de título, descrição e tags (tamanho, hashtags, emojis, CTA, perguntas, caixa alta)',
+    'Construir features com TF-IDF + TruncatedSVD e com embeddings multilíngues + PCA, ajustando os redutores só no treino com um Pipeline',
+    'Guardar embeddings em cache por video_id e hash do texto',
+    'Medir o valor do texto com ablação e com análises what-if, e agrupar dimensões de embedding na explicação',
+  ]}
+  prerequisitos={[
+    {label: 'Embeddings (trilha de RAG)', to: '/aulas/rag-e-rerankers/embeddings'},
+    {label: 'Features do canal e do tempo', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/features-do-canal-e-do-tempo'},
+  ]}
+/>
+
+Texto é a parte do criativo que você mais conhece. Você passou meses fazendo embeddings, chunking e retrieval; transformar um título num vetor é trivial para você. O difícil aqui é outro: descobrir se esse vetor **ajuda a prever curtidas**, e provar isso sem se enganar.
+
+O gerador sintético da [aula 3.1](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao) esconde efeitos no título, justamente para você poder conferir. O **formato** que o título anuncia muda o alvo ("antes e depois" soma 0,20; "tutorial" tira 0,05), e títulos com pergunta ou com chamada para ação (CTA) somam um pouco. Hashtags, emojis e caixa alta não fazem nada. Nenhuma dessas informações está numa coluna pronta: elas estão escritas, de várias formas, no texto.
+
+Você vai ver que as três formas clássicas de extrair features de texto recuperam coisas diferentes, que o MAE global quase não se mexe e que, mesmo assim, uma delas mede o efeito do formato com boa precisão. Para a decisão A vs. B, é esse efeito que importa.
+
+:::info[A ideia central]
+Há três caminhos do texto até colunas de um modelo tabular:
+- **features manuais**: poucas colunas interpretáveis (tamanho, hashtags, emojis, CTA, pergunta);
+- **TF-IDF + SVD**: o vocabulário do treino, comprimido em 16 a 32 colunas;
+- **embeddings de sentenças + PCA**: significado, inclusive de paráfrases nunca vistas, comprimido em 16 a 32 colunas.
+
+TF-IDF, SVD e PCA são **ajustados só no treino**, dentro de um `Pipeline`. Os embeddings são **cacheados** por `video_id` e hash do texto. E o valor do texto se mede com ablação **e** com perguntas what-if, porque o efeito do texto é pequeno perto do ruído.
+:::
+
+---
+
+## Três caminhos do texto às colunas
+
+<Sketch name="m3/texto-em-colunas" alt="Diagrama da esquerda para a direita. Uma caixa azul com título, descrição e tags alimenta três caminhos em laranja: features manuais (hashtag, emoji, interrogação, CTA, caixa alta), que viram 9 colunas interpretáveis; TF-IDF com vocabulário aprendido no treino, que passa por TruncatedSVD e vira 16 colunas; e embedding multilíngue MiniLM de 384 dimensões com cache por video_id e hash, que passa por PCA e vira 16 colunas. As três saídas entram numa caixa verde: Pipeline com ColumnTransformer e LightGBM. Duas notas embaixo: TF-IDF, SVD e PCA são ajustados só no treino, dentro do Pipeline, e ajustar em treino mais teste é vazamento; uma dimensão de embedding não tem significado, e no SHAP as 16 colunas devem ser somadas num grupo texto." caption="Cada caminho vira um bloco de colunas; o Pipeline garante que os redutores só veem o treino." />
+
+Os três caminhos se complementam:
+
+| | Features manuais | TF-IDF + SVD | Embeddings + PCA |
+| :--- | :--- | :--- | :--- |
+| **Captura** | forma (tamanho, #, emoji, CTA) | palavras e bigramas do treino | significado, inclusive de paráfrases |
+| **Palavra nova no teste** | irrelevante | vira zero (fora do vocabulário) | cai perto de sinônimos conhecidos |
+| **Interpretação** | direta | média (dá para ver os termos de cada componente) | só em grupo |
+| **Custo** | microssegundos | milissegundos | segundos a minutos em CPU; cache resolve |
+
+---
+
+## Features manuais: o que um humano olharia
+
+Comece pelo barato. As features abaixo servem para título, descrição e tags (a YouTube Data API devolve os três em `snippet` do recurso `videos`). O trecho usa o gerador da aula 3.1.
+
+```python
+import re
+import numpy as np
+import pandas as pd
+from shorts_sinteticos import gerar_shorts
+
+EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿⬀-⯿️]")
+CTA = re.compile(r"link na bio|comenta|salva|segue|compartilha|marca (um|uma|alguém)", re.IGNORECASE)
+PT = {"de", "do", "da", "que", "com", "para", "por", "em", "um", "uma", "você", "não", "sobre", "isso"}
+EN = {"the", "and", "with", "for", "to", "of", "in", "you", "is", "this", "my", "how"}
+
+
+def features_de_texto(texto: str) -> dict:
+    letras = [c for c in texto if c.isalpha()]
+    palavras = re.findall(r"\w+", texto.lower())
+    return {
+        "txt_caracteres": len(texto),
+        "txt_palavras": len(palavras),
+        "txt_hashtags": len(re.findall(r"#\w+", texto)),
+        "txt_emojis": len(EMOJI.findall(texto)),
+        "txt_pergunta": int("?" in texto),
+        "txt_cta": int(bool(CTA.search(texto))),
+        "txt_numeros": len(re.findall(r"\d+", texto)),
+        "txt_frac_maiusculas": sum(c.isupper() for c in letras) / max(len(letras), 1),
+        "txt_ingles": int(len(EN & set(palavras)) > len(PT & set(palavras))),   # heurística simples
+    }
+
+
+df = gerar_shorts()
+manuais = pd.DataFrame([features_de_texto(t) for t in df["titulo"]], index=df.index)
+print(df["titulo"].iloc[:3].tolist())
+print(manuais.iloc[:3].to_string())
+print(manuais.mean().round(3).to_dict())
+```
+
+```text
+['Tutorial de pneu aro 17 em 5 passos #shorts', 'Olha a diferença: delineado | comenta aqui', 'Antes e depois: carro elétrico | salva pra depois #shorts']
+   txt_caracteres  txt_palavras  txt_hashtags  txt_emojis  txt_pergunta  txt_cta  txt_numeros  txt_frac_maiusculas  txt_ingles
+0              43             9             1           0             0        0            2             0.032258           0
+1              42             6             0           0             0        1            0             0.029412           0
+2              57             9             1           0             0        1            0             0.022222           0
+{'txt_caracteres': 44.24, 'txt_palavras': 7.248, 'txt_hashtags': 0.69, 'txt_emojis': 0.282, 'txt_pergunta': 0.195, 'txt_cta': 0.243, 'txt_numeros': 0.219, 'txt_frac_maiusculas': 0.123, 'txt_ingles': 0.0}
+```
+
+Alguns cuidados:
+
+- **Emojis** não têm uma faixa Unicode única; a expressão acima cobre os blocos mais comuns, mas não todos (bandeiras e sequências com modificadores, por exemplo). Para contagem exata, existem bibliotecas dedicadas; confira os casos da sua base antes de confiar no número.
+- **Idioma**: a heurística de palavras funcionais serve para separar português de inglês em títulos curtos. Bibliotecas de detecção de idioma (como `lingua-language-detector` ou o modelo `lid.176` do fastText) são mais robustas; não foram testadas nesta aula.
+- **Descrições repetidas** são uma armadilha: muitos canais usam a mesma descrição padrão (links, redes sociais) em todos os vídeos. Features dessa descrição viram, na prática, um identificador do canal, com os mesmos problemas de `canal_id` que você viu na [aula 3.4](/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost). Remova o bloco padrão antes de extrair features.
+- **Só o que existe antes da publicação**: comentários, o comentário fixado e títulos editados depois são informação do futuro. A API devolve o título **atual**, que pode não ser o da publicação.
+
+---
+
+## TF-IDF + SVD: o vocabulário do treino
+
+O TF-IDF representa cada título por um vetor com uma posição por termo do vocabulário (palavras e, com `ngram_range=(1, 2)`, pares de palavras). O peso de um termo cresce com a frequência no título e cai com a frequência na base inteira: "antes e depois" pesa mais que "de". O vetor é enorme e esparso, então o `TruncatedSVD` o comprime em 16 componentes densos, a técnica conhecida como análise semântica latente (LSA).
+
+O ponto crítico é que **o vocabulário, os pesos IDF e os componentes do SVD são aprendidos**. Se você os ajustar na base inteira, o teste influencia as colunas do treino; é vazamento, ainda que discreto. A forma segura é colocar tudo dentro de um `Pipeline` do scikit-learn, que ajusta no `fit` (treino) e só aplica no `predict` (teste). O trecho da ablação, mais abaixo, faz exatamente isso.
+
+---
+
+## Embeddings multilíngues, com cache
+
+Para significado, use um modelo de embeddings de sentenças. Dois modelos multilíngues do `sentence-transformers` são escolhas razoáveis para títulos em português:
+
+- `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`: 768 dimensões, melhor qualidade, mais pesado. Não foi testado nesta aula.
+- `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`: 384 dimensões, roda bem em CPU. Foi o usado aqui: o download ocupou cerca de 480 MB no cache do Hugging Face, e codificar os 2.607 títulos, incluindo carregar o modelo, levou menos de meio minuto em CPU na máquina de teste. O limite de entrada é de 128 tokens (`modelo.max_seq_length`); descrições longas são truncadas.
+
+Se precisar revisar o que é um embedding e como a similaridade funciona, a [aula de embeddings da trilha de RAG](/aulas/rag-e-rerankers/embeddings) cobre isso. O que muda aqui é o uso: o vetor não vai para um índice de busca, vai virar colunas de um modelo tabular.
+
+Calcular embeddings é a parte cara do pipeline, e você vai rodar o treino dezenas de vezes. Guarde os vetores em disco, com uma chave que muda quando o texto muda:
+
+```python
+import hashlib
+from functools import lru_cache
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+
+MODELO = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"   # 384 dimensões, roda em CPU
+
+
+@lru_cache(maxsize=2)
+def carregar(modelo):                     # carrega o modelo uma vez por sessão
+    return SentenceTransformer(modelo, device="cpu")
+
+
+def embeddings_com_cache(ids, textos, modelo=MODELO, pasta="cache_embeddings"):
+    """Um vetor por texto; só calcula o que ainda não está no cache (chave: video_id + hash do texto)."""
+    arquivo = Path(pasta) / (modelo.replace("/", "__") + ".parquet")
+    chaves = [f"{i}:{hashlib.sha1(t.encode()).hexdigest()[:12]}" for i, t in zip(ids, textos)]
+    cache = pd.read_parquet(arquivo) if arquivo.exists() else None
+    conhecidas = set() if cache is None else set(cache.index)
+    faltam = [(k, t) for k, t in zip(chaves, textos) if k not in conhecidas]
+    if faltam:
+        vet = carregar(modelo).encode(
+            [t for _, t in faltam], batch_size=64, normalize_embeddings=True)
+        novos = pd.DataFrame(vet, index=[k for k, _ in faltam]).rename(columns=str)
+        cache = novos if cache is None else pd.concat([cache, novos])
+        arquivo.parent.mkdir(exist_ok=True)
+        cache.to_parquet(arquivo)
+    print(f"{len(faltam)} textos novos codificados; {len(chaves) - len(faltam)} vieram do cache")
+    return cache.loc[chaves].to_numpy(dtype=np.float32)
+
+
+E = embeddings_com_cache(df["video_id"], df["titulo"])
+print(E.shape)
+E = embeddings_com_cache(df["video_id"], df["titulo"])        # segunda chamada: tudo do cache
+```
+
+```text
+2607 textos novos codificados; 0 vieram do cache
+(2607, 384)
+0 textos novos codificados; 2607 vieram do cache
+```
+
+Nas saídas dos próximos trechos, omitimos essas linhas de log do cache para facilitar a leitura.
+
+A chave inclui o hash do texto porque o criador pode editar o título, e o nome do arquivo inclui o modelo porque vetores de modelos diferentes não se misturam. Os embeddings em si não "vazam": cada vetor depende só do próprio título, e o modelo foi treinado por terceiros antes da sua base existir. O que aprende com a sua base, e por isso precisa ficar só no treino, é o PCA que vem depois.
+
+---
+
+## Na prática: a ablação
+
+O `Pipeline` abaixo junta os blocos com um `ColumnTransformer`: as features de base passam direto, o título vai para TF-IDF + SVD e as 384 colunas de embedding vão para um PCA de 16 componentes. Tudo é ajustado no `fit` com o treino. As features de base são as da aula 3.4, sem o histórico da aula 3.5, para isolar o efeito do texto.
+
+```python
+from lightgbm import LGBMRegressor
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import mean_absolute_error as mae
+from sklearn.pipeline import Pipeline, make_pipeline
+
+EMB = [f"emb_{i}" for i in range(E.shape[1])]
+dados = pd.concat([df, manuais, pd.DataFrame(E, columns=EMB, index=df.index)], axis=1)
+dados["log_inscritos"] = np.log(dados["inscritos"])
+dados["setor_cod"] = dados["setor"].map({"moda": 0, "beleza": 1, "automotivo": 2})
+dados[["rosto", "texto_tela"]] = dados[["rosto", "texto_tela"]].astype(int)
+BASE = ["log_inscritos", "setor_cod", "duracao_s", "gancho", "rosto", "texto_tela", "energia", "hora", "dia_semana"]
+
+
+def montar(blocos, n_comp=16):
+    partes = [("base", "passthrough", BASE)]
+    if "manuais" in blocos:
+        partes.append(("manuais", "passthrough", list(manuais.columns)))
+    if "tfidf" in blocos:          # TF-IDF + SVD: vocabulário e componentes aprendidos SÓ no treino
+        partes.append(("tfidf", make_pipeline(TfidfVectorizer(ngram_range=(1, 2), min_df=3, sublinear_tf=True),
+                                              TruncatedSVD(n_components=n_comp, random_state=0)), "titulo"))
+    if "emb" in blocos:            # 384 dimensões -> 16 componentes, PCA ajustado SÓ no treino
+        partes.append(("emb", PCA(n_components=n_comp, random_state=0), EMB))
+    modelo = LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=15, min_child_samples=20,
+                           colsample_bytree=0.9, random_state=0, n_jobs=1, verbose=-1)
+    return Pipeline([("features", ColumnTransformer(partes)), ("modelo", modelo)])
+
+
+corte = pd.Timestamp("2026-01-01", tz="UTC")
+treino, teste = dados[dados["published_at"] < corte], dados[dados["published_at"] >= corte]
+for nome, blocos in [("sem texto", []), ("+ manuais", ["manuais"]), ("+ TF-IDF/SVD", ["tfidf"]),
+                     ("+ embeddings/PCA", ["emb"]), ("+ manuais + embeddings", ["manuais", "emb"])]:
+    pipe = montar(blocos).fit(treino, treino["y"])
+    print(f"{nome:<24} MAE teste {mae(teste['y'], pipe.predict(teste)):.3f}")
+```
+
+```text
+sem texto                MAE teste 0.599
++ manuais                MAE teste 0.593
++ TF-IDF/SVD             MAE teste 0.589
++ embeddings/PCA         MAE teste 0.605
++ manuais + embeddings   MAE teste 0.603
+```
+
+As diferenças são de centésimos, na faixa em que a [aula 3.2](/aulas/ml-preditivo-e-agentes/gradient-boosting/bagging-vs-boosting) mostrou que um bootstrap pareado não distingue nada. Os embeddings até pioraram o MAE. A conclusão apressada seria "texto não serve". Ela está errada, e a próxima seção mostra por quê.
+
+---
+
+## O que o MAE não mostra: perguntas what-if
+
+O efeito verdadeiro do texto no gerador é pequeno: o formato varia o alvo em cerca de 0,1 de desvio-padrão, contra 0,5 do ruído. Um efeito desse tamanho quase não mexe no MAE global, mas é exatamente o tipo de diferença que decide entre dois criativos do mesmo canal. A pergunta certa é: **o modelo aprendeu o efeito do formato?**
+
+Para responder, pegue cada post de teste, troque só o título por uma versão "antes e depois" e por uma versão "tutorial" do mesmo tema, e compare as previsões. A diferença verdadeira, pelo gerador, é 0,20 − (−0,05) = 0,25.
+
+```python
+from shorts_sinteticos import TEMAS
+
+# What-if: o MESMO post de teste com dois títulos. Diferença verdadeira no gerador: 0,20 - (-0,05) = 0,25
+tema = teste["setor"].map({s: v[0] for s, v in TEMAS.items()})
+variantes = {"antes e depois": "Antes e depois: " + tema, "tutorial": "Tutorial de " + tema + " em 5 passos"}
+
+
+def com_titulo(base, titulos, sufixo):
+    v = base.drop(columns=list(manuais.columns) + EMB).assign(titulo=titulos)
+    v["video_id"] = v["video_id"] + sufixo                     # chave nova no cache
+    m = pd.DataFrame([features_de_texto(t) for t in v["titulo"]], index=v.index)
+    e = pd.DataFrame(embeddings_com_cache(v["video_id"], v["titulo"]), columns=EMB, index=v.index)
+    return pd.concat([v, m, e], axis=1)
+
+
+x_ad = com_titulo(teste, variantes["antes e depois"], "_ad")
+x_tu = com_titulo(teste, variantes["tutorial"], "_tu")
+for nome, blocos in [("+ manuais", ["manuais"]), ("+ TF-IDF/SVD", ["tfidf"]), ("+ embeddings/PCA", ["emb"])]:
+    pipe = montar(blocos).fit(treino, treino["y"])
+    print(f"{nome:<18} efeito estimado de 'antes e depois' vs. 'tutorial': "
+          f"{np.mean(pipe.predict(x_ad) - pipe.predict(x_tu)):+.3f}  (verdadeiro: +0.250)")
+```
+
+```text
++ manuais          efeito estimado de 'antes e depois' vs. 'tutorial': +0.058  (verdadeiro: +0.250)
++ TF-IDF/SVD       efeito estimado de 'antes e depois' vs. 'tutorial': +0.203  (verdadeiro: +0.250)
++ embeddings/PCA   efeito estimado de 'antes e depois' vs. 'tutorial': +0.255  (verdadeiro: +0.250)
+```
+
+As features manuais não enxergam o formato: os +0,058 vêm de correlações acidentais com o tamanho e com números no título. TF-IDF e embeddings recuperam a maior parte do efeito. Com esta semente, os embeddings acertaram quase em cheio; repetindo com outras sementes e com subamostragem de linhas, o TF-IDF ficou entre 0,21 e 0,24 e os embeddings entre 0,15 e 0,24. Os dois aprenderam o formato, e o MAE não mostrou.
+
+Os títulos do gerador são montados a partir de poucos modelos, e isso favorece o TF-IDF: as mesmas palavras se repetem no treino e no teste. Os títulos da Lumina, e os de qualquer cliente novo, não vão repetir o seu vocabulário. O teste abaixo usa paráfrases que **não existem** no treino:
+
+```python
+# Paráfrases que NÃO existem no treino: mesmo sentido, palavras novas
+pares = [("Veja o resultado final: {t}", "Guia completo de {t} para iniciantes"),
+         ("Do começo ao fim, que mudança: {t}", "Explico {t} em detalhes"),
+         ("A diferença é enorme: {t}", "Aula de {t} passo por passo")]
+pipes = {n: montar(b).fit(treino, treino["y"]) for n, b in [("manuais", ["manuais"]), ("TF-IDF", ["tfidf"]),
+                                                             ("embeddings", ["emb"])]}
+for k, (a, b) in enumerate(pares):
+    xa = com_titulo(teste, [a.format(t=x) for x in tema], f"_pa{k}")
+    xb = com_titulo(teste, [b.format(t=x) for x in tema], f"_pb{k}")
+    efeitos = {n: round(float(np.mean(p.predict(xa) - p.predict(xb))), 3) for n, p in pipes.items()}
+    print(f"{a.format(t='...')[:30]:<30} vs. {b.format(t='...')[:30]:<30} {efeitos}")
+```
+
+```text
+Veja o resultado final: ...    vs. Guia completo de ... para inic {'manuais': 0.092, 'TF-IDF': -0.004, 'embeddings': 0.09}
+Do começo ao fim, que mudança: vs. Explico ... em detalhes        {'manuais': -0.056, 'TF-IDF': 0.006, 'embeddings': 0.048}
+A diferença é enorme: ...      vs. Aula de ... passo por passo    {'manuais': 0.003, 'TF-IDF': 0.047, 'embeddings': 0.186}
+```
+
+Com palavras novas, o TF-IDF fica perto de zero: os termos não estão no vocabulário do treino. O único par em que ele reage (0,047) compartilha a palavra "diferença" com um modelo de título do treino. Os embeddings reagem nos três pares, sempre na direção certa, embora com menos força que nos títulos conhecidos. É para isso que eles servem: **generalizar para textos que o seu treino nunca viu**. As features manuais oscilam sem direção.
+
+---
+
+## Interpretando: dimensões de embedding só fazem sentido em grupo
+
+Um componente do PCA sobre embeddings não tem significado humano: "emb_7 alto" não quer dizer nada que você possa escrever no relatório da Lumina. Por isso, na explicação, as 16 colunas viram **um grupo**. O LightGBM calcula contribuições SHAP nativamente (`pred_contrib=True`); some as contribuições do grupo **com sinal**, post a post, e só depois tire o valor absoluto:
+
+```python
+# SHAP agrupado: some as contribuições das 16 colunas de embedding numa só "feature"
+pipe = montar(["manuais", "emb"]).fit(treino, treino["y"])
+Xf = pipe[:-1].transform(teste)                                   # features já transformadas
+nomes = pipe[:-1].get_feature_names_out()
+contrib = pipe[-1].predict(Xf, pred_contrib=True)[:, :-1]   # TreeSHAP nativo; última coluna = valor base
+grupo = ["texto: embedding" if n.startswith("emb__") else
+         "texto: manuais" if n.startswith("manuais__") else n.split("__")[1] for n in nomes]
+por_grupo = pd.DataFrame(contrib, columns=grupo).T.groupby(level=0).sum().T   # soma COM sinal, por post
+imp = por_grupo.abs().mean()                                                  # depois o |.| médio
+print(imp.sort_values(ascending=False).round(3).to_string())
+```
+
+```text
+log_inscritos       1.031
+gancho              0.137
+texto: embedding    0.112
+energia             0.095
+texto_tela          0.077
+rosto               0.070
+hora                0.051
+duracao_s           0.045
+setor_cod           0.045
+texto: manuais      0.018
+dia_semana          0.017
+```
+
+A ordem importa: se você somasse os valores **absolutos** de cada coluna, contribuições que se cancelam dentro do grupo seriam contadas como importância, e o grupo de embeddings apareceria quase três vezes maior (0,325, no nosso teste). A [aula de SHAP na prática](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica) aprofunda o agrupamento. Um detalhe de ambiente: no macOS, com PyTorch e LightGBM no mesmo processo, chamar `booster_.predict(..., pred_contrib=True)` direto derrubou o processo (*segmentation fault*) na máquina de teste, provavelmente por conflito entre as bibliotecas de paralelismo (OpenMP) dos dois; pelo wrapper do scikit-learn (`pipe[-1].predict`), que respeita `n_jobs=1`, funcionou.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Os títulos da Lumina são "Pele natural em 5 passos" (A) e "1 produto, 20 segundos" (B). As features manuais quase não os distinguem (24 contra 22 caracteres, 1 contra 2 números). Para medir só o efeito do título, colocamos cada um nos mesmos posts de beleza do teste e comparamos:
+
+```text
++ manuais          efeito do título (B - A): -0.012
++ TF-IDF/SVD       efeito do título (B - A): +0.223
++ embeddings/PCA   efeito do título (B - A): +0.160
+```
+
+<details>
+<summary>Ver o código (continua os trechos anteriores)</summary>
+
+```python
+# Lumina: o mesmo post de teste (beleza) com o título de A ou o de B; só o texto muda
+titulos = {"A": "Pele natural em 5 passos", "B": "1 produto, 20 segundos"}
+print({k: {c: v for c, v in features_de_texto(t).items() if v} for k, t in titulos.items()})
+beleza = teste[teste["setor"] == "beleza"]
+xa = com_titulo(beleza, [titulos["A"]] * len(beleza), "_lumA")
+xb = com_titulo(beleza, [titulos["B"]] * len(beleza), "_lumB")
+for nome, blocos in [("+ manuais", ["manuais"]), ("+ TF-IDF/SVD", ["tfidf"]), ("+ embeddings/PCA", ["emb"])]:
+    p = montar(blocos).fit(treino, treino["y"])
+    print(f"{nome:<18} efeito do título (B - A): {np.mean(p.predict(xb) - p.predict(xa)):+.3f}")
+```
+
+</details>
+
+Leia com cuidado. O título A contém "em 5 passos", que é literalmente o modelo "tutorial" do gerador (efeito −0,05). O título B não corresponde a nenhum modelo; o mais parecido é "1 truque para...", do formato "dica" (+0,05). Se essa leitura estiver certa, a diferença verdadeira seria de cerca de +0,10. Os dois métodos concordam na direção e exageram o tamanho, e o TF-IDF exagera mais: ele penaliza "passos" em A e, sem reconhecer nenhuma palavra de B, trata B como um título neutro.
+
+Para a resposta à Lumina, isso significa: o título soma pouco à vantagem de B, bem menos que o gancho, o texto na tela e o horário. E, como os títulos de clientes reais não repetem o seu vocabulário de treino, **prefira embeddings** para o texto do criativo, com o efeito relatado como grupo.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas com texto]
+1. **Ajustar TF-IDF, SVD ou PCA na base inteira.** O teste influencia as colunas do treino. Use um `Pipeline` e ajuste só no `fit`.
+2. **Concluir que o texto não serve porque o MAE não mudou.** Efeitos pequenos perto do ruído não aparecem no MAE global; use what-if e a métrica par-a-par.
+3. **Recalcular embeddings a cada treino.** Use cache com chave `video_id` + hash do texto, separado por modelo.
+4. **Usar a descrição padrão do canal.** Ela vira um identificador de canal. Remova o bloco repetido.
+5. **Interpretar uma dimensão de embedding isolada.** Agrupe as colunas e some as contribuições com sinal antes do valor absoluto.
+6. **Usar texto que só existe depois:** comentários, comentário fixado, título editado após a publicação.
+7. **Passar textos longos sem olhar o limite do modelo.** O MiniLM multilíngue trunca em 128 tokens.
+:::
+
+<Quiz
+  id="m3-a6"
+  perguntas={[
+    {
+      pergunta: 'Você ajustou o `TfidfVectorizer` e o `TruncatedSVD` na base inteira (treino + teste) antes de separar. Qual é o problema?',
+      opcoes: [
+        {texto: 'Nenhum: TF-IDF não usa o alvo, então não há vazamento.', explicacao: 'Não usa o alvo, mas o vocabulário, os pesos IDF e os componentes passam a depender do teste. É vazamento de distribuição, e o teste deixa de simular o futuro.'},
+        {texto: 'O vocabulário, o IDF e os componentes aprenderam com o teste; coloque tudo num Pipeline ajustado só no treino.', correta: true, explicacao: 'O Pipeline ajusta no fit (treino) e só aplica no predict (teste), como aconteceria em produção.'},
+        {texto: 'O problema é só de desempenho: fica mais lento.', explicacao: 'Velocidade não é a questão; a validação deixa de ser honesta.'},
+      ],
+    },
+    {
+      pergunta: 'Na ablação, os embeddings pioraram o MAE de 0,599 para 0,605, mas o what-if mostrou que eles recuperaram o efeito do formato. Como isso é possível?',
+      opcoes: [
+        {texto: 'O what-if está errado: se o efeito existisse, o MAE teria melhorado.', explicacao: 'O efeito do formato é pequeno perto do ruído (0,1 contra 0,5 de desvio); ele quase não muda o MAE global.'},
+        {texto: 'O efeito é pequeno perto do ruído: as 16 colunas extras adicionam um pouco de variância, o que pesa no MAE, mas o modelo aprendeu a direção e o tamanho do efeito do formato.', correta: true, explicacao: 'MAE global e efeito sobre uma decisão específica medem coisas diferentes. Para A vs. B, o segundo importa mais.'},
+        {texto: 'Os embeddings vazam informação do teste.', explicacao: 'O PCA foi ajustado só no treino, e cada embedding depende só do próprio título.'},
+      ],
+    },
+    {
+      pergunta: 'O título de um cliente novo usa palavras que não aparecem em nenhum título do seu treino. Qual representação tende a reagir melhor?',
+      opcoes: [
+        {texto: 'TF-IDF + SVD.', explicacao: 'Palavras fora do vocabulário do treino viram zero; no teste de paráfrases, o TF-IDF ficou perto de zero.'},
+        {texto: 'Embeddings de sentenças + PCA.', correta: true, explicacao: 'O modelo de embeddings coloca paráfrases perto de textos conhecidos; no teste, reagiu na direção certa nos três pares.'},
+        {texto: 'Features manuais.', explicacao: 'Elas medem forma (tamanho, #, CTA), não o sentido; oscilaram sem direção.'},
+      ],
+    },
+    {
+      pergunta: 'Qual é a forma certa de medir a importância do grupo de 16 colunas de embedding com SHAP?',
+      opcoes: [
+        {texto: 'Somar a importância média |SHAP| de cada coluna.', explicacao: 'Contribuições que se cancelam dentro do grupo viram importância; no teste, isso quase triplicou o grupo (0,325 contra 0,112).'},
+        {texto: 'Somar os SHAP com sinal das 16 colunas em cada post e só depois tirar a média do valor absoluto.', correta: true, explicacao: 'Assim o grupo é tratado como uma feature só, que é como você vai explicá-lo.'},
+        {texto: 'Reportar só a coluna de embedding com maior SHAP.', explicacao: 'Uma dimensão isolada não tem significado e ignora o resto do grupo.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: quantos componentes?]
+Rode a ablação e o what-if do formato com 4, 16 e 64 componentes, para TF-IDF/SVD e para embeddings/PCA (use o parâmetro `n_comp` de `montar`). Responda:
+
+1. Qual número de componentes recupera melhor o efeito do formato?
+2. O MAE acompanha essa escolha?
+3. Por que poucos componentes podem perder o formato, e muitos podem piorar o MAE?
+:::
+
+<details>
+<summary>Ver a solução</summary>
+
+```python
+for n in [4, 16, 64]:
+    for nome, blocos in [("TF-IDF/SVD", ["tfidf"]), ("embeddings/PCA", ["emb"])]:
+        pipe = montar(blocos, n_comp=n).fit(treino, treino["y"])
+        efeito = np.mean(pipe.predict(x_ad) - pipe.predict(x_tu))
+        print(f"{n:>2} componentes | {nome:<15} MAE {mae(teste['y'], pipe.predict(teste)):.3f} | "
+              f"efeito do formato {efeito:+.3f}")
+```
+
+```text
+ 4 componentes | TF-IDF/SVD      MAE 0.587 | efeito do formato +0.078
+ 4 componentes | embeddings/PCA  MAE 0.602 | efeito do formato +0.116
+16 componentes | TF-IDF/SVD      MAE 0.589 | efeito do formato +0.203
+16 componentes | embeddings/PCA  MAE 0.605 | efeito do formato +0.255
+64 componentes | TF-IDF/SVD      MAE 0.599 | efeito do formato +0.197
+64 componentes | embeddings/PCA  MAE 0.613 | efeito do formato +0.176
+```
+
+Com 4 componentes, o PCA e o SVD guardam as direções de maior variação dos títulos, que aqui são o **tema** (base líquida, SUV, jeans) e não o formato: o efeito quase some. Com 16, o formato entra. Com 64, o modelo ganha colunas ruidosas, o MAE piora e o efeito estimado começa a cair. Faixas de 16 a 32 componentes são um bom ponto de partida; confirme na sua base com a validação temporal, nunca com o teste.
+
+</details>
+
+---
+
+## Resumo
+
+- Texto vira colunas por três caminhos: **features manuais** (forma), **TF-IDF + SVD** (vocabulário do treino) e **embeddings + PCA** (significado, inclusive de **paráfrases**).
+- **TF-IDF, SVD e PCA** são aprendidos e devem ser ajustados **só no treino**, dentro de um **`Pipeline`**.
+- **Cache** de embeddings com chave `video_id` + hash do texto, por modelo.
+- O efeito do texto é pequeno perto do ruído: o **MAE global** quase não se mexe, mas o **what-if** mostra se o modelo aprendeu o efeito que decide A vs. B.
+- Dimensões de embedding só se interpretam em **grupo**: some o SHAP com sinal e depois tire o valor absoluto.
+
+## Referências
+
+- Reimers e Gurevych. [*Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks*](https://arxiv.org/abs/1908.10084). EMNLP, 2019.
+- Reimers e Gurevych. [*Making Monolingual Sentence Embeddings Multilingual using Knowledge Distillation*](https://arxiv.org/abs/2004.09813). EMNLP, 2020. Origem dos modelos `paraphrase-multilingual-*`.
+- Cartões dos modelos: [paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) e [paraphrase-multilingual-mpnet-base-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-mpnet-base-v2); documentação do [Sentence Transformers](https://sbert.net/).
+- Documentação do scikit-learn: [`TfidfVectorizer`](https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html), [`TruncatedSVD`](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.TruncatedSVD.html) (LSA) e [`ColumnTransformer`](https://scikit-learn.org/stable/modules/generated/sklearn.compose.ColumnTransformer.html).
+- Documentação do LightGBM: [`LGBMRegressor.predict`](https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.LGBMRegressor.html) (parâmetro `pred_contrib`).
+- Kayal et al. [*Large Language Models Are Natural Video Popularity Predictors*](https://aclanthology.org/2025.findings-acl.597/). Findings of ACL, 2025. Usa descrições textuais de vídeos como entrada, uma alternativa ao caminho desta aula.
+
+**Próxima aula:** [Anatomia de um Short e o pipeline multimodal](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short): do texto ao vídeo, o que um Short tem além do título e como transformar frames, áudio e fala em colunas.

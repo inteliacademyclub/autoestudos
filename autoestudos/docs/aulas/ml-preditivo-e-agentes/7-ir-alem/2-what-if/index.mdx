@@ -1,0 +1,511 @@
+---
+sidebar_position: 2
+sidebar_label: 'What-if: otimizando legenda, horário e gancho'
+title: 'What-if: otimizando legenda, horário e gancho'
+description: 'Como re-pontuar variações de um criativo com o modelo treinado sem confundir correlação com causa: filtro de suporte, P(variação > original) com quantis, estabilidade do efeito e o LLM propondo legendas para o modelo julgar.'
+tags: [ml-preditivo, ir-alem, what-if, explicabilidade, agente]
+---
+
+import WhatIfSimulator from '@site/src/components/interativos/WhatIfSimulator';
+
+# What-if: Otimizando um Criativo sem Enganar Ninguém
+
+<LessonMeta
+  tempo="45 min"
+  semana="4+"
+  etapa={['modelo', 'explicacao', 'agente']}
+  opcional
+  objetivos={[
+    'Re-pontuar variações de um criativo com o modelo e montar uma tabela de comparação honesta',
+    'Explicar por que um what-if sobre features correlacionadas pode extrapolar ou herdar efeitos de outras variáveis',
+    'Filtrar variações fora do suporte dos dados e medir a estabilidade do efeito com bootstrap por canal',
+    'Estimar P(variação > original) a partir dos quantis previstos, sabendo o que esse número não mede',
+    'Montar o fluxo em que o LLM propõe legendas e o modelo julga',
+  ]}
+  prerequisitos={[
+    {label: 'Regressão quantílica e pinball loss', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica'},
+    {label: 'SHAP na prática', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica'},
+    {label: 'Pipeline agnóstico', to: '/aulas/ml-preditivo-e-agentes/ir-alem/pipeline-agnostico'},
+  ]}
+/>
+
+O time da Lumina gosta do Short A. O tutorial é mais informativo, a apresentadora aparece o tempo todo e a marca acha que ele "combina mais" com o lançamento. Só que o seu agente prefere o B. Então vem a pergunta natural: *"e se a gente mudasse o A? Postar às 19h, abrir com o resultado em vez do logo, encurtar a legenda... quanto ele ganharia?"*
+
+Tecnicamente, responder é trivial. Você troca o valor de uma coluna e chama `predict` de novo. É justamente por isso que é perigoso: o modelo responde **qualquer** pergunta, inclusive as que ele não tem base nenhuma para responder. Ele vai dizer quanto rende um Short de 3 segundos, ou um gancho nota 10 com energia 10, com a mesma cara séria com que prevê um caso comum.
+
+Nesta aula você vai construir um what-if que só responde o que consegue sustentar, e que diz com clareza quando não consegue.
+
+:::info[A ideia central]
+Um what-if re-pontua variações de um criativo com o modelo treinado. A resposta é sobre **o modelo**, não sobre o mundo. Antes de virar sugestão para a marca, cada variação passa por três filtros:
+1. é **plausível e controlável** (a marca consegue fazer isso de verdade);
+2. está **no suporte dos dados** (já vimos posts parecidos no mesmo setor);
+3. o efeito é **estável** (sobrevive quando o treino muda um pouco).
+
+O LLM pode **propor** variações. Quem **julga** é o modelo, e quem decide é a marca.
+:::
+
+---
+
+## Re-pontuar é fácil; interpretar é o difícil
+
+Formalmente, para um criativo com *features* $$x$$ e uma mudança na feature $$j$$ para o valor $$v$$, o what-if calcula:
+
+$$
+\Delta = f(x_{j \leftarrow v}) - f(x)
+$$
+
+Se você fizer isso para vários valores de $$v$$ e desenhar a curva, obtém uma curva ICE (*Individual Conditional Expectation*), a versão "de um caso só" do gráfico de dependência parcial. O conceito é o mesmo que você usou para ler o SHAP: todas as outras features ficam paradas.
+
+O problema está em "todas as outras ficam paradas". No modelo, dá para mexer no horário sem mexer em mais nada. No mundo, **quem posta às 19h não é uma amostra aleatória de quem posta às 14h**. Se os criadores guardam os melhores vídeos para o horário nobre, o modelo aprende que 19h "vale muito", porque o horário carrega um pedaço do efeito da qualidade. O SHAP tem exatamente a mesma limitação: ele explica **o modelo**, não a causa. A documentação do próprio SHAP dedica um texto inteiro a esse alerta.
+
+<Sketch name="m7/what-if" alt="Fluxo do what-if: o Short A original gera variações por dois caminhos, o LLM propondo legendas e você propondo mudanças controláveis como hora, gancho e duração. Todas passam por um filtro de suporte que pergunta se já vimos posts parecidos no mesmo setor; se não, a variação é descartada ou marcada como fora do suporte. Se sim, o modelo pontua q10, q50 e q90 do original e da variação, gerando uma tabela com delta do p50, faixa de 80%, P(V maior que O) e suporte. Depois vem a checagem de estabilidade com bootstrap por canal e, por fim, uma sugestão para a marca com ressalvas. Um alerta ao lado lembra que correlação não é causa: sem o gancho no modelo, publicar às 19h herda o efeito dos bons ganchos, com 23% previsto contra 13% real nos dados simulados." caption="O LLM propõe, o suporte filtra, o modelo julga. A marca decide." />
+
+Há três armadilhas, e o código desta aula mostra cada uma delas com números:
+
+- **Correlação herdada.** A feature que você mexe carrega o efeito de outra que o modelo não vê.
+- **Extrapolação.** A variação cai fora da faixa dos dados. Árvores não extrapolam: além do último valor visto, a previsão fica **constante** e parece plausível, mas é só a folha da borda.
+- **Efeito de ruído.** O modelo ajustou um padrão que não existe. A diferença aparece num treino e some no outro.
+
+Explore o componente abaixo antes do código. Ele re-pontua variações do Short B com o simulador da trilha. Os dados são **simulados**, com efeitos conhecidos.
+
+<WhatIfSimulator />
+
+---
+
+## Comparando com quantis: P(variação > original)
+
+O modelo do projeto prevê três quantis de $$y = \log(1+\text{curtidas})$$: $$q_{0,1}$$, $$q_{0,5}$$ e $$q_{0,9}$$. Para transformar isso numa probabilidade de a variação $$V$$ render mais que o original $$O$$, uma aproximação simples é tratar cada previsão como uma normal em escala log. A média é o $$q_{0,5}$$, e o desvio sai da largura do intervalo:
+
+$$
+\sigma = \frac{q_{0,9} - q_{0,1}}{2 \, z_{0,9}}, \qquad z_{0,9} \approx 1{,}2816
+$$
+
+Supondo erros independentes:
+
+$$
+P(V > O) \approx \Phi\left(\frac{q_{0,5}^{V} - q_{0,5}^{O}}{\sqrt{\sigma_V^2 + \sigma_O^2}}\right)
+$$
+
+em que $$\Phi$$ é a função de distribuição da normal padrão. É a mesma conta que serve para comparar os Shorts A e B.
+
+Saiba o que esse número mede e o que ele **não** mede:
+
+- **Mede** o ruído do resultado. Mesmo que o modelo esteja certo sobre o efeito, uma publicação real pode dar azar.
+- **Não mede** a incerteza do modelo sobre o próprio efeito. Se o modelo aprendeu um efeito que não existe, $$P(V > O)$$ vai sair confiante do mesmo jeito. Para isso existe a checagem de estabilidade da seção seguinte.
+- A hipótese de erros independentes é conservadora aqui. Original e variação seriam o mesmo vídeo no mesmo canal, então boa parte do ruído seria compartilhada. Trate $$P(V > O)$$ como uma escala para ordenar variações, não como probabilidade calibrada.
+
+---
+
+## Na prática: o what-if da Lumina
+
+O código usa o ambiente do módulo, definido na aula [Pipeline agnóstico](/aulas/ml-preditivo-e-agentes/ir-alem/pipeline-agnostico). Os blocos rodam em sequência na mesma sessão.
+
+**Passo 1: dados com uma armadilha e modelos quantílicos.** A base sintética usa os efeitos do simulador da trilha, com uma confusão plantada de propósito: posts no horário nobre têm, em média, ganchos 1,5 ponto melhores. Você treina dois modelos, um com as features de vídeo e outro sem elas.
+
+```python
+# whatif_modelo.py — base sintética com uma armadilha de propósito, e modelos quantílicos
+import numpy as np
+import pandas as pd
+from lightgbm import LGBMRegressor
+
+rng = np.random.default_rng(11)
+ROSTO = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}   # efeitos do simulador da trilha
+linhas = []
+for c in range(30):
+    setor, nivel = ["moda", "beleza", "automotivo"][c % 3], rng.normal(6.5, 1.0)
+    for _ in range(int(rng.integers(60, 120))):
+        nobre = rng.random() < 0.4
+        hora = int(rng.integers(18, 23)) if nobre else int(rng.integers(7, 18))
+        # a armadilha: quem posta no horário nobre guarda para ele os melhores ganchos
+        gancho = float(np.clip(round(rng.normal(5 + 1.5 * nobre, 2)), 0, 10))
+        rosto, texto = int(rng.random() < 0.6), int(rng.random() < 0.5)
+        energia = float(np.clip(round(rng.normal(5, 2.2)), 0, 10))
+        dur = float(np.clip(rng.normal(30, 12), 8, 90))
+        legenda = int(np.clip(rng.normal(90, 45), 5, 220))     # sem efeito real no simulador
+        efeito = (0.09 * (gancho - 5) + ROSTO[setor] * rosto + 0.15 * texto
+                  + 0.05 * (energia - 5) - 0.05 * (dur - 30) / 10 + 0.12 * nobre)
+        linhas.append(dict(canal=c, mediana_canal=nivel + rng.normal(0, 0.1), setor=setor, hora=hora,
+                           duracao_s=dur, gancho=gancho, rosto=rosto, texto_na_tela=texto,
+                           energia=energia, legenda_chars=legenda,
+                           hashtags=int(rng.integers(0, 6)),
+                           y=nivel + efeito + rng.normal(0, 0.5)))   # y = log1p(curtidas)
+df = pd.DataFrame(linhas).astype({"setor": "category"})
+
+COMPLETO = ["mediana_canal", "setor", "hora", "duracao_s", "gancho", "rosto",
+            "texto_na_tela", "energia", "legenda_chars", "hashtags"]
+SEM_VIDEO = ["mediana_canal", "setor", "hora", "legenda_chars", "hashtags"]
+PARAMS = dict(n_estimators=400, learning_rate=0.03, num_leaves=15, min_child_samples=30,
+              subsample=0.8, subsample_freq=1, random_state=0, verbose=-1)
+
+
+def treinar_quantis(cols, quantis=(0.1, 0.5, 0.9)):
+    return {q: LGBMRegressor(objective="quantile", alpha=q, **PARAMS).fit(df[cols], df["y"])
+            for q in quantis}
+
+
+MODELOS = {"completo": (COMPLETO, treinar_quantis(COMPLETO)),
+           "sem_video": (SEM_VIDEO, treinar_quantis(SEM_VIDEO))}
+print(len(df), "posts;", "gancho médio no horário nobre vs. fora:",
+      df.groupby(df["hora"] >= 18)["gancho"].mean().round(2).tolist())
+# 2727 posts; gancho médio no horário nobre vs. fora: [5.08, 6.48]
+```
+
+A `mediana_canal` aqui é simulada diretamente, para o exemplo ficar curto. No projeto, ela vem do histórico do canal calculado só com posts anteriores, como na aula anterior. O treino usa a base inteira porque o objetivo é estudar o what-if, não medir a métrica. No projeto, o modelo que você usa para what-if é o mesmo que passou pela validação temporal.
+
+**Passo 2: pontuar, checar suporte e comparar.** O filtro de suporte é propositalmente simples e fácil de explicar. Ele verifica se o valor novo está dentro da faixa vista no treino e **conta** quantos posts do mesmo setor têm valores parecidos (até meio desvio-padrão) em todas as features alteradas. Menos de 20 exemplos, e a variação é marcada como fora do suporte.
+
+```python
+# whatif.py — re-pontuar variações, checar suporte e comparar com o original
+from scipy.stats import norm
+
+NUM = [c for c in COMPLETO if c != "setor"]
+DESVIO = df[NUM].std()
+
+
+def suporte(original: dict, mudanca: dict, tol=0.5, minimo=20) -> str:
+    """Quantos posts do mesmo setor já tiveram valores parecidos nas features alteradas?"""
+    v, cols = {**original, **mudanca}, [k for k in mudanca if k in NUM]
+    fora = [k for k in cols if not df[k].min() <= v[k] <= df[k].max()]
+    if fora:
+        return f"fora ({', '.join(fora)})"
+    perto = (df["setor"] == v["setor"]).to_numpy()
+    for k in cols:
+        perto = perto & ((df[k] - v[k]).abs() <= tol * DESVIO[k]).to_numpy()
+    return "ok" if perto.sum() >= minimo else f"fora (só {perto.sum()} posts parecidos)"
+
+
+def pontuar(c: dict, modelo="completo") -> dict[float, float]:
+    cols, qs = MODELOS[modelo]
+    X = pd.DataFrame([c]).astype({"setor": df["setor"].dtype})[cols]
+    return {q: float(m.predict(X)[0]) for q, m in qs.items()}
+
+
+def prob_supera(v: dict, o: dict) -> float:
+    """P(curtidas da variação > curtidas do original), aproximando cada previsão por uma
+    normal em log com sigma tirado do intervalo 10–90% e erros independentes."""
+    s = lambda p: (p[0.9] - p[0.1]) / (2 * norm.ppf(0.9))  # noqa: E731
+    return float(norm.cdf((v[0.5] - o[0.5]) / np.hypot(s(v), s(o))))
+
+
+def tabela_whatif(original: dict, variacoes: dict[str, dict], modelo="completo") -> pd.DataFrame:
+    po = pontuar(original, modelo)
+    linhas = []
+    for nome, mudanca in {"original": {}, **variacoes}.items():
+        pv = pontuar({**original, **mudanca}, modelo)
+        linhas.append({"variação": nome, "p50": round(np.expm1(pv[0.5])),
+                       "faixa 80%": f"{np.expm1(pv[0.1]):,.0f}–{np.expm1(pv[0.9]):,.0f}",
+                       "Δ p50": f"{np.expm1(pv[0.5] - po[0.5]):+.0%}",
+                       "P(V > O)": round(prob_supera(pv, po), 2),
+                       "suporte": suporte(original, mudanca)})
+    return pd.DataFrame(linhas)
+```
+
+**Passo 3: as variações do Short A.** Como os dados são simulados, dá para fazer algo impossível com dados reais: acrescentar uma coluna com o efeito **verdadeiro** de cada mudança.
+
+```python
+# lumina_whatif.py — o que aproximaria o Short A do Short B?
+def efeito_real(c: dict) -> float:   # só existe porque os dados são simulados
+    return (0.09 * (c["gancho"] - 5) + ROSTO[c["setor"]] * c["rosto"] + 0.15 * c["texto_na_tela"]
+            + 0.05 * (c["energia"] - 5) - 0.05 * (c["duracao_s"] - 30) / 10 + 0.12 * (c["hora"] >= 18))
+
+
+LUMINA_A = dict(mediana_canal=np.log1p(2300), setor="beleza", hora=14, duracao_s=55, gancho=3,
+                rosto=1, texto_na_tela=0, energia=3, legenda_chars=104, hashtags=2)
+LUMINA_B = dict(LUMINA_A, hora=19, duracao_s=22, gancho=8, texto_na_tela=1, energia=7, legenda_chars=64)
+VARIACOES = {
+    "legenda curta (30 caracteres)": {"legenda_chars": 30, "hashtags": 1},
+    "publicar às 19h": {"hora": 19},
+    "gancho forte (3 → 7)": {"gancho": 7},
+    "19h + gancho forte": {"hora": 19, "gancho": 7},
+    "cortar para 6 s": {"duracao_s": 6},
+    "gancho 10, energia 10, 8 s": {"gancho": 10, "energia": 10, "duracao_s": 8},
+}
+tab = tabela_whatif(LUMINA_A, VARIACOES)
+tab["Δ real"] = [f"{np.expm1(efeito_real({**LUMINA_A, **m}) - efeito_real(LUMINA_A)):+.0%}"
+                 for m in [{}, *VARIACOES.values()]]
+pd.set_option("display.width", 140)
+print(tab.to_string(index=False))
+print("Short B, para referência: p50 =", round(np.expm1(pontuar(LUMINA_B)[0.5])))
+```
+
+```text
+                     variação  p50   faixa 80% Δ p50  P(V > O)                     suporte Δ real
+                     original 2968 2,123–3,957   +0%      0.50                          ok    +0%
+legenda curta (30 caracteres) 3163 2,174–3,775   +7%      0.58                          ok    +0%
+              publicar às 19h 3337 2,145–4,181  +12%      0.63                          ok   +13%
+         gancho forte (3 → 7) 4077 2,072–5,675  +37%      0.75                          ok   +43%
+           19h + gancho forte 4388 2,126–6,143  +48%      0.79                          ok   +62%
+              cortar para 6 s 3580 2,010–5,284  +21%      0.66            fora (duracao_s)   +28%
+   gancho 10, energia 10, 8 s 6443 2,929–9,915 +117%      0.93 fora (só 0 posts parecidos)  +237%
+Short B, para referência: p50 = 6820
+```
+
+A tabela mostra as três armadilhas de uma vez:
+
+1. **Efeito de ruído.** "Legenda curta" ganha +7% e $$P(V > O) = 0{,}58$$, mas no simulador o tamanho da legenda tem efeito **zero**. O modelo achou um padrão no ruído. Repare que $$P(V > O)$$ não denuncia o problema.
+2. **Extrapolação.** "Cortar para 6 s" está abaixo do menor valor do treino (8 s). O +21% é só a folha da borda repetida, e o filtro marca a linha como fora do suporte. A combinação "gancho 10, energia 10, 8 s" tem cada valor dentro da faixa, mas **nenhum** post parecido no setor. É por isso que o filtro olha a combinação, e não só cada coluna.
+3. **Efeitos plausíveis e no suporte.** Horário e gancho acertam o sinal e chegam perto do valor real. O modelo tende a subestimar efeitos grandes (+48% contra +62%), porque o GBM encolhe as previsões na direção da média.
+
+**Passo 4: a mesma pergunta em dois modelos.**
+
+```python
+# confusao.py — o mesmo what-if em dois modelos
+for nome in ["completo", "sem_video"]:
+    o, v = pontuar(LUMINA_A, nome), pontuar({**LUMINA_A, "hora": 19}, nome)
+    print(f"{nome:10s} 'publicar às 19h': {np.expm1(v[0.5] - o[0.5]):+.0%}")
+print(f"{'real':10s} 'publicar às 19h': {np.expm1(0.12):+.0%}")
+```
+
+```text
+completo   'publicar às 19h': +12%
+sem_video  'publicar às 19h': +23%
+real       'publicar às 19h': +13%
+```
+
+Esta é a correlação herdada, em um número. O modelo sem as features de vídeo não vê o gancho. Então o horário absorve parte do efeito dos bons ganchos que os criadores guardam para a noite, e o what-if quase **dobra** o ganho de mudar o horário. Os dois modelos podem ter métricas parecidas de ordenação e, mesmo assim, dar conselhos bem diferentes. Um modelo bom para prever não é automaticamente bom para recomendar intervenções.
+
+---
+
+## O efeito é estável?
+
+Para separar efeito real de ruído, retreine o modelo em reamostras da base e veja se o $$\Delta$$ se mantém. A reamostragem é por **canal inteiro** (um <Termo id="bootstrap">bootstrap</Termo> por grupo), porque posts do mesmo canal não são independentes.
+
+```python
+# estabilidade.py — o efeito sobrevive quando o treino muda um pouco?
+def efeito_bootstrap(original: dict, mudanca: dict, n=20, seed=0) -> np.ndarray:
+    r, canais, deltas = np.random.default_rng(seed), df["canal"].unique(), []
+    X = pd.DataFrame([original, {**original, **mudanca}]).astype({"setor": df["setor"].dtype})
+    for _ in range(n):   # reamostra CANAIS inteiros, não linhas soltas
+        amostra = r.choice(canais, size=len(canais), replace=True)
+        boot = pd.concat([df[df["canal"] == c] for c in amostra])
+        m = LGBMRegressor(objective="quantile", alpha=0.5, **PARAMS).fit(boot[COMPLETO], boot["y"])
+        p = m.predict(X[COMPLETO])
+        deltas.append(np.expm1(p[1] - p[0]))
+    return np.array(deltas)
+
+
+for nome in ["legenda curta (30 caracteres)", "publicar às 19h", "gancho forte (3 → 7)"]:
+    d = efeito_bootstrap(LUMINA_A, VARIACOES[nome])
+    lo, hi = np.quantile(d, [0.05, 0.95])
+    print(f"{nome:30s} Δ mediano {np.median(d):+.0%}  faixa 90% [{lo:+.0%}, {hi:+.0%}]"
+          f"  vezes com Δ > 0: {np.mean(d > 0):.0%}")
+```
+
+```text
+legenda curta (30 caracteres)  Δ mediano +0%  faixa 90% [-17%, +9%]  vezes com Δ > 0: 55%
+publicar às 19h                Δ mediano +7%  faixa 90% [+1%, +16%]  vezes com Δ > 0: 100%
+gancho forte (3 → 7)           Δ mediano +28%  faixa 90% [+7%, +45%]  vezes com Δ > 0: 95%
+```
+
+São 60 treinos; no nosso teste, em CPU, levaram cerca de 2 minutos. Agora o quadro fica claro. O efeito da legenda aparece em 55% das reamostras, praticamente cara ou coroa: não há evidência. Horário e gancho mantêm o sinal em 95% a 100% das vezes. Só estes merecem virar sugestão, e mesmo assim como **hipótese a testar**, não como promessa.
+
+---
+
+## O LLM propõe, o modelo julga
+
+Gerar variações de legenda é uma tarefa em que o LLM é ótimo: manter o tom, a promessa e a marca, e variar tamanho, pergunta ao público e hashtags. Avaliar qual delas rende mais é uma tarefa em que ele **não tem régua**. Então a divisão de trabalho é a mesma de toda a trilha: o LLM gera candidatos com saída estruturada, e o modelo pontua cada um.
+
+```python
+# llm_propoe.py — o LLM propõe legendas, o modelo julga
+from pydantic import BaseModel, Field
+
+
+class Propostas(BaseModel):
+    legendas: list[str] = Field(description="variações da legenda, mesma promessa e mesmo tom")
+
+
+def propor_legendas_mock(legenda: str, n: int = 4) -> Propostas:
+    """Faz o papel do LLM nos testes: variações fixas, sem chamada de API."""
+    return Propostas(legendas=[
+        "Pele natural em 5 passos #make",
+        "5 passos, zero efeito máscara. Qual você pula? #make #pelenatural",
+        "Base, corretivo, pó, blush e iluminador: a ordem que deixa a pele natural #tutorial",
+        "Pele natural em 5 passos: base, corretivo, pó, blush e iluminador. "
+        "Salva para testar! #make #pelenatural #tutorial #beleza #maquiagem",
+    ][:n])
+
+
+LEGENDA_A = ("Pele natural em 5 passos: base, corretivo, pó, blush e iluminador. "
+             "Salva para testar! #make #pelenatural")
+propostas = propor_legendas_mock(LEGENDA_A)
+variacoes = {f"L{i}: {t[:26]}...": {"legenda_chars": len(t), "hashtags": t.count("#")}
+             for i, t in enumerate(propostas.legendas, start=1)}
+print(tabela_whatif(LUMINA_A, variacoes).to_string(index=False))
+```
+
+```text
+                         variação  p50   faixa 80% Δ p50  P(V > O) suporte
+                         original 2968 2,123–3,957   +0%      0.50      ok
+L1: Pele natural em 5 passos #... 3163 2,174–3,775   +7%      0.58      ok
+L2: 5 passos, zero efeito másc... 2776 2,035–3,687   -6%      0.42      ok
+L3: Base, corretivo, pó, blush... 3006 2,219–3,826   +1%      0.52      ok
+L4: Pele natural em 5 passos: ... 2758 1,696–4,463   -7%      0.44      ok
+```
+
+Para trocar o mock por um LLM de verdade, basta outra função com a mesma assinatura:
+
+```python
+# requer GOOGLE_API_KEY e: uv add "langchain[google-genai]"
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model("google_genai:gemini-3.5-flash-lite", temperature=0.7)
+propor = llm.with_structured_output(Propostas)
+
+
+def propor_legendas(legenda: str, n: int = 4) -> Propostas:
+    return propor.invoke(
+        f"Reescreva a legenda de um YouTube Short de maquiagem em {n} variações. "
+        "Mantenha a promessa e o tom; varie o tamanho, a pergunta ao público e as hashtags. "
+        f"Não invente produtos nem resultados.\n\nLegenda original: {legenda}")
+```
+
+Esse trecho não foi executado contra a API (exige chave). A assinatura de `init_chat_model` e o `with_structured_output` foram conferidos no ambiente do módulo.
+
+Leia a tabela das legendas com o que você já sabe. **O modelo só enxerga o que as features medem.** Aqui, isso é o número de caracteres e de hashtags. A frase "Qual você pula?", que convida comentários, é invisível para ele. As diferenças de -7% a +7% estão todas dentro do ruído que a checagem de estabilidade revelou. A conclusão honesta é que **o modelo não tem opinião sobre essas legendas**. Nesse caso, não deixe o LLM preencher o vazio com a opinião dele e apresentá-la como resultado do modelo. Se quiser que o juiz enxergue o conteúdo do texto, inclua *embeddings* de legenda como features ([Features de texto](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto)). Mesmo assim, o julgamento continua correlacional.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A pergunta da marca era: *"dá para salvar o Short A?"*. A melhor variação plausível, no suporte e com efeito estável, é **publicar às 19h com um gancho forte** (abrir com o resultado final em vez do logo). O modelo prevê p50 de cerca de 4.400 curtidas para essa versão, contra cerca de 3.000 do A original e 6.800 do B. Mesmo melhorado, o A continua atrás do B, e os intervalos de 80% se sobrepõem bastante.
+
+Duas ressalvas precisam ir junto com qualquer sugestão:
+
+- "Gancho forte" não é um botão: é **reeditar o vídeo**. O modelo avaliou um gancho nota 7 genérico, não a edição que a marca vai fazer. A sugestão é uma hipótese de edição, e a nova versão precisa ser extraída e pontuada de novo.
+- O ganho do horário é pequeno e, fora do simulador, pode ser confundido com o que os criadores guardam para a noite. Ele vale como sugestão barata de testar, não como alavanca principal.
+
+A resposta do agente fica mais ou menos assim: *"Se a Lumina preferir o tutorial, publicar às 19h e abrir com o resultado são as mudanças com evidência consistente nos dados. Mesmo assim, a previsão continua abaixo da do B. Mudar a legenda não teve efeito detectável."*
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas do what-if]
+1. **Apresentar o Δ como efeito causal.** O what-if responde "o que o modelo prevê se eu mudar X", não "o que acontece se eu mudar X". Escreva isso na resposta do agente.
+2. **Mexer em features que a marca não controla.** Inscritos, mediana do canal e setor não são alavancas. Restrinja o what-if a hora, dia, duração, gancho, legenda e elementos de edição.
+3. **Ignorar o suporte.** Árvores devolvem a folha da borda para qualquer valor fora da faixa. Um Short de 3 s "prevê" o mesmo que um de 8 s, sem aviso nenhum.
+4. **Checar cada coluna isolada.** Valores individualmente comuns podem formar uma combinação que nunca aconteceu. Olhe a combinação das features alteradas.
+5. **Confiar em P(V > O) como teste de significância.** Esse número mede o ruído do resultado, não se o efeito aprendido é real. Use a estabilidade entre retreinos.
+6. **Deixar o LLM julgar as próprias propostas.** Ele vai preferir a legenda "mais bem escrita". Quem pontua é o modelo, e, se o modelo não distingue as opções, a resposta certa é "sem diferença detectável".
+:::
+
+<Quiz
+  id="m7-a2"
+  perguntas={[
+    {
+      pergunta: 'No exemplo da aula, o modelo sem features de vídeo previu +23% para "publicar às 19h", contra +13% reais. Por quê?',
+      opcoes: [
+        {texto: 'Porque o modelo sem vídeo tem menos árvores.', explicacao: 'O número de árvores é o mesmo nos dois modelos. A diferença está em quais variáveis cada um enxerga.'},
+        {texto: 'Porque os criadores guardam os melhores ganchos para o horário nobre, e o modelo que não vê o gancho atribui esse efeito ao horário.', correta: true, explicacao: 'É correlação herdada: a feature mexida carrega o efeito de outra, não observada, que anda junto com ela nos dados.'},
+        {texto: 'Porque o horário nobre tem efeito maior no setor de beleza.', explicacao: 'No simulador, o efeito do horário nobre é o mesmo (+0,12 em log) para todos os setores.'},
+        {texto: 'Porque o intervalo de 80% do modelo sem vídeo é mais largo.', explicacao: 'A largura do intervalo não muda o p50. O viés vem da variável omitida.'},
+      ],
+    },
+    {
+      pergunta: 'O what-if "cortar o vídeo para 6 s" devolveu +21%, mas o menor vídeo da base tem 8 s. Como interpretar?',
+      opcoes: [
+        {texto: 'Vídeos mais curtos rendem mais, então 6 s deve render ainda mais que 8 s.', explicacao: 'O modelo não tem como saber: ele nunca viu vídeos de 6 s.'},
+        {texto: 'É extrapolação: a árvore devolve a previsão da folha da borda (8 s), e o número não tem base nos dados.', correta: true, explicacao: 'Árvores ficam constantes fora da faixa do treino. A variação deve ser descartada ou marcada como fora do suporte.'},
+        {texto: 'É um sinal de vazamento de dados.', explicacao: 'Vazamento é informação do futuro no treino. Aqui o problema é pedir uma previsão fora da região em que o modelo foi treinado.'},
+      ],
+    },
+    {
+      pergunta: 'A variação "legenda curta" teve P(V > O) = 0,58, mas só 55% das reamostras por canal mantiveram Δ > 0. O que o agente deve dizer?',
+      opcoes: [
+        {texto: 'Que a legenda curta tem 58% de chance de render mais, então vale a pena.', explicacao: 'P(V > O) mede o ruído do resultado supondo que o efeito aprendido é real. A instabilidade mostra que não há evidência de que ele seja.'},
+        {texto: 'Que não há diferença detectável: o efeito aparece e some quando o treino muda.', correta: true, explicacao: 'Com 55% das reamostras para cada lado, o efeito é indistinguível de ruído. De fato, no simulador ele é zero.'},
+        {texto: 'Que a legenda curta piora o vídeo.', explicacao: 'Também não há evidência nessa direção. A resposta honesta é neutra.'},
+      ],
+    },
+    {
+      pergunta: 'Quais dessas variações fazem sentido num what-if para a marca? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Publicar na quinta às 19h em vez da terça às 14h.', correta: true, explicacao: 'É controlável e costuma estar bem representado nos dados.'},
+        {texto: 'Dobrar o número de inscritos do canal.', explicacao: 'Não é uma alavanca da peça: a marca não controla isso antes de postar, e não é uma decisão sobre o criativo.'},
+        {texto: 'Abrir com o resultado final em vez do logo (gancho mais forte).', correta: true, explicacao: 'É uma decisão de edição. Depois de reeditar, extraia as features de novo e pontue a versão real.'},
+        {texto: 'Legenda com 900 caracteres e 30 hashtags.', explicacao: 'Fora da faixa vista nos dados. O modelo extrapolaria sem base.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: um what-if pronto para virar tool]
+Escreva `what_if_seguro(original, variacoes)`, que devolve duas coisas:
+
+1. a tabela só com variações **no suporte** e com **efeito estável** (mesmo sinal em pelo menos 90% das reamostras por canal);
+2. um dicionário `descartadas` com o motivo de cada variação recusada.
+
+Rode com as seis variações do Short A. Depois, pense em como o agente deve usar o dicionário `descartadas` na resposta à marca.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+# solução do exercício: what-if com travas, pronto para virar tool do agente
+def what_if_seguro(original: dict, variacoes: dict[str, dict], n_boot=10, estabilidade=0.9):
+    aprovadas, descartadas = {}, {}
+    for nome, mudanca in variacoes.items():
+        s = suporte(original, mudanca)
+        if s != "ok":
+            descartadas[nome] = s
+            continue
+        d = efeito_bootstrap(original, mudanca, n=n_boot)
+        if max(np.mean(d > 0), np.mean(d < 0)) < estabilidade:
+            descartadas[nome] = f"efeito instável: Δ > 0 em {np.mean(d > 0):.0%} das reamostras"
+        else:
+            aprovadas[nome] = mudanca
+    return tabela_whatif(original, aprovadas), descartadas
+
+
+tabela, descartadas = what_if_seguro(LUMINA_A, VARIACOES)
+print(tabela.drop(columns="suporte").to_string(index=False))
+for nome, motivo in descartadas.items():
+    print(f"descartada: {nome} -> {motivo}")
+```
+
+```text
+            variação  p50   faixa 80% Δ p50  P(V > O)
+            original 2968 2,123–3,957   +0%      0.50
+     publicar às 19h 3337 2,145–4,181  +12%      0.63
+gancho forte (3 → 7) 4077 2,072–5,675  +37%      0.75
+  19h + gancho forte 4388 2,126–6,143  +48%      0.79
+descartada: legenda curta (30 caracteres) -> efeito instável: Δ > 0 em 60% das reamostras
+descartada: cortar para 6 s -> fora (duracao_s)
+descartada: gancho 10, energia 10, 8 s -> fora (só 0 posts parecidos)
+```
+
+O dicionário `descartadas` é tão importante quanto a tabela. Ele permite ao agente dizer *"também avaliei encurtar a legenda e cortar o vídeo para 6 s, mas os dados não sustentam uma conclusão"*, em vez de simplesmente omitir essas opções. Para virar tool MCP, devolva as duas partes num único JSON e limite o número de variações por chamada, porque cada uma custa `n_boot` treinos.
+
+</details>
+
+---
+
+## Resumo
+
+- Um **what-if** re-pontua variações do criativo com o modelo. A resposta é sobre o **modelo**, e o Δ só é causal sob hipóteses fortes.
+- **Correlação herdada**: sem ver o gancho, o modelo atribuiu ao horário nobre quase o dobro do efeito real (+23% contra +13%).
+- **Suporte**: árvores ficam constantes fora da faixa do treino. Filtre valores fora da faixa e **combinações** sem posts parecidos no setor.
+- **P(V > O)** a partir dos quantis ordena variações pelo ruído do resultado, mas não detecta efeito espúrio. Para isso, use a **estabilidade** entre retreinos com bootstrap por canal.
+- **O LLM propõe, o modelo julga.** Se o modelo não distingue as propostas, a resposta honesta é "sem diferença detectável".
+
+## Referências
+
+- Goldstein, Kapelner, Bleich e Pitkin. [*Peeking Inside the Black Box: Visualizing Statistical Learning with Plots of Individual Conditional Expectation*](https://arxiv.org/abs/1309.6392). Journal of Computational and Graphical Statistics, 2015.
+- Molnar. [*Interpretable Machine Learning*, capítulo sobre ICE](https://christophm.github.io/interpretable-ml-book/ice.html).
+- Hooker, Mentch e Zhou. [*Unrestricted Permutation Forces Extrapolation*](https://arxiv.org/abs/1905.03151). Statistics and Computing, 2021. Mostra como avaliar modelos fora do suporte dos dados distorce explicações.
+- Wachter, Mittelstadt e Russell. [*Counterfactual Explanations without Opening the Black Box*](https://arxiv.org/abs/1711.00399). Harvard Journal of Law & Technology, 2018.
+- SHAP. [*Be careful when interpreting predictive models in search of causal insights*](https://shap.readthedocs.io/en/latest/example_notebooks/overviews/Be%20careful%20when%20interpreting%20predictive%20models%20in%20search%20of%20causal%20insights.html).
+- Hernán e Robins. [*Causal Inference: What If*](https://miguelhernan.org/whatifbook). Livro aberto sobre quando uma pergunta "e se" tem resposta causal.
+- LangChain. [Structured output](https://docs.langchain.com/oss/python/langchain/structured-output).
+
+**Próxima aula:** [LLM zero-shot vs. modelo treinado](/aulas/ml-preditivo-e-agentes/ir-alem/llm-zero-shot-vs-modelo). Monte um experimento justo para descobrir se o LLM, sozinho, ordena criativos tão bem quanto o modelo.

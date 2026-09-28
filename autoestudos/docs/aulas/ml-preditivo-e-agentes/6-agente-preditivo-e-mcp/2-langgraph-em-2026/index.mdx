@@ -1,0 +1,558 @@
+---
+sidebar_position: 2
+sidebar_label: 'LangGraph em 2026'
+title: 'LangGraph em 2026'
+description: 'StateGraph determinístico para o fluxo da previsão, create_agent (ReAct) para perguntas abertas, checkpointer, streaming para inspeção e testes sem LLM.'
+tags: [ml-preditivo, galaxies, agente, langgraph]
+---
+
+import AgentTrace from '@site/src/components/interativos/AgentTrace';
+
+# LangGraph em 2026: Grafo Fixo para o Número, ReAct para a Conversa
+
+<LessonMeta
+  tempo="55 min"
+  semana={3}
+  etapa="agente"
+  objetivos={[
+    'Montar o fluxo da previsão como um StateGraph determinístico, com estado tipado e aresta condicional',
+    'Usar create_agent (ReAct) só para perguntas abertas, com a previsão exposta como tool',
+    'Inspecionar uma execução com checkpointer e streaming de eventos',
+    'Testar o grafo sem LLM (passos falsos) e o agente com um LLM falso',
+  ]}
+  prerequisitos={[
+    {label: 'O LLM orquestra, o modelo prevê', to: '/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/o-llm-orquestra-o-modelo-preve'},
+    {label: 'Function calling', to: '/aulas/conceitos-basicos-de-llm/function-calling'},
+    {label: 'Avaliação de agentes e tool calling', to: '/aulas/eval-driven-development/avaliacao-de-agentes-e-tool-calling'},
+  ]}
+/>
+
+A persona da Galaxies pode fazer dois tipos de pergunta. O primeiro é fechado: *"quantas curtidas o Short B deve ter?"*. A resposta segue sempre o mesmo caminho: ler o vídeo, buscar o histórico do canal, prever, explicar. Não há nada para decidir no meio do caminho, a não ser pular a leitura do vídeo quando o criativo é só um texto.
+
+O segundo é aberto: *"compare esses três roteiros, me diga qual impulsionar e se vale mudar o horário"*. Aqui alguém precisa decidir quantas previsões fazer, quais comparar e como apresentar o resultado. É um trabalho para um LLM.
+
+Muitos projetos resolvem as duas perguntas com um único agente ReAct que "decide tudo", inclusive a ordem dos passos do número. Funciona na maioria das vezes. O problema está no restante: o dia em que o LLM decide que não precisa extrair atributos porque "já sabe como é o vídeo", ou chama a predição antes de buscar o histórico. Em 2026, o LangGraph oferece as duas ferramentas, e a escolha certa é usar **cada uma no seu lugar**.
+
+:::info[A recomendação desta aula]
+O **fluxo da previsão** é um `StateGraph` **determinístico**: nós fixos, arestas fixas e uma única aresta condicional (vídeo ou texto). O **LLM** entra em dois pontos: opcionalmente na redação da explicação e no **agente ReAct** (`create_agent`), que responde perguntas abertas chamando a previsão como uma tool. O LLM decide *quais* criativos prever; nunca *como* o número é calculado.
+:::
+
+---
+
+## O que mudou no LangGraph 1.x
+
+Se você aprendeu LangGraph em 2024 ou no começo de 2025, duas mudanças importam aqui:
+
+- **`langgraph.prebuilt.create_react_agent` foi descontinuado.** O agente pronto agora é `langchain.agents.create_agent`, construído sobre o LangGraph e com *middleware* para limites, *retries* e aprovação humana. O import antigo ainda funciona, mas avisa: `create_react_agent has been moved to langchain.agents. Please update your import to from langchain.agents import create_agent. Deprecated in LangGraph V1.0 to be removed in V2.0.` (mensagem real, do LangGraph 1.2.12).
+- **O `StateGraph` continua sendo a API de baixo nível** para fluxos que você controla nó a nó. É ele que usaremos para a previsão.
+
+Os dois produzem o mesmo tipo de objeto: um grafo compilado, com `invoke`, `stream`, `get_state` e suporte a *checkpointer*. Por isso dá para colocar um dentro do outro.
+
+<Sketch name="m6/grafo-vs-react" alt="Duas colunas. À esquerda, o StateGraph da previsão: START, um losango 'criativo é texto?', que leva a extrair (VLM + Whisper) quando não e a embutir_texto quando sim; os dois caminhos convergem em contexto, depois prever, explicar (com LLM opcional só no texto) e responder, até END. Nota: InMemorySaver guarda o estado após cada nó e stream_mode updates mostra o que cada nó produziu. À direita, o agente create_agent: a pergunta aberta entra no nó model (LLM), que faz tool calls ao nó tools (prever_criativo, que é o grafo da esquerda, e comparar_criativos) e recebe ToolMessages, até responder em texto citando os números das tools." caption="O número segue o grafo fixo da esquerda; o LLM da direita só decide o que perguntar a ele." />
+
+---
+
+## Estado, nós e arestas
+
+Um `StateGraph` tem três ingredientes:
+
+- **Estado**: um `TypedDict` (ou modelo Pydantic) que todos os nós leem. Cada nó devolve só as chaves que quer atualizar.
+- **Nós**: funções `estado -> atualização parcial`.
+- **Arestas**: fixas (`add_edge`) ou condicionais (`add_conditional_edges`, com uma função que devolve o nome do próximo nó).
+
+Quando dois nós escrevem na mesma chave, um *reducer* decide como combinar. Por padrão, o último valor vence; com `Annotated[list[str], operator.add]`, as listas são concatenadas. Usamos isso numa chave `trilha`, em que cada nó acrescenta o próprio nome: é a forma mais barata de inspecionar e testar a trajetória.
+
+```python
+# galaxies_tool/agente.py — parte 1: estado e passos do grafo determinístico
+import operator
+from dataclasses import dataclass
+from typing import Annotated, Any, Callable, TypedDict
+
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+from langgraph.config import get_stream_writer
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
+
+from galaxies_tool.schemas import (Atributos, Contexto, PredictionRequest, PredictionResponse,
+                                   Previsao, ResultadoExplicar)
+
+
+class Estado(TypedDict, total=False):
+    pedido: dict  # tudo em JSON: o checkpointer serializa sem surpresas
+    atributos: dict
+    contexto: dict
+    previsao: dict
+    explicacao: dict
+    resposta: dict
+    trilha: Annotated[list[str], operator.add]  # reducer: cada nó ACRESCENTA o seu nome
+
+
+@dataclass(frozen=True)
+class Passos:
+    """O que cada nó chama. Injetável: nos testes, entram versões falsas."""
+    extrair: Callable[[PredictionRequest], Atributos]
+    de_texto: Callable[[PredictionRequest], Atributos]
+    contexto: Callable[[PredictionRequest, Atributos], Contexto]
+    prever: Callable[[PredictionRequest, Atributos, Contexto], Previsao]
+    explicar: Callable[[PredictionRequest, Previsao, Contexto, Any], ResultadoExplicar]
+    responder: Callable[..., PredictionResponse]
+
+
+def passos_reais(extrator=None) -> Passos:
+    from galaxies_tool import tools  # as cinco tools (aula 6.3)
+    return Passos(extrair=lambda p: tools.extrair_atributos(p, extrator or tools.extrator_demo),
+                  de_texto=tools.atributos_de_texto, contexto=tools.historico_e_comparaveis,
+                  prever=tools.prever, explicar=tools.explicar, responder=tools.montar_resposta)
+```
+
+Duas decisões merecem atenção.
+
+**O estado guarda JSON, não objetos Pydantic.** Cada nó valida o que lê (`Atributos.model_validate(...)`) e grava `model_dump(mode="json")`. Parece burocracia, mas evita uma armadilha do *checkpointer* do LangGraph 1.x. Com um objeto Pydantic seu dentro do estado, a leitura do *checkpoint* emite este aviso (saída real num exemplo mínimo):
+
+```text
+Deserializing unregistered type __main__.P from checkpoint. This will be blocked in a future
+version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to
+allow explicitly: [('__main__', 'P')]
+```
+
+Isso é uma medida de segurança: desserializar tipos arbitrários de um banco de *checkpoints* permite executar código. Você pode registrar cada classe em `allowed_msgpack_modules`, mas o estado em JSON é mais simples, portátil e fácil de inspecionar, porque o *trace* é o próprio estado.
+
+**Os passos são injetados.** O grafo não importa as tools diretamente: recebe um objeto `Passos`. Em produção, `passos_reais()` liga cada nó a uma das cinco tools da [próxima aula](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/as-cinco-tools). Nos testes, entram funções falsas que devolvem valores fixos, e você testa roteamento e ordem sem modelo, sem índice e sem LLM.
+
+```python
+# galaxies_tool/agente.py — parte 2: os nós, a aresta condicional e a compilação
+def construir_grafo(passos: Passos | None = None, explicador=None, checkpointer=None):
+    p = passos or passos_reais()
+    ped = lambda s: PredictionRequest.model_validate(s["pedido"])  # valida na fronteira
+    atr = lambda s: Atributos.model_validate(s["atributos"])
+    ctx = lambda s: Contexto.model_validate(s["contexto"])
+    prv = lambda s: Previsao.model_validate(s["previsao"])
+    js = lambda m: m.model_dump(mode="json")
+
+    def extrair(s):
+        get_stream_writer()({"aviso": "extraindo atributos do vídeo (pode levar ~1 min)"})
+        return {"atributos": js(p.extrair(ped(s))), "trilha": ["extrair"]}
+
+    def embutir_texto(s):
+        return {"atributos": js(p.de_texto(ped(s))), "trilha": ["embutir_texto"]}
+
+    def contexto(s):
+        return {"contexto": js(p.contexto(ped(s), atr(s))), "trilha": ["contexto"]}
+
+    def prever(s):
+        return {"previsao": js(p.prever(ped(s), atr(s), ctx(s))), "trilha": ["prever"]}
+
+    def explicar(s):  # o ÚNICO nó em que um LLM pode entrar (e só no texto)
+        r = p.explicar(ped(s), prv(s), ctx(s), explicador)
+        return {"explicacao": js(r), "trilha": ["explicar"]}
+
+    def responder(s):
+        exp = ResultadoExplicar.model_validate(s["explicacao"])
+        return {"resposta": js(p.responder(ped(s), atr(s), ctx(s), prv(s), exp)),
+                "trilha": ["responder"]}
+
+    def rota_inicial(s) -> str:  # criativo em texto pula o VLM
+        return "embutir_texto" if ped(s).tipo_criativo() == "texto" else "extrair"
+
+    g = StateGraph(Estado)
+    for no in (extrair, embutir_texto, contexto, prever, explicar, responder):
+        g.add_node(no.__name__, no)
+    g.add_conditional_edges(START, rota_inicial, ["extrair", "embutir_texto"])
+    g.add_edge("extrair", "contexto")
+    g.add_edge("embutir_texto", "contexto")
+    for a, b in [("contexto", "prever"), ("prever", "explicar"), ("explicar", "responder")]:
+        g.add_edge(a, b)
+    g.add_edge("responder", END)
+    return g.compile(checkpointer=checkpointer, name="previsao_galaxies")
+```
+
+A aresta condicional sai do `START`: `rota_inicial` lê o pedido e devolve o nome do próximo nó. Um criativo em texto não passa pelo VLM, que é a etapa lenta e cara, e segue direto para o *embedding* do texto. A lista `["extrair", "embutir_texto"]` informa ao LangGraph os destinos possíveis, o que deixa o desenho do grafo (`grafo.get_graph().draw_mermaid()`) correto.
+
+O LLM entra por um parâmetro: `construir_grafo(explicador=...)` repassa ao nó `explicar` o subagente da [aula 5.7](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa), que escreve a explicação e passa por um validador de fidelidade (detalhes na próxima aula). Sem `explicador`, a explicação é montada sem LLM, a partir de um *template*. Em nenhum caso o LLM toca `prever`.
+
+---
+
+## Rodar, inspecionar e voltar no tempo
+
+Com as tools reais, o grafo roda assim. O `InMemorySaver` guarda o estado depois de cada nó, e isso exige um `thread_id` na configuração. Sem ele, o LangGraph recusa a execução com `ValueError: Checkpointer requires one or more of the following 'configurable' keys: thread_id, checkpoint_ns, checkpoint_id`.
+
+```python
+# rodar_grafo.py — o grafo com as tools reais, checkpointer e streaming
+import time
+
+from langgraph.checkpoint.memory import InMemorySaver
+
+from galaxies_tool.agente import construir_grafo
+from galaxies_tool.api import aquecer, prever_criativo
+from galaxies_tool.schemas import PredictionRequest
+
+aquecer()  # modelo, índice e SHAP na memória (senão a 1ª execução mede importações)
+pedido = PredictionRequest(creative="lumina_b.mp4", sector="beleza",
+                           caption="1 produto, 20 segundos #antesedepois #maquiagem",
+                           planned_datetime="2026-10-01T19:00:00-03:00",
+                           channel_id="UC_lumina_beauty")
+grafo = construir_grafo(checkpointer=InMemorySaver())
+config = {"configurable": {"thread_id": "lumina-b"}}  # obrigatório com checkpointer
+
+t0 = time.perf_counter()
+for modo, dado in grafo.stream({"pedido": pedido.model_dump(mode="json")}, config,
+                               stream_mode=["updates", "custom"]):
+    ms = 1000 * (time.perf_counter() - t0)
+    if modo == "custom":
+        print(f"{ms:6.1f} ms  aviso: {dado['aviso']}")
+    else:
+        for no, delta in dado.items():
+            print(f"{ms:6.1f} ms  {no:<10} -> {[k for k in delta if k != 'trilha']}")
+
+estado = grafo.get_state(config).values
+print(estado["trilha"])
+print(estado["resposta"]["predicted_metric"], estado["resposta"]["confidence_flag"])
+print("checkpoints:", len(list(grafo.get_state_history(config))))
+print("igual à função pura:", estado["resposta"] == prever_criativo(pedido).model_dump(mode="json"))
+```
+
+```text
+   4.2 ms  aviso: extraindo atributos do vídeo (pode levar ~1 min)
+   4.4 ms  extrair    -> ['atributos']
+  20.1 ms  contexto   -> ['contexto']
+  25.9 ms  prever     -> ['previsao']
+  27.6 ms  explicar   -> ['explicacao']
+  27.9 ms  responder  -> ['resposta']
+['extrair', 'contexto', 'prever', 'explicar', 'responder']
+4237.0 {'baixa_confianca': False, 'motivos': []}
+checkpoints: 7
+igual à função pura: True
+```
+
+Três modos de *streaming* aparecem aqui. O modo `updates` emite, após cada nó, só o que ele mudou: é o que alimenta uma interface de inspeção. O modo `custom` carrega mensagens que o próprio nó emite com `get_stream_writer()`; na extração real, que leva perto de um minuto, é assim que a interface avisa o usuário de que algo está acontecendo. Existe ainda o `messages`, que transmite *tokens* de LLM, útil quando o subagente de explicação estiver ligado.
+
+Os sete *checkpoints* são o estado antes do início e depois de cada passo. Com `get_state_history`, você pega qualquer um deles e, passando o `checkpoint_id` na configuração, retoma a execução daquele ponto: é assim que se reproduz um bug sem refazer a extração do vídeo. O `InMemorySaver` perde tudo quando o processo termina; em produção, a documentação do LangGraph oferece *checkpointers* em SQLite e Postgres, instalados como pacotes separados.
+
+A última linha é a que mais importa: **o grafo e a função pura devolvem exatamente a mesma resposta**. O grafo não reimplementa nada; ele só organiza as chamadas e as torna visíveis.
+
+O componente abaixo reproduz, passo a passo, uma execução como essa. Os dados vêm do simulador sintético da trilha.
+
+<AgentTrace />
+
+---
+
+## O agente ReAct: perguntas abertas
+
+Para *"A ou B da Lumina?"*, entra o `create_agent`. Ele monta o laço clássico de um agente ReAct: o nó `model` (o LLM) decide se chama uma tool ou responde; o nó `tools` executa a chamada e devolve uma `ToolMessage`; e o ciclo continua até o LLM responder em texto.
+
+O ponto central é **o que o LLM enxerga**. Ele não recebe as cinco tools internas; recebe duas tools de alto nível, `prever_criativo` e `comparar_criativos`, cujos argumentos são o próprio contrato Pydantic. O LLM escolhe quais criativos enviar, mas não tem como passar *features* inventadas: tudo o que ele controla passa pelo `PredictionRequest`.
+
+```python
+# galaxies_tool/agente.py — parte 3: tools para o LLM e o agente ReAct (perguntas abertas)
+SISTEMA = """Você ajuda times de marketing a escolher Shorts ANTES de publicar.
+Regras:
+1. Todo número de curtidas, intervalo ou probabilidade vem de uma ferramenta. Nunca estime.
+2. Sempre cite o intervalo de 80% e a confiança junto com o número.
+3. Para dois ou mais criativos, use comparar_criativos (ela calcula a chance de um superar o outro).
+4. Se a ferramenta devolver erro, corrija o pedido ou pergunte ao usuário o que falta."""
+
+
+class PedidoComparacao(BaseModel):
+    criativos: dict[str, PredictionRequest] = Field(
+        min_length=2, max_length=10,
+        description="Nome curto -> pedido. Ex.: {'A': {...}, 'B': {...}}")
+
+
+@tool("prever_criativo", args_schema=PredictionRequest)
+def tool_prever(**pedido) -> dict:
+    """Prevê as curtidas de UM Short antes da publicação: número (mediana), intervalo de 80%,
+    confiança, fatores que mais pesaram (SHAP) e Shorts comparáveis anteriores.
+    Use sempre que pedirem número, previsão ou chance de um único criativo."""
+    from galaxies_tool.api import prever_criativo
+    return prever_criativo(PredictionRequest.model_validate(pedido)).model_dump(mode="json")
+
+
+@tool("comparar_criativos", args_schema=PedidoComparacao)
+def tool_comparar(criativos: dict) -> dict:
+    """Compara 2 a 10 criativos: ranking pela previsão, intervalos e P(A supera B) para cada
+    par. Use quando o usuário quiser escolher entre criativos."""
+    from galaxies_tool.api import comparar_criativos
+    pedidos = {n: PredictionRequest.model_validate(p) for n, p in criativos.items()}
+    resultado = comparar_criativos(pedidos)
+    resultado.pop("respostas")  # o LLM recebe o resumo; o detalhe fica no trace
+    return resultado
+
+
+# ToolException vira ToolMessage de erro (o LLM lê e corrige), em vez de derrubar o agente
+tool_prever.handle_tool_error = tool_comparar.handle_tool_error = True
+
+
+def construir_agente(modelo, checkpointer=None):
+    """modelo: um BaseChatModel ou "provedor:modelo" (ex.: "google_genai:gemini-3.5-flash-lite")."""
+    return create_agent(modelo, tools=[tool_prever, tool_comparar], system_prompt=SISTEMA,
+                        checkpointer=checkpointer, name="assistente_galaxies")
+```
+
+Com um LLM real, bastaria `construir_agente("google_genai:gemini-3.5-flash-lite")` (requer `GOOGLE_API_KEY` e o pacote `langchain-google-genai`). Para rodar sem chave, e para testar, use um LLM falso que segue um roteiro. O `GenericFakeChatModel` do `langchain-core` 1.6.5 devolve mensagens predefinidas, mas não implementa `bind_tools`, que o `create_agent` chama. Uma subclasse de três linhas resolve.
+
+O roteiro abaixo comete um erro de propósito: a primeira chamada envia o Short B **sem fuso**.
+
+```python
+# rodar_react.py — o agente ReAct com um LLM FALSO que segue um roteiro
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+
+from galaxies_tool.agente import construir_agente
+
+
+class FakeComTools(GenericFakeChatModel):
+    """Devolve as mensagens roteirizadas, na ordem. O create_agent chama bind_tools(),
+    que o GenericFakeChatModel não implementa; aqui ele só devolve o próprio modelo."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+A = {"creative": "lumina_a.mp4", "caption": "Pele natural em 5 passos #maquiagem #tutorial",
+     "planned_datetime": "2026-09-29T14:00:00-03:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}
+B = {"creative": "lumina_b.mp4", "caption": "1 produto, 20 segundos #antesedepois #maquiagem",
+     "planned_datetime": "2026-10-01T19:00:00", "channel_id": "UC_lumina_beauty",
+     "sector": "beleza"}  # ERRO de propósito: sem fuso
+B_ok = B | {"planned_datetime": "2026-10-01T19:00:00-03:00"}
+chamada = lambda criativos, id_: AIMessage("", tool_calls=[
+    {"name": "comparar_criativos", "args": {"criativos": criativos}, "id": id_}])
+roteiro = iter([chamada({"A": A, "B": B}, "c1"), chamada({"A": A, "B": B_ok}, "c2"),
+                AIMessage("Impulsione o B: 4.237 curtidas (80%: 1.655 a 9.180) contra 1.477 "
+                          "do A. P(B > A) = 0,884.")])
+
+agente = construir_agente(FakeComTools(messages=roteiro))  # real: "google_genai:..." (requer chave)
+saida = agente.invoke({"messages": [{"role": "user", "content": "A ou B da Lumina?"}]})
+for m in saida["messages"]:
+    chamadas = [t["name"] for t in getattr(m, "tool_calls", [])]
+    print(f"{m.type:<6} {chamadas or ''} {str(m.content)[-150:]}")
+```
+
+```text
+human   A ou B da Lumina?
+ai     ['comparar_criativos']
+tool    _lumina_beauty', 'sector': 'beleza'}}} with error:
+ criativos.B.planned_datetime: Input should have timezone info
+ Please fix the error and try again.
+ai     ['comparar_criativos']
+tool    iativo": "A", "predicted_metric": 1477.0, "interval_low": 671.0, "interval_high": 2923.0, "baixa_confianca": false}], "prob_supera": {"B > A": 0.884}}
+ai      Impulsione o B: 4.237 curtidas (80%: 1.655 a 9.180) contra 1.477 do A. P(B > A) = 0,884.
+```
+
+O erro de validação do contrato não derrubou o agente: o nó `tools` o transformou numa `ToolMessage` com a mensagem do Pydantic e a instrução *"Please fix the error and try again"*. Um LLM real lê isso e reenvia com o fuso, exatamente como o roteiro simulou. Esse é o retorno de ter escrito validadores com mensagens claras na aula anterior.
+
+Quando usar cada estrutura:
+
+| Situação | Estrutura | Por quê |
+| :--- | :--- | :--- |
+| "Quanto o criativo X vai render?" | `StateGraph` (ou a função pura) | Caminho fixo; nada para o LLM decidir |
+| Servidor MCP para a persona | A função pura | O LLM já está do lado do cliente |
+| "Compare esses três e me diga qual impulsionar" | `create_agent` com as duas tools | Decidir o que prever e como apresentar é trabalho de LLM |
+| Explicação em linguagem de marketing | Nó `explicar` com subagente opcional | O texto muda; os números são conferidos |
+
+---
+
+## Testar sem LLM, e depois com um LLM falso
+
+O grafo tem lógica própria (roteamento, ordem, montagem da resposta), e ela precisa de teste. Com os passos injetados, o teste não depende de modelo treinado nem de rede:
+
+```python
+# tests/test_agente.py — o grafo SEM modelo e SEM LLM: só roteamento e ordem dos nós
+from langchain_core.runnables import RunnableLambda
+
+from galaxies_tool.agente import Passos, construir_grafo
+from galaxies_tool.schemas import (Atributos, ConfidenceFlag, Contexto, Explicacao,
+                                   PredictionResponse, Previsao, ResultadoExplicar)
+from galaxies_tool.tools import explicar
+
+
+def passos_falsos() -> Passos:
+    atr = lambda tipo: Atributos(tipo=tipo, embedding=[1.0, 0.0], fonte="texto")
+    sem_alerta = ConfidenceFlag(baixa_confianca=False)
+    prev = Previsao(q10=50, q50=100, q90=200, features={}, confidence_flag=sem_alerta,
+                    model_version="fake")
+    exp = ResultadoExplicar(top_drivers=[], explanation=Explicacao(resumo="ok", fatores=[],
+                                                                  ressalvas=[]))
+    return Passos(
+        extrair=lambda p: atr("video"), de_texto=lambda p: atr("texto"),
+        contexto=lambda p, a: Contexto(subscribers=1, mediana_curtidas=100, n_posts_canal=9,
+                                       posts_anteriores=40, comparables=[], rel_vizinhos=None,
+                                       sim_vizinho=None),
+        prever=lambda p, a, c: prev,
+        explicar=lambda p, pr, c, explicador: exp,
+        responder=lambda p, a, c, pr, e: PredictionResponse(
+            predicted_metric=pr.q50, interval_low=pr.q10, interval_high=pr.q90,
+            confidence_flag=pr.confidence_flag, relative_to_channel=1.0, top_drivers=[],
+            explanation=e.explanation, comparables=[], features_used={},
+            model_version=pr.model_version))
+
+
+def test_video_passa_pela_extracao(pedido_b):
+    final = construir_grafo(passos_falsos()).invoke({"pedido": pedido_b.model_dump(mode="json")})
+    assert final["trilha"] == ["extrair", "contexto", "prever", "explicar", "responder"]
+
+
+def test_texto_pula_a_extracao(pedido_b):
+    pedido = pedido_b.model_copy(update={"creative": "roteiro: antes/depois com texto grande"})
+    final = construir_grafo(passos_falsos()).invoke({"pedido": pedido.model_dump(mode="json")})
+    assert final["trilha"][0] == "embutir_texto" and "extrair" not in final["trilha"]
+
+
+def test_subagente_nao_pode_inventar_numero(pedido_b):
+    from galaxies_tool.tools import extrair_atributos, historico_e_comparaveis, prever
+    atr = extrair_atributos(pedido_b)
+    ctx = historico_e_comparaveis(pedido_b, atr)
+    prev = prever(pedido_b, atr, ctx)
+    modelo = explicar(pedido_b, prev, ctx).explanation  # sem LLM: texto de modelo
+    inventa = Explicacao(resumo="Vai passar de 10.000 curtidas!", fatores=[], ressalvas=["ok"])
+    fiel = modelo.model_copy(update={"resumo": modelo.resumo.replace("Previsão", "Estimativa")})
+    chamadas = []
+    falso = lambda resposta: RunnableLambda(lambda msgs: chamadas.append(1) or resposta)
+    assert explicar(pedido_b, prev, ctx, explicador=falso(fiel)).explanation == fiel
+    chamadas.clear()
+    resultado = explicar(pedido_b, prev, ctx, explicador=falso(inventa)).explanation
+    assert resultado == modelo and len(chamadas) == 2  # tentou, corrigiu, desistiu
+```
+
+O último teste cuida do nó que pode usar LLM. O `explicador` é qualquer *Runnable* que devolva uma `Explicacao`; com LLM real, seria `init_chat_model(...).with_structured_output(Explicacao)`. No teste, um `RunnableLambda` devolve uma resposta pronta. Com uma explicação que inventa "10.000 curtidas", o validador reprova, o subagente recebe os problemas, reprova de novo e a tool **fica com a explicação montada sem LLM**. A *fixture* `pedido_b` fica no `tests/conftest.py`, mostrado na [aula de testes](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente).
+
+```text
+tests/test_agente.py ...                                                 [100%]
+3 passed
+```
+
+Com um LLM falso você testa o **encanamento**: o que acontece quando o LLM chama a tool certa, a errada, ou devolve lixo. A qualidade das decisões de um LLM real é outra pergunta, respondida com avaliação de trajetória na [aula 6.6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente).
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Quando a persona perguntar *"A ou B?"*, o caminho completo é: o LLM da persona chama `comparar_criativos` com os dois pedidos; cada pedido percorre o grafo fixo (extrair, contexto, prever, explicar, responder); a Tool 5 ordena e calcula a probabilidade de B superar A. Com o modelo sintético do módulo, **B sai com 4.237 curtidas (80%: 1.655 a 9.180) e A com 1.477 (80%: 671 a 2.923), com P(B > A) = 0,884**.
+
+Note duas coisas. Primeiro, os intervalos **se sobrepõem** (de 1.655 a 2.923): a ordenação é provável, não garantida, e a resposta do agente precisa dizer isso. Segundo, se o time da Lumina descrever um terceiro criativo só em texto (*"e um tutorial de 30 s com legenda grande?"*), o grafo pula a extração e a resposta sai com `baixa_confianca: true` e o motivo `extracao_falhou`. Isso é o comportamento correto, e a `trilha` do estado mostra por quê.
+
+Os componentes interativos usam o simulador da trilha, em que B fica perto de 4.380 e P(B > A) perto de 0,94. O modelo treinado encolhe um pouco o efeito de B e tem intervalos mais largos, que é o comportamento esperado de um modelo real diante de um simulador com os efeitos verdadeiros.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Deixar o ReAct decidir a ordem dos passos do número.** Extração, contexto e predição sempre acontecem na mesma ordem. Isso é um grafo fixo, não uma decisão.
+2. **Expor ao LLM a tool `prever` que recebe *features*.** O LLM pode "preencher" um gancho que ninguém extraiu. Exponha tools no nível do pedido (`PredictionRequest`), não no nível das *features*.
+3. **Guardar objetos Pydantic no estado sem pensar no *checkpointer*.** Funciona hoje com aviso e será bloqueado. Guarde JSON e valide na leitura.
+4. **Esquecer o `thread_id`.** Com *checkpointer*, toda execução precisa de um; use um ID por conversa ou por criativo.
+5. **Importar `create_react_agent`.** Está descontinuado desde o LangGraph 1.0; use `from langchain.agents import create_agent`.
+6. **Testar só com o LLM real.** Fica lento, caro e instável. Teste o encanamento com passos e LLMs falsos; avalie as decisões com o LLM real em outra camada.
+:::
+
+<Quiz
+  id="m6-a2"
+  perguntas={[
+    {
+      pergunta: 'O time propõe um único agente ReAct com as cinco tools internas (extrair, contexto, prever, explicar, ordenar), deixando o LLM decidir a ordem. Qual é o principal risco?',
+      opcoes: [
+        {texto: 'O LangGraph não suporta mais de três tools.', explicacao: 'Não há esse limite. O problema é de confiabilidade, não de capacidade.'},
+        {texto: 'O LLM pode pular a extração ou chamar a predição com argumentos que ele mesmo inventou, e o número passa a depender da decisão do LLM.', correta: true, explicacao: 'Exato. Um caminho que nunca muda deve ser um grafo fixo; o LLM decide só o que perguntar a ele.'},
+        {texto: 'Fica mais barato, porque o LLM pula passos desnecessários.', explicacao: 'Pular a extração não é economia: é previsão sem atributos do vídeo.'},
+      ],
+    },
+    {
+      pergunta: 'Você chama `grafo.invoke(entrada)` num grafo compilado com `InMemorySaver()` e recebe um `ValueError`. O que falta?',
+      opcoes: [
+        {texto: 'Um `thread_id` em `config={"configurable": {...}}`.', correta: true, explicacao: 'Com checkpointer, o LangGraph precisa saber em qual thread guardar os checkpoints.'},
+        {texto: 'Chamar `grafo.compile()` de novo.', explicacao: 'O grafo já está compilado; o erro pede uma chave de configuração.'},
+        {texto: 'Trocar `invoke` por `stream`.', explicacao: 'Os dois exigem o thread_id quando há checkpointer.'},
+      ],
+    },
+    {
+      pergunta: 'Qual `stream_mode` mostra, após cada nó, apenas o que aquele nó mudou no estado, ideal para uma tela de inspeção?',
+      opcoes: [
+        {texto: '`values`', explicacao: '`values` emite o estado inteiro a cada passo: funciona, mas repete tudo.'},
+        {texto: '`updates`', correta: true, explicacao: 'Isso. Emite {nome_do_nó: atualização}.'},
+        {texto: '`messages`', explicacao: '`messages` transmite tokens de LLM, útil para o subagente de explicação.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o teste de roteamento usa `Passos` falsos em vez das tools reais?',
+      opcoes: [
+        {texto: 'Porque as tools reais não funcionam fora do servidor MCP.', explicacao: 'Elas funcionam em qualquer lugar; são funções Python.'},
+        {texto: 'Para testar a lógica do grafo (rota e ordem) isoladamente, rápido e sem depender de modelo, índice ou LLM.', correta: true, explicacao: 'Exato. As tools reais têm testes próprios; aqui interessa só o grafo.'},
+        {texto: 'Porque o LangGraph exige funções sem efeitos colaterais.', explicacao: 'O LangGraph aceita qualquer função; a injeção é uma escolha de testabilidade.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: uma segunda aresta condicional]
+Depois de `prever`, adicione uma aresta condicional: se `confidence_flag.baixa_confianca` for `true`, o grafo passa por um nó `marcar_revisao` antes de `explicar`. Esse nó grava `revisao_humana: True` no estado, para que alguém do time olhe a previsão antes de ela seguir para a marca. Escreva um teste com `Passos` falsos que prove as duas rotas.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+Acrescente `revisao_humana: bool` ao `Estado` e, dentro de `construir_grafo`, troque a aresta fixa `prever -> explicar` por:
+
+```python
+    def marcar_revisao(s):
+        return {"revisao_humana": True, "trilha": ["marcar_revisao"]}
+
+    def rota_confianca(s) -> str:
+        return "marcar_revisao" if prv(s).confidence_flag.baixa_confianca else "explicar"
+
+    g.add_node("marcar_revisao", marcar_revisao)
+    g.add_conditional_edges("prever", rota_confianca, ["marcar_revisao", "explicar"])
+    g.add_edge("marcar_revisao", "explicar")
+```
+
+E o teste, variando só o passo `prever` dos passos falsos:
+
+```python
+from dataclasses import replace
+
+from galaxies_tool.schemas import ConfidenceFlag, Motivo
+
+
+def test_baixa_confianca_marca_revisao(pedido_b):
+    alerta = ConfidenceFlag(baixa_confianca=True, motivos=[
+        Motivo(codigo="canal_novo", texto="o canal tem só 4 posts anteriores")])
+    passos = passos_falsos()
+    baixa = passos.prever(None, None, None).model_copy(update={"confidence_flag": alerta})
+    final = construir_grafo(replace(passos, prever=lambda p, a, c: baixa)).invoke(
+        {"pedido": pedido_b.model_dump(mode="json")})
+    assert final["revisao_humana"] and "marcar_revisao" in final["trilha"]
+```
+
+Repare que o nó novo **não altera nenhum número**: ele só marca o caso. Se um dia alguém quiser que esse nó "ajuste" a previsão, a discussão deve ir para o modelo e para a calibração, não para o grafo. Para pausar o grafo de verdade até um humano aprovar, o LangGraph aceita `interrupt_before` na compilação, e o `create_agent` tem o `HumanInTheLoopMiddleware`.
+
+</details>
+
+---
+
+## Resumo
+
+- Em 2026, `create_react_agent` está descontinuado; use **`langchain.agents.create_agent`** para ReAct e **`StateGraph`** para fluxos controlados.
+- O fluxo da previsão é um **grafo determinístico** com uma aresta condicional (vídeo ou texto); o **ReAct** responde perguntas abertas chamando a previsão como tool.
+- Guarde **JSON no estado** e valide na leitura; objetos Pydantic no estado geram aviso de desserialização no *checkpointer*.
+- **`InMemorySaver`** + `thread_id` dão histórico e retomada; **`stream_mode="updates"`** dá inspeção nó a nó; `get_stream_writer()` emite avisos customizados.
+- Teste o grafo com **passos falsos**, o agente com um **LLM falso** (`GenericFakeChatModel` com `bind_tools`) e o subagente de explicação com um `RunnableLambda`.
+
+## Referências
+
+- LangGraph. [Graph API: estado, nós, arestas e *reducers*](https://docs.langchain.com/oss/python/langgraph/graph-api).
+- LangGraph. [Persistence (*checkpointers*, *threads*, histórico)](https://docs.langchain.com/oss/python/langgraph/persistence) e [Streaming](https://docs.langchain.com/oss/python/langgraph/streaming).
+- LangGraph. [Workflows e agentes](https://docs.langchain.com/oss/python/langgraph/workflows-agents): quando usar um fluxo fixo e quando usar um agente.
+- LangChain. [Agents (`create_agent`)](https://docs.langchain.com/oss/python/langchain/agents) e [Tools](https://docs.langchain.com/oss/python/langchain/tools).
+- LangGraph. [Testes de grafos](https://docs.langchain.com/oss/python/langgraph/test).
+- Yao et al. [*ReAct: Synergizing Reasoning and Acting in Language Models*](https://arxiv.org/abs/2210.03629). ICLR, 2023.
+
+**Próxima aula:** [As cinco tools do agente](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/as-cinco-tools): o desenho de cada tool (contrato, erros, cache, idempotência) e a versão final de `prever_criativo`.

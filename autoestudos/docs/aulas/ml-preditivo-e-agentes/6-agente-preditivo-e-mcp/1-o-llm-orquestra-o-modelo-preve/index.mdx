@@ -1,0 +1,797 @@
+---
+sidebar_position: 1
+sidebar_label: 'O LLM orquestra, o modelo prevê'
+title: 'O LLM orquestra, o modelo prevê'
+description: 'Como separar orquestração, previsão e explicação: um contrato Pydantic, uma função Python pura como API principal e adaptadores finos (LangGraph e MCP) em volta dela.'
+tags: [ml-preditivo, galaxies, agente, arquitetura]
+---
+
+# O LLM Orquestra, o Modelo Prevê: A Arquitetura da Sua Tool
+
+<LessonMeta
+  tempo="50 min"
+  semana={3}
+  etapa="agente"
+  objetivos={[
+    'Separar as responsabilidades de orquestrar, prever e explicar em camadas com fronteiras claras',
+    'Escrever o contrato da tool em Pydantic, com validadores que recusam pedidos perigosos',
+    'Implementar prever_criativo como uma função Python pura, que MCP e LangGraph apenas embrulham',
+    'Carregar o modelo uma única vez por processo e devolver a versão dele em toda resposta',
+  ]}
+  prerequisitos={[
+    {label: 'Do LLM ao modelo preditivo', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/do-llm-ao-modelo-preditivo'},
+    {label: 'Predição conformal', to: '/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal'},
+    {label: 'Function calling', to: '/aulas/conceitos-basicos-de-llm/function-calling'},
+  ]}
+/>
+
+:::info[Ambiente deste módulo]
+Python 3.12. As versões abaixo foram resolvidas juntas e todo o código do módulo foi executado com elas:
+
+```bash
+uv init galaxies-tool && cd galaxies-tool
+uv add pandas==3.0.6 numpy==2.5.3 scipy==1.18.1 scikit-learn==1.9.1 lightgbm==4.7.0 \
+  shap==0.52.0 pyarrow==25.0.1 faiss-cpu==1.15.1 pydantic==2.13.5 \
+  langgraph==1.2.12 langchain==1.4.2 langchain-core==1.6.5 \
+  langchain-mcp-adapters==0.3.2 fastmcp==3.4.7 mcp==1.30.0 mlflow==3.16.1
+uv add --dev pytest==9.1.1
+```
+
+Não troque `fastmcp` nem `mcp` de versão sem ler a [aula de MCP](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero): as versões novas quebram o `langchain-mcp-adapters`. Chamadas a LLM de verdade exigem uma chave de API e um pacote do provedor (por exemplo, `langchain-google-genai`); nas aulas, elas aparecem marcadas com `# requer chave` e os testes usam modelos falsos.
+:::
+
+Na semana 4, a persona sintética da Galaxies vai conectar no seu servidor MCP e perguntar algo como: *"a Lumina vai publicar o Short B na quinta às 19h; quantas curtidas ele deve ter?"*. Do outro lado da conexão já existe um LLM, o da própria persona. Se o seu servidor também tiver um LLM que lê o histórico do canal e "estima" o número, você terá dois modelos de linguagem conversando sobre um palpite, sem nenhuma régua no meio.
+
+A tentação aparece cedo. Com o agente montado, basta colar no prompt as últimas 30 curtidas do canal e pedir *"estime as curtidas deste criativo"*. Na demo, funciona: o número parece razoável. Na auditoria, não: ninguém consegue dizer qual erro esperar, a resposta muda entre execuções e a explicação não tem ligação com o que realmente determinou o número.
+
+Esta aula monta a estrutura que impede esse atalho. Até o fim do módulo, você terá um pacote Python pequeno, com um contrato explícito, uma função que é a API principal e dois adaptadores finos em volta dela.
+
+:::info[A ideia central]
+A tool de previsão é uma **função Python pura** com **contrato Pydantic** na entrada e na saída. LangGraph e MCP são **adaptadores finos** em volta dessa função. O LLM orquestra e explica; o número nasce no modelo treinado e atravessa todas as camadas **sem ser tocado**.
+:::
+
+---
+
+## Três responsabilidades, três lugares
+
+O briefing da Galaxies resume a regra numa frase: *"o LLM orquestra, interpreta e explica, nunca chuta o número"*. Na prática, isso vira uma tabela de responsabilidades. Cada linha tem um dono e um lugar no código.
+
+| Responsabilidade | Quem faz | Onde fica | O que dá errado se misturar |
+| :--- | :--- | :--- | :--- |
+| Decidir o que chamar e com quais argumentos | LLM (seu agente ou a persona) | `agente.py`, ou o host MCP | O fluxo do número passa a depender do humor do LLM |
+| Ler o vídeo e extrair atributos | VLM + Whisper (módulo 4) | Tool 1 | Atributos inventados viram *features* |
+| Produzir número e intervalo | GBM quantílico + ajuste conformal | Tool 3 e `modelo.py` | Previsão sem erro medido |
+| Explicar | SHAP; opcionalmente um LLM reescrevendo | Tool 4 | Narrativa bonita e infiel |
+| Garantir o formato | Pydantic | `schemas.py` | Erro silencioso, descoberto na demo |
+
+Repare que o LLM aparece em dois lugares, e os dois estão nas **bordas**: na orquestração, antes do número existir, e na redação da explicação, depois de o número estar pronto. Entre as duas pontas, o caminho é determinístico.
+
+<Sketch name="m6/camadas" alt="Diagrama em camadas. No topo, quem chama: a persona sintética da Galaxies, o Claude Desktop ou Claude Code e você (notebook, testes, demo). Abaixo, dois adaptadores finos: servidor_mcp.py com FastMCP e agente.py com LangGraph. No centro, a API principal api.prever_criativo, uma função pura sem LLM no caminho do número, que chama as tools 1 a 4. Abaixo, as cinco tools e, na base, modelo.py com o Bundle carregado uma vez e os artefatos em disco. À direita, schemas.py atravessa todas as camadas como contrato." caption="Uma função no centro, adaptadores nas bordas e um contrato valendo em todas as camadas." />
+
+Essa organização tem um nome conhecido em engenharia de software (*ports and adapters*), mas o motivo aqui é bem concreto. A mesma previsão precisa sair por **quatro portas**: a função chamada no notebook, o grafo do LangGraph, o agente conversacional e o servidor MCP. Se cada porta tiver a própria lógica de *features*, você terá quatro números diferentes para o mesmo criativo. Com uma função no centro, todas as portas devolvem o mesmo valor, e a [aula de testes](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente) transforma essa igualdade num teste automático.
+
+---
+
+## A árvore do mini-projeto
+
+Não existe repositório *starter*: o código vive nas aulas. Esta é a estrutura que você terá no fim do módulo, com a aula em que cada arquivo aparece:
+
+```text
+galaxies-tool/
+├── pyproject.toml
+├── galaxies_tool/
+│   ├── __init__.py        6.4  ajuste de OpenMP (faiss + lightgbm no macOS)
+│   ├── schemas.py         6.1  o contrato: PredictionRequest, PredictionResponse...
+│   ├── sintetico.py       6.1  base SINTÉTICA para rodar sem a sua base real
+│   ├── modelo.py          6.1  features, treino temporal, carga única, quantis
+│   ├── api.py             6.1  prever_criativo(): esqueleto na 6.1, versão final na 6.3
+│   ├── tools.py           6.3  as cinco tools
+│   ├── comparaveis.py     6.4  índice FAISS sem vazamento temporal
+│   ├── agente.py          6.2  StateGraph + agente ReAct (create_agent)
+│   └── servidor_mcp.py    6.5  FastMCP: tools, resources e prompt
+├── tests/                 6.6  unidade, contrato, invariante, golden set, MCP
+├── rodar_*.py, ablacao.py, demo_de_para.py, rastrear.py   scripts das aulas
+└── app.py                 6.7  demo mínima em Streamlit (opcional)
+```
+
+O modelo é um LightGBM treinado numa **base sintética** com efeitos conhecidos (os mesmos do simulador dos componentes interativos). Isso deixa o módulo executável do começo ao fim sem a sua base. No projeto, você troca `sintetico.py` pela sua coleta, e o resto continua igual.
+
+---
+
+## O contrato: o que entra
+
+O briefing define os campos mínimos. O contrato abaixo usa os nomes em inglês do briefing, porque é isso que a persona vai enviar, e acrescenta validadores para os erros que mais aparecem.
+
+```python
+# galaxies_tool/schemas.py — parte 1: o que entra
+from datetime import datetime
+from typing import Literal
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+
+Setor = Literal["moda", "beleza", "automotivo"]
+TipoCriativo = Literal["video", "imagem", "texto"]
+CodigoMotivo = Literal["intervalo_largo", "canal_novo", "setor_desconhecido",
+                       "extracao_falhou", "fora_da_distribuicao", "data_fora_do_periodo"]
+
+EXT_VIDEO = (".mp4", ".mov", ".webm", ".mkv")
+EXT_IMAGEM = (".jpg", ".jpeg", ".png", ".webp")
+
+
+class ChannelStats(BaseModel):
+    """Estatísticas do canal no momento da previsão (quando não há channel_id na base)."""
+
+    subscribers: int = Field(ge=0, description="Inscritos do canal hoje.")
+    recent_likes: list[int] = Field(
+        min_length=1,
+        description="Curtidas dos Shorts anteriores (idealmente dos últimos 90 dias).",
+    )
+
+
+class PredictionRequest(BaseModel):
+    """Um criativo que ainda NÃO foi publicado."""
+
+    model_config = ConfigDict(extra="forbid")  # campo desconhecido = erro, não silêncio
+
+    creative: str = Field(min_length=1, description="Caminho/URL do vídeo ou imagem, ou texto.")
+    caption: str = Field(default="", max_length=5000, description="Legenda planejada.")
+    planned_datetime: AwareDatetime = Field(
+        description="Data e hora planejadas, COM fuso. Ex.: 2026-10-01T19:00:00-03:00."
+    )
+    channel_id: str | None = Field(default=None, description="ID do canal na base.")
+    channel_stats: ChannelStats | None = Field(default=None,
+                                               description="Use se o canal não está na base.")
+    sector: Setor
+
+    @model_validator(mode="after")
+    def _exige_canal(self) -> "PredictionRequest":
+        if self.channel_id is None and self.channel_stats is None:
+            raise ValueError("informe channel_id ou channel_stats")
+        return self
+
+    def tipo_criativo(self) -> TipoCriativo:
+        ref = self.creative.lower().split("?")[0]
+        if ref.endswith(EXT_VIDEO) or "youtube.com/" in ref or "youtu.be/" in ref:
+            return "video"
+        if ref.endswith(EXT_IMAGEM):
+            return "imagem"
+        return "texto"
+```
+
+Cada validador existe por um motivo:
+
+- **`sector` como `Literal`**: o modelo só foi treinado nos três setores do recorte. Um pedido de "games" precisa falhar na porta, não produzir um número extrapolado.
+- **`AwareDatetime`**: o Pydantic recusa data sem fuso. Isso importa porque o modelo aprendeu com a **hora local** do público. Quinta às 19h em São Paulo é 22h em UTC; se o fuso se perder no caminho, a *feature* `hora` vira 22 e a previsão muda sem ninguém perceber.
+- **`extra="forbid"`**: um campo desconhecido vira erro. É a sua defesa contra alguém (ou algum LLM) mandando `curtidas_primeira_hora`, que seria <Termo id="leakage">vazamento</Termo> puro, e contra erros de digitação que seriam ignorados em silêncio.
+- **`channel_id` ou `channel_stats`**: o canal pode estar na sua base (você busca o histórico) ou ser novo (o chamador envia inscritos e curtidas recentes).
+
+Veja o contrato recusando três pedidos ruins:
+
+```python
+# contrato_demo.py — o contrato recusando pedidos ruins
+from pydantic import ValidationError
+
+from galaxies_tool.schemas import PredictionRequest
+
+ruins = {
+    "sem fuso": dict(planned_datetime="2026-10-01T19:00:00"),
+    "setor fora do recorte": dict(sector="games"),
+    "campo que vazaria": dict(curtidas_primeira_hora=900),
+}
+base = dict(creative="lumina_b.mp4", planned_datetime="2026-10-01T19:00:00-03:00",
+            channel_id="UC_lumina_beauty", sector="beleza")
+for nome, mudanca in ruins.items():
+    try:
+        PredictionRequest(**(base | mudanca))
+    except ValidationError as e:
+        erro = e.errors()[0]
+        print(f"{nome:<22} -> {'.'.join(map(str, erro['loc']))}: {erro['msg']}")
+print(PredictionRequest(**base).tipo_criativo())
+```
+
+```text
+sem fuso               -> planned_datetime: Input should have timezone info
+setor fora do recorte  -> sector: Input should be 'moda', 'beleza' or 'automotivo'
+campo que vazaria      -> curtidas_primeira_hora: Extra inputs are not permitted
+video
+```
+
+Essas mensagens vão chegar, sem alteração, ao LLM que chamou a tool. Como elas dizem exatamente o que está errado, o LLM consegue corrigir o pedido sozinho. Na [aula 6.2](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/langgraph-em-2026) você vai ver isso acontecer.
+
+---
+
+## O contrato: o que sai
+
+A saída tem os oito campos do briefing e mais três que servem à **inspeção**: o nível do intervalo, as *features* que entraram no modelo e a versão do modelo. Três campos não são inventados aqui: eles têm exatamente o formato que o módulo 5 definiu, para que o agente consuma o que aquelas aulas produzem sem nenhuma conversão.
+
+- **`confidence_flag`** é um objeto `{baixa_confianca, motivos}`, e cada motivo tem um código estável (`intervalo_largo`, `canal_novo`, `setor_desconhecido`, `extracao_falhou`, `fora_da_distribuicao`, `data_fora_do_periodo`) e um texto para humanos. Veja a [aula 5.4](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/sinal-de-baixa-confianca).
+- **`top_drivers`** é a lista `{feature, valor, contribuicao_log, multiplicador, direcao}` produzida pela função `top_drivers` da [aula 5.6](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/shap-na-pratica).
+- **`explanation`** é o objeto `{resumo, fatores, ressalvas}` do explicador ancorado da [aula 5.7](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/da-explicacao-a-narrativa).
+
+```python
+# galaxies_tool/schemas.py — parte 2: o que sai (mesmos formatos do módulo 5)
+class Motivo(BaseModel):
+    codigo: CodigoMotivo
+    texto: str
+
+
+class ConfidenceFlag(BaseModel):  # aula 5.4
+    baixa_confianca: bool
+    motivos: list[Motivo] = Field(default_factory=list)
+
+
+class Driver(BaseModel):  # aula 5.6: saída de top_drivers()
+    feature: str
+    valor: float | None = Field(description="Valor que entrou no modelo (None = ausente).")
+    contribuicao_log: float
+    multiplicador: float = Field(gt=0, description="exp(contribuicao_log)")
+    direcao: Literal["aumenta", "reduz"]
+
+
+class Fator(BaseModel):  # aula 5.7
+    fator: str = Field(description="nome EXATO de uma feature que está em top_drivers")
+    efeito: str = Field(description="direção e tamanho, citando o multiplicador")
+    evidencia: str = Field(description="o valor da feature no criativo")
+
+
+class Explicacao(BaseModel):  # aula 5.7
+    resumo: str
+    fatores: list[Fator]
+    ressalvas: list[str]
+```
+
+```python
+# galaxies_tool/schemas.py — parte 2b: comparáveis e a resposta completa
+class Comparable(BaseModel):
+    post_id: str
+    channel_id: str
+    published_at: datetime
+    titulo: str
+    curtidas: int = Field(ge=0)
+    relativo_canal: float = Field(gt=0, description="Curtidas / mediana anterior do canal.")
+    similaridade: float = Field(ge=-1.0, le=1.0)
+
+
+class PredictionResponse(BaseModel):
+    metric: Literal["likes"] = "likes"
+    predicted_metric: float = Field(ge=0, description="Curtidas previstas (mediana, quantil 50%).")
+    interval_low: float = Field(ge=0)
+    interval_high: float = Field(ge=0)
+    interval_level: float = Field(default=0.8, gt=0, lt=1)
+    confidence_flag: ConfidenceFlag
+    relative_to_channel: float = Field(gt=0, description="Previsão / mediana recente do canal.")
+    top_drivers: list[Driver]
+    explanation: Explicacao
+    comparables: list[Comparable]
+    features_used: dict[str, float | None] = Field(description="O que entrou no modelo.")
+    model_version: str
+
+    @model_validator(mode="after")
+    def _intervalo_coerente(self) -> "PredictionResponse":
+        if not (self.interval_low <= self.predicted_metric <= self.interval_high):
+            raise ValueError(
+                f"intervalo incoerente: {self.interval_low} <= {self.predicted_metric} "
+                f"<= {self.interval_high} é falso"
+            )
+        return self
+```
+
+O validador `_intervalo_coerente` parece óbvio, mas pega um bug real: modelos quantílicos treinados separadamente podem produzir $$q_{0,1} > q_{0,5}$$ para alguns criativos (*quantile crossing*, visto na [aula de regressão quantílica](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica)). Se isso escapar, a persona recebe um intervalo que não contém a própria previsão. Com o validador, a resposta simplesmente não é construída, e o teste de contrato falha antes da entrega.
+
+O campo `features_used` responde ao pedido de inspeção do briefing: quem olha a resposta vê **quais atributos entraram**, a previsão e a evidência (`top_drivers` e `comparables`). Se o VLM leu errado o gancho de um vídeo, é ali que alguém vai perceber.
+
+Os passos internos também têm contrato. Eles não saem pela porta da frente, mas tipar a fronteira entre dois passos é o que permite testar cada um isoladamente:
+
+```python
+# galaxies_tool/schemas.py — parte 3: contratos entre os passos (uso interno)
+class Atributos(BaseModel):
+    """Saída da Tool 1. None = não extraído (o GBM trata como ausente)."""
+    tipo: TipoCriativo
+    duracao_s: float | None = None
+    gancho: float | None = Field(default=None, ge=0, le=10, description="Nota 0-10 do VLM.")
+    rosto: bool | None = None
+    texto_na_tela: bool | None = None
+    energia_musica: float | None = Field(default=None, ge=0, le=10, description="0-10.")
+    embedding: list[float]
+    fonte: Literal["cache", "extrator", "texto"]
+
+
+class Contexto(BaseModel):
+    subscribers: int
+    mediana_curtidas: float = Field(gt=0, description="Mediana dos últimos 90 dias.")
+    n_posts_canal: int = Field(description="Posts usados na mediana.")
+    posts_anteriores: int = Field(description="Todos os posts do canal antes da data.")
+    comparables: list[Comparable]
+    rel_vizinhos: float | None = Field(description="Mediana do alvo relativo dos vizinhos (log).")
+    sim_vizinho: float | None = Field(description="Similaridade do vizinho mais próximo.")
+
+
+class Previsao(BaseModel):
+    q10: float
+    q50: float
+    q90: float
+    features: dict[str, float | None]
+    confidence_flag: ConfidenceFlag
+    model_version: str
+
+
+class ResultadoExplicar(BaseModel):
+    top_drivers: list[Driver]
+    explanation: Explicacao
+```
+
+---
+
+## A função pura como API principal
+
+"Função pura", aqui, quer dizer três coisas: mesma entrada, mesma saída; nenhum LLM no caminho do número; e nenhuma dependência de framework de agente. `prever_criativo(pedido) -> PredictionResponse` é a **API principal** do projeto. O servidor MCP chama essa função. O agente do LangGraph chama essa função. Os seus testes chamam essa função.
+
+Comece com um **esqueleto andante** (*walking skeleton*): uma versão que atravessa todas as camadas de ponta a ponta, ainda sem as partes difíceis. Esta primeira versão ignora o vídeo e só aceita `channel_stats`, mas já devolve um `PredictionResponse` válido, com intervalo e versão do modelo. Nas próximas aulas, cada peça é trocada pela versão real sem mudar a assinatura.
+
+```python
+# galaxies_tool/api.py — VERSÃO 0 (esqueleto andante): ponta a ponta, sem vídeo nem SHAP
+import numpy as np
+
+from galaxies_tool.modelo import (carregar_modelo, features_de_tempo_e_legenda,
+                                  features_do_canal, prever_quantis)
+from galaxies_tool.schemas import (ConfidenceFlag, Explicacao, Motivo, PredictionRequest,
+                                   PredictionResponse)
+
+
+def prever_criativo(pedido: PredictionRequest) -> PredictionResponse:
+    if pedido.channel_stats is None:
+        raise NotImplementedError("v0 só aceita channel_stats; channel_id chega na aula 6.3")
+    bundle = carregar_modelo()  # lido do disco na 1ª chamada; depois, cache
+    likes = pedido.channel_stats.recent_likes
+    mediana = float(np.median(likes))
+    feats = features_do_canal(pedido.channel_stats.subscribers, mediana, len(likes))
+    feats |= features_de_tempo_e_legenda(pedido.planned_datetime, pedido.caption, pedido.sector)
+    q_log = prever_quantis(bundle, [feats])[0]  # atributos do vídeo ausentes: o GBM lida com NaN
+    q10, q50, q90 = (float(np.expm1(feats["log_mediana_canal"] + q)) for q in q_log)
+    sem_video = Motivo(codigo="extracao_falhou", texto="v0: o vídeo ainda não é analisado")
+    return PredictionResponse(
+        predicted_metric=round(q50), interval_low=round(q10), interval_high=round(q90),
+        confidence_flag=ConfidenceFlag(baixa_confianca=True, motivos=[sem_video]),
+        relative_to_channel=round(q50 / mediana, 2), top_drivers=[], comparables=[],
+        features_used=feats, model_version=bundle.versao,
+        explanation=Explicacao(resumo=f"Previsão de {round(q50)} curtidas (esqueleto v0).",
+                               fatores=[], ressalvas=["Baixa confiança: " + sem_video.texto]))
+```
+
+O modelo prevê o <Termo id="alvo-relativo">alvo relativo</Termo> em escala log: $$\hat{y} = \log(1+\text{curtidas}) - \log(1+\text{mediana do canal})$$. Para voltar a curtidas, a função soma o nível do canal e aplica `expm1`. Por isso a mesma saída do modelo vira números absolutos diferentes em canais de tamanhos diferentes, e `relative_to_channel` fica fácil de calcular.
+
+As funções `carregar_modelo`, `features_do_canal`, `features_de_tempo_e_legenda` e `prever_quantis` vêm de `modelo.py`. O código completo dele e da base sintética está nos blocos recolhidos abaixo; o que importa agora é o desenho.
+
+<details>
+<summary>Código de <code>galaxies_tool/sintetico.py</code> (base sintética com efeitos conhecidos)</summary>
+
+```python
+# galaxies_tool/sintetico.py — parte 1: o "mundo" sintético (troque pela sua base)
+import zlib
+
+import numpy as np
+import pandas as pd
+
+SETORES = ["moda", "beleza", "automotivo"]
+ATRIBUTOS = ["duracao_s", "gancho", "rosto", "texto_na_tela", "energia_musica"]
+TZ = "America/Sao_Paulo"
+DIM_EMB = 32
+_W = np.random.default_rng(7).normal(size=(DIM_EMB, 9))  # "encoder" fixo e inventado
+ROSTO = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}  # mesmos efeitos do simulador
+
+
+def efeito_conteudo(setor, duracao_s, gancho, rosto, texto_na_tela, energia_musica, hora,
+                    estilo=0.0):
+    """Efeito VERDADEIRO do conteúdo no log das curtidas (o modelo precisa redescobrir)."""
+    return (0.09 * (gancho - 5) + ROSTO[setor] * rosto + 0.15 * texto_na_tela
+            + 0.05 * (energia_musica - 5) - 0.05 * (duracao_s - 30) / 10
+            + 0.12 * (18 <= hora <= 22) + 0.20 * estilo)  # estilo: só o embedding "vê"
+
+
+def embedding_sintetico(setor, duracao_s=None, gancho=None, rosto=None, texto_na_tela=None,
+                        energia_musica=None, estilo=0.0, semente: str = "") -> list[float]:
+    """Imita um embedding visual+texto normalizado: criativos parecidos ficam próximos."""
+    ok = lambda v, padrao: padrao if v is None or v != v else float(v)  # None/NaN -> padrão
+    x = [ok(duracao_s, 30) / 60, ok(gancho, 5) / 10, ok(rosto, 0.5), ok(texto_na_tela, 0.5),
+         ok(energia_musica, 5) / 10, estilo] + [float(setor == s) for s in SETORES]
+    ruido = np.random.default_rng(zlib.crc32(semente.encode())).normal(scale=0.3, size=DIM_EMB)
+    v = _W @ np.array(x) + ruido
+    return (v / np.linalg.norm(v)).round(5).tolist()
+```
+
+```python
+# galaxies_tool/sintetico.py — parte 2: canais e posts no esquema mínimo do briefing
+def gerar_base(n_por_setor: int = 25, seed: int = 0, prefixo: str = "UC") -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    canais = [(f"{prefixo}_{s}_{i:02d}", s, int(np.exp(np.clip(rng.normal(11.3, 1.5), 7.5, 16))))
+              for s in SETORES for i in range(n_por_setor)]
+    canais = [(c, s, n, 0.85 * np.log(n) - 2.9 + rng.normal(0, 0.55)) for c, s, n in canais]
+    if prefixo == "UC":  # os canais do fio condutor, com nível fixo
+        canais += [("UC_lumina_beauty", "beleza", 180_000, 7.76),
+                   ("UC_garagem22", "automotivo", 95_000, 6.60)]
+    inicio, fim = pd.Timestamp("2025-01-01", tz=TZ), pd.Timestamp("2026-09-20", tz=TZ)
+    linhas = []
+    for canal, setor, inscritos, nivel in canais:
+        for j in range(int(rng.integers(30, 70))):
+            hora = int(rng.integers(18, 23)) if rng.uniform() < 0.4 else int(rng.integers(7, 24))
+            dia = (inicio + (fim - inicio) * rng.uniform()).normalize()
+            quando = dia + pd.Timedelta(hours=hora)
+            dur_media = 38 if setor == "automotivo" else 28
+            a = dict(duracao_s=float(np.clip(round(rng.normal(dur_media, 12)), 8, 90)),
+                     gancho=float(np.clip(round(rng.normal(5, 2)), 0, 10)),
+                     rosto=float(rng.uniform() < (0.35 if setor == "automotivo" else 0.7)),
+                     texto_na_tela=float(rng.uniform() < 0.5),
+                     energia_musica=float(np.clip(round(rng.normal(5, 2.2)), 0, 10)))
+            estilo, n_tags = float(rng.normal()), int(rng.integers(0, 6))
+            log_likes = (nivel + efeito_conteudo(setor, **a, hora=hora, estilo=estilo)
+                         + rng.normal(0, 0.5))
+            linhas.append(dict(
+                post_id=f"{canal}_{j:03d}", channel_id=canal, published_at=quando,
+                caption=f"Short {j} de {setor}" + " #shorts" * n_tags,
+                media_ref=f"s3://sintetico/{canal}/{j:03d}.mp4",
+                metric_target=max(0, int(round(np.exp(log_likes) - 1))),
+                channel_stats_at_collection={"subscribers": inscritos}, sector=setor, **a,
+                emb=embedding_sintetico(setor, **a, estilo=estilo, semente=f"{canal}/{j}")))
+    base = pd.DataFrame(linhas).sort_values("published_at", ignore_index=True)
+    falhou = rng.uniform(size=len(base)) < 0.08  # simula falhas do pipeline do módulo 4
+    base.loc[falhou, ATRIBUTOS] = np.nan
+    return base
+```
+
+As colunas seguem o esquema mínimo que o briefing pede para retreino (`post_id`, `channel_id`, `published_at`, `caption`, `media_ref`, `metric_target`, `channel_stats_at_collection`, `sector`), mais os atributos extraídos e o *embedding*, que no projeto real ficam numa tabela à parte, ligada por `post_id`.
+
+</details>
+
+<details>
+<summary>Código de <code>galaxies_tool/modelo.py</code> (features, treino temporal, carga única)</summary>
+
+```python
+# galaxies_tool/modelo.py — parte 1: features calculadas do MESMO jeito no treino e na previsão
+import hashlib
+import os
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from functools import lru_cache
+from pathlib import Path
+
+import joblib
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+
+from galaxies_tool.sintetico import ATRIBUTOS, SETORES, TZ
+
+FEATURES_BASE = ["log_inscritos", "log_mediana_canal", "n_posts_canal", "hora", "dia_semana",
+                 "setor_cod", "len_legenda", "n_hashtags", *ATRIBUTOS]
+QUANTIS = {"q10": 0.1, "q50": 0.5, "q90": 0.9}
+DIR_ARTEFATOS = os.environ.get("GALAXIES_ARTEFATOS", "artefatos")
+
+
+def historico_recente(posts_canal: pd.DataFrame, antes_de: datetime) -> pd.Series:
+    """Curtidas dos posts ANTERIORES à data: últimos 90 dias (ou os 10 últimos)."""
+    antes_de = pd.Timestamp(antes_de)
+    anteriores = posts_canal[posts_canal["published_at"] < antes_de]
+    recentes = anteriores[anteriores["published_at"] >= antes_de - pd.Timedelta(days=90)]
+    return (recentes if len(recentes) >= 3 else anteriores.tail(10))["metric_target"]
+
+
+def features_do_canal(subscribers: int, mediana: float, n_posts: int) -> dict:
+    return {"log_inscritos": float(np.log1p(subscribers)),
+            "log_mediana_canal": float(np.log1p(mediana)), "n_posts_canal": float(n_posts)}
+
+
+def features_de_tempo_e_legenda(quando: datetime, caption: str, setor: str) -> dict:
+    local = pd.Timestamp(quando).tz_convert(TZ)  # hora LOCAL do público, não UTC
+    return {"hora": float(local.hour), "dia_semana": float(local.weekday()),
+            "setor_cod": float(SETORES.index(setor)),
+            "len_legenda": float(len(caption)), "n_hashtags": float(caption.count("#"))}
+
+
+def preparar_treino(base: pd.DataFrame) -> pd.DataFrame:
+    """Uma linha por post, com features point-in-time e o alvo relativo ao canal."""
+    linhas = []
+    for _, posts in base.groupby("channel_id"):
+        posts = posts.sort_values("published_at")
+        for i in range(3, len(posts)):  # exige ao menos 3 posts anteriores
+            post = posts.iloc[i]
+            hist = historico_recente(posts.iloc[:i], post["published_at"])
+            f = features_do_canal(post["channel_stats_at_collection"]["subscribers"],
+                                  float(np.median(hist)), len(hist))
+            f |= features_de_tempo_e_legenda(post["published_at"], post["caption"], post["sector"])
+            f |= {c: post[c] for c in [*ATRIBUTOS, "rel_vizinhos"] if c in post.index}
+            f |= {"post_id": post["post_id"], "channel_id": post["channel_id"],
+                  "published_at": post["published_at"], "metric_target": post["metric_target"],
+                  "y": np.log1p(post["metric_target"]) - f["log_mediana_canal"]}  # alvo relativo
+            linhas.append(f)
+    return pd.DataFrame(linhas).sort_values("published_at", ignore_index=True)
+```
+
+```python
+# galaxies_tool/modelo.py — parte 2: treinar com split temporal e calibrar o intervalo
+@dataclass
+class Bundle:
+    modelos: dict[str, lgb.LGBMRegressor]  # "q10", "q50", "q90"
+    features: list[str]
+    versao: str
+    ajuste_conformal: float = 0.0  # CQR (aula 5.3): quanto alargar o intervalo, em log
+    metricas: dict[str, float] = field(default_factory=dict)
+    limiares: dict = field(default_factory=dict)  # do confidence_flag (aula 5.4)
+
+
+def _ajustar(X: pd.DataFrame, y: pd.Series) -> dict[str, lgb.LGBMRegressor]:
+    params = dict(n_estimators=1000, learning_rate=0.03, num_leaves=7, min_child_samples=30,
+                  subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=42,
+                  deterministic=True, force_row_wise=True, n_jobs=1, verbose=-1)
+    return {nome: lgb.LGBMRegressor(objective="quantile", alpha=a, **params).fit(X, y)
+            for nome, a in QUANTIS.items()}
+
+
+def prever_quantis(bundle: Bundle, linhas: pd.DataFrame | list[dict]) -> np.ndarray:
+    """Devolve (n, 3): q10, q50, q90 do alvo relativo (log), já calibrados."""
+    X = pd.DataFrame(linhas).reindex(columns=bundle.features).astype(float)
+    q = np.sort(np.column_stack([bundle.modelos[n].predict(X) for n in QUANTIS]), axis=1)
+    q[:, 0] -= bundle.ajuste_conformal  # o sort acima evita "quantile crossing"
+    q[:, 2] += bundle.ajuste_conformal
+    return q
+```
+
+```python
+# galaxies_tool/modelo.py — parte 2b: treino temporal, calibração conformal e limiares
+def treinar(tabela: pd.DataFrame, features: list[str],
+            cortes: tuple[str, str] = ("2026-03-01", "2026-05-15")) -> Bundle:
+    t1, t2 = (pd.Timestamp(c, tz=TZ) for c in cortes)
+    treino = tabela[tabela["published_at"] < t1]
+    calib = tabela[(tabela["published_at"] >= t1) & (tabela["published_at"] < t2)]
+    teste = tabela[tabela["published_at"] >= t2]
+    assinatura = f"{features}|{len(treino)}|{treino['metric_target'].sum()}".encode()
+    versao = f"gbm-quantil-{date.today():%Y%m%d}-{hashlib.sha1(assinatura).hexdigest()[:7]}"
+    bundle = Bundle(_ajustar(treino[features], treino["y"]), features, versao)
+    q = prever_quantis(bundle, calib)  # ainda sem ajuste: ajuste_conformal = 0
+    escores = np.maximum(q[:, 0] - calib["y"], calib["y"] - q[:, 2])
+    nivel = min(1.0, np.ceil((len(calib) + 1) * 0.8) / len(calib))
+    bundle.ajuste_conformal = float(np.quantile(escores, nivel))
+    larguras = q[:, 2] - q[:, 0] + 2 * bundle.ajuste_conformal
+    bundle.limiares = {"largura_log": float(np.quantile(larguras, 0.8)), "min_posts": 10,
+                       "setores": sorted({SETORES[int(c)] for c in treino["setor_cod"]}),
+                       "ultima_data": tabela["published_at"].max().isoformat(),
+                       "max_dias": 180, "max_dias_passado": 365}
+    bundle.metricas = avaliar(bundle, teste)
+    return bundle
+
+
+def avaliar(bundle: Bundle, teste: pd.DataFrame) -> dict[str, float]:
+    from scipy.stats import spearmanr
+    q = prever_quantis(bundle, teste)
+    real = np.log1p(teste["metric_target"])
+    q50 = pd.Series(q[:, 1], index=teste.index)
+    pares = [(a, b) for _, g in teste.groupby("channel_id")
+             for a in g.index for b in g.index if a < b]
+    acertos = [np.sign(q50[a] - q50[b]) == np.sign(teste.y[a] - teste.y[b]) for a, b in pares]
+    return {"n_teste": float(len(teste)),
+            "spearman": float(spearmanr(teste["log_mediana_canal"] + q[:, 1], real)[0]),
+            "spearman_baseline": float(spearmanr(teste["log_mediana_canal"], real)[0]),
+            "par_a_par_intra_canal": float(np.mean(acertos)),
+            "cobertura_80": float(np.mean((teste.y >= q[:, 0]) & (teste.y <= q[:, 2])))}
+```
+
+```python
+# galaxies_tool/modelo.py — parte 3: salvar e carregar UMA vez por processo
+def treinar_e_salvar(base: pd.DataFrame, destino: str = DIR_ARTEFATOS,
+                     features: list[str] | None = None) -> Bundle:
+    tabela = preparar_treino(base)
+    features = features or FEATURES_BASE + (["rel_vizinhos"] if "rel_vizinhos" in tabela else [])
+    bundle = treinar(tabela, features)
+    if "sim_vizinho" in base:  # "fora da distribuição" = abaixo do p1 da base (aula 5.4)
+        bundle.limiares["sim_min"] = float(base["sim_vizinho"].quantile(0.01))
+    Path(destino).mkdir(parents=True, exist_ok=True)
+    joblib.dump(bundle, Path(destino) / "modelo.joblib")
+    rel = tabela.set_index("post_id")["y"]  # alvo relativo de cada post (para comparáveis)
+    base.assign(rel=base["post_id"].map(rel)).to_parquet(Path(destino) / "base.parquet")
+    return bundle
+
+
+@lru_cache(maxsize=1)
+def carregar_modelo(origem: str = DIR_ARTEFATOS) -> Bundle:
+    """Lê o modelo do disco UMA vez por processo; as chamadas seguintes vêm do cache."""
+    return joblib.load(Path(origem) / "modelo.joblib")
+```
+
+O treino usa três janelas no tempo: treino até fev/2026, calibração conformal de mar a meados de mai/2026 e teste depois disso. É o mesmo desenho das aulas de [validação temporal](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal) e de [predição conformal](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal), comprimido num arquivo.
+
+</details>
+
+---
+
+## Carregar o modelo uma vez (e dizer qual é)
+
+Ler um modelo do disco custa dezenas de milissegundos; prever uma linha custa bem menos. Se cada chamada da tool recarregar o arquivo, a latência é dominada por I/O e, num servidor com várias requisições simultâneas, cada uma guarda a sua cópia na memória. A solução mais simples em Python é `functools.lru_cache(maxsize=1)` na função que carrega: a primeira chamada lê o arquivo e as seguintes devolvem o mesmo objeto.
+
+```python
+# rodar_v0.py — aula 6.1: treina o modelo sintético e chama o esqueleto
+import time
+
+from galaxies_tool.api import prever_criativo  # a versão 0, acima
+from galaxies_tool.modelo import carregar_modelo, treinar_e_salvar
+from galaxies_tool.schemas import PredictionRequest
+from galaxies_tool.sintetico import gerar_base
+
+bundle = treinar_e_salvar(gerar_base())  # grava artefatos/modelo.joblib e artefatos/base.parquet
+print(bundle.versao, {k: round(v, 3) for k, v in bundle.metricas.items()})
+
+pedido = PredictionRequest(
+    creative="lumina_b.mp4", caption="1 produto, 20 segundos #antesedepois #maquiagem",
+    planned_datetime="2026-10-01T19:00:00-03:00", sector="beleza",
+    channel_stats={"subscribers": 180_000,
+                   "recent_likes": [1850, 2100, 2240, 2290, 2300, 2310, 2480, 2900, 3350, 4100]})
+for i in range(2):
+    t0 = time.perf_counter()
+    r = prever_criativo(pedido)
+    print(f"chamada {i + 1}: {1000 * (time.perf_counter() - t0):.1f} ms")
+print(r.model_dump_json(indent=1, exclude={"features_used"}))
+print(carregar_modelo.cache_info())
+```
+
+```text
+gbm-quantil-20260927-af06930 {'n_teste': 793.0, 'spearman': 0.903, 'spearman_baseline': 0.884, 'par_a_par_intra_canal': 0.638, 'cobertura_80': 0.826}
+chamada 1: 15.8 ms
+chamada 2: 1.7 ms
+{
+ "metric": "likes",
+ "predicted_metric": 2113.0,
+ "interval_low": 854.0,
+ "interval_high": 4642.0,
+ "interval_level": 0.8,
+ "confidence_flag": {
+  "baixa_confianca": true,
+  "motivos": [
+   {
+    "codigo": "extracao_falhou",
+    "texto": "v0: o vídeo ainda não é analisado"
+   }
+  ]
+ },
+ "relative_to_channel": 0.92,
+ "top_drivers": [],
+ "explanation": {
+  "resumo": "Previsão de 2113 curtidas (esqueleto v0).",
+  "fatores": [],
+  "ressalvas": [
+   "Baixa confiança: v0: o vídeo ainda não é analisado"
+  ]
+ },
+ "comparables": [],
+ "model_version": "gbm-quantil-20260927-af06930"
+}
+CacheInfo(hits=1, misses=1, maxsize=1, currsize=1)
+```
+
+A segunda chamada é cerca de dez vezes mais rápida, e `cache_info()` confirma: uma leitura do disco, um acerto no cache. Os números exatos variam entre máquinas; a versão tem a data do treino, então a sua será diferente.
+
+O cache tem três consequências que você precisa conhecer:
+
+1. **Retreinar não atualiza o processo que já está rodando.** O servidor continua com o modelo antigo até reiniciar ou até alguém chamar `carregar_modelo.cache_clear()`. Isso é uma vantagem, não um defeito: a versão em produção muda num momento controlado.
+2. **Cada processo tem a sua cópia.** Um servidor com quatro *workers* carrega o modelo quatro vezes. Para um GBM de alguns megabytes, tudo bem.
+3. **Nos testes, o caminho do modelo precisa ser definido antes da primeira chamada.** Por isso o diretório vem de uma variável de ambiente (`GALAXIES_ARTEFATOS`), lida na importação.
+
+A `model_version` em toda resposta fecha o ciclo da auditoria. Quando a Galaxies disser *"a previsão da semana passada errou feio"*, a primeira pergunta é *"qual versão respondeu?"*. Sem esse campo, não há como reproduzir a previsão. Aqui a versão combina a data do treino com um *hash* das *features* e dos dados; se você registra modelos no MLflow (visto na [aula de experimentos rastreáveis](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/experimentos-rastreaveis)), use o nome e a versão do registro.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Rode o esqueleto para o Short B da Lumina e o resultado é **2.113 curtidas, 0,92x a mediana do canal**. Isso está longe dos números que você verá quando as tools entrarem, e o motivo é instrutivo: a versão 0 não enxerga o vídeo. Para ela, A e B só diferem no horário e na legenda. O gancho forte de B, o texto na tela e a música animada ainda não chegaram ao modelo, que trata esses atributos como ausentes e cai perto da mediana do canal.
+
+Na [aula 6.3](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/as-cinco-tools), com a Tool 1 extraindo os atributos, B sobe para cerca de **4.240 curtidas (1,84x)** e A fica em cerca de **1.480 (0,64x)**. A estrutura não muda; só as peças. Esse é o valor do esqueleto: a persona já pode conectar e receber respostas válidas, e cada melhoria aparece como uma mudança de número, com a versão do modelo registrada.
+
+Repare também no `confidence_flag` da versão 0: `baixa_confianca` é `true`, com o motivo `extracao_falhou`. É honesto: sem atributos do vídeo, a previsão não merece mais que isso.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Pedir o número ao LLM "só enquanto o modelo não fica pronto".** Use o esqueleto andante. Um número ruim com versão e intervalo é melhor que um número plausível sem régua, porque o primeiro melhora e o segundo vira hábito.
+2. **Contrato frouxo.** `dict` livre, data sem fuso e setor como texto aberto passam na demo e quebram na primeira chamada da persona. Use `Literal`, `AwareDatetime` e `extra="forbid"`.
+3. **Lógica de negócio no adaptador.** Se o servidor MCP calcula uma *feature* que a função não calcula, você passa a ter dois modelos. O adaptador só converte formatos e erros.
+4. **Carregar o modelo a cada chamada, ou na importação do módulo.** O primeiro custa latência; o segundo quebra os testes, que precisam escolher o diretório antes. Carregue sob demanda, uma vez, com `lru_cache`.
+5. **Resposta sem `model_version`.** Sem ela, nenhum erro reportado pode ser reproduzido.
+:::
+
+<Quiz
+  id="m6-a1"
+  perguntas={[
+    {
+      pergunta: 'A persona envia `planned_datetime = "2026-10-01T19:00:00"`, sem fuso. O que a sua tool deve fazer?',
+      opcoes: [
+        {texto: 'Assumir UTC e seguir.', explicacao: 'Se o horário era de São Paulo, a feature hora vira 22 em vez de 19 e a previsão muda em silêncio.'},
+        {texto: 'Assumir o fuso de São Paulo e seguir.', explicacao: 'Às vezes acerta, mas esconde o problema. Um canal de outro fuso receberia uma previsão errada sem aviso.'},
+        {texto: 'Recusar com uma mensagem clara, para o chamador reenviar com fuso.', correta: true, explicacao: 'Exato. O AwareDatetime recusa na porta, e a mensagem deixa o LLM do chamador corrigir o pedido.'},
+      ],
+    },
+    {
+      pergunta: 'Por que `prever_criativo` é uma função Python pura, e não um nó do LangGraph ou uma tool do FastMCP?',
+      opcoes: [
+        {texto: 'Porque o LangGraph é lento demais para servir previsões.', explicacao: 'O grafo roda em milissegundos. A questão é de arquitetura, não de velocidade.'},
+        {texto: 'Porque assim todas as portas (notebook, grafo, agente e MCP) chamam o mesmo código e devolvem o mesmo número.', correta: true, explicacao: 'Isso. A função é a API; os frameworks são adaptadores. Um teste garante que as portas concordam.'},
+        {texto: 'Porque o MCP não aceita funções com estado.', explicacao: 'O MCP expõe qualquer função; o motivo é evitar lógica duplicada em cada adaptador.'},
+      ],
+    },
+    {
+      pergunta: 'Você retreinou o modelo e salvou o novo `modelo.joblib`, mas o servidor MCP continua respondendo com a versão antiga. Por quê?',
+      opcoes: [
+        {texto: 'O joblib não sobrescreve arquivos existentes.', explicacao: 'Sobrescreve. O arquivo novo está no disco.'},
+        {texto: 'O `lru_cache` guardou o modelo carregado no processo; ele só é relido após reiniciar ou chamar `cache_clear()`.', correta: true, explicacao: 'Exato, e isso é desejável: a troca de versão acontece num momento controlado.'},
+        {texto: 'O MCP guarda as respostas antigas em cache no cliente.', explicacao: 'O cliente não guarda previsões; o modelo antigo está na memória do servidor.'},
+      ],
+    },
+    {
+      pergunta: 'Quais campos da resposta existem principalmente para **inspeção** e auditoria? (marque todos)',
+      multipla: true,
+      opcoes: [
+        {texto: '`features_used`', correta: true, explicacao: 'Mostra quais atributos entraram. É onde se descobre que o VLM leu o gancho errado.'},
+        {texto: '`model_version`', correta: true, explicacao: 'Permite reproduzir qualquer previsão reportada.'},
+        {texto: '`predicted_metric`', explicacao: 'É o produto principal da tool, não um campo de inspeção.'},
+        {texto: '`comparables`', correta: true, explicacao: 'São a evidência: Shorts parecidos, anteriores, com desempenho conhecido.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: endureça o contrato do seu recorte]
+1. Adicione ao `PredictionRequest` uma regra: `planned_datetime` não pode estar a **mais de 90 dias no futuro** em relação ao momento da chamada. Escreva o validador e um teste que prove que ele recusa `2027-06-01T19:00:00-03:00`.
+2. Alguém do grupo sugere também recusar datas **no passado** ("não faz sentido prever o que já foi publicado"). Explique, em duas frases, por que essa regra quebraria a avaliação do seu agente.
+3. Liste dois campos que a sua base tem e que **nunca** podem entrar no pedido, e confirme que `extra="forbid"` os recusa.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from pydantic import field_validator
+
+
+class PredictionRequestComPrazo(PredictionRequest):
+    @field_validator("planned_datetime")
+    @classmethod
+    def _no_maximo_90_dias(cls, v: datetime) -> datetime:
+        if v - datetime.now(timezone.utc) > timedelta(days=90):
+            raise ValueError("planned_datetime a mais de 90 dias: o histórico do canal "
+                             "estará desatualizado; reenvie mais perto da data")
+        return v
+```
+
+Sobre o item 2: o *golden set* da [aula 6.6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/testando-o-agente) reenvia à tool criativos **já publicados**, com a data original, para comparar a previsão com as curtidas reais. Com a regra "sem passado", essa avaliação "de-para" deixaria de existir. Se quiser a regra em produção, faça dela uma opção do servidor, não do contrato.
+
+Sobre o item 3: `metric_target` (as curtidas do próprio post) e qualquer contagem pós-publicação, como views ou comentários, são os candidatos óbvios.
+
+</details>
+
+---
+
+## Resumo
+
+- O LLM fica nas **bordas**: orquestra antes do número e redige a explicação depois. O caminho do número é determinístico.
+- O **contrato Pydantic** (`PredictionRequest`, `PredictionResponse` e os contratos internos) recusa na porta o que causaria erro silencioso: data sem fuso, setor fora do recorte, campos que vazariam.
+- `prever_criativo(pedido) -> PredictionResponse` é a **API principal**, uma função pura; MCP e LangGraph são **adaptadores finos** em volta dela.
+- Comece por um **esqueleto andante** e troque as peças sem mudar a assinatura.
+- Carregue o modelo **uma vez por processo** (`lru_cache`) e devolva a **versão do modelo** em toda resposta.
+
+## Referências
+
+- Pydantic. [Validators](https://docs.pydantic.dev/latest/concepts/validators/) e [tipos de data com fuso (`AwareDatetime`)](https://docs.pydantic.dev/latest/api/types/#pydantic.types.AwareDatetime).
+- Python. [`functools.lru_cache`](https://docs.python.org/3/library/functools.html#functools.lru_cache).
+- LightGBM. [Parâmetros, incluindo `objective="quantile"`](https://lightgbm.readthedocs.io/en/latest/Parameters.html).
+- Romano, Patterson e Candès. [*Conformalized Quantile Regression*](https://arxiv.org/abs/1905.03222). NeurIPS, 2019.
+- Briefing do case: [Visão geral do projeto Galaxies](/projetos/galaxies).
+
+**Próxima aula:** [LangGraph em 2026](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/langgraph-em-2026): o fluxo da previsão como um grafo determinístico, o agente ReAct para perguntas abertas e como testar os dois sem chamar um LLM.

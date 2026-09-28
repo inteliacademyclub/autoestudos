@@ -1,0 +1,264 @@
+---
+sidebar_position: 1
+sidebar_label: 'Do LLM ao modelo preditivo'
+title: 'Do LLM ao modelo preditivo'
+description: 'Por que um agente que prevê performance precisa de um modelo treinado por trás, e como o LLM e o modelo dividem o trabalho.'
+tags: [ml-preditivo, galaxies, formulacao]
+---
+
+# Do LLM ao Modelo Preditivo: Por que o LLM Não Chuta o Número
+
+<LessonMeta
+  tempo="35 min"
+  semana={1}
+  etapa={['dados', 'modelo', 'agente']}
+  objetivos={[
+    'Explicar a diferença entre gerar uma resposta plausível e fazer uma previsão verificável',
+    'Distinguir regressão de classificação e escolher a formulação certa para o case Galaxies',
+    'Descrever a arquitetura do projeto: o que o LLM faz e o que o modelo treinado faz',
+    'Conhecer o fio condutor da trilha: os Shorts A e B da marca Lumina',
+  ]}
+  prerequisitos={[
+    {label: 'Conceitos básicos de LLM', to: '/aulas/conceitos-basicos-de-llm/funcionamento-das-llms'},
+    {label: 'Function calling', to: '/aulas/conceitos-basicos-de-llm/function-calling'},
+  ]}
+/>
+
+Abra o seu chat de LLM favorito, cole a descrição de um YouTube Short de maquiagem e pergunte: *"quantas curtidas esse vídeo vai ter?"*. A resposta vem rápida e segura: "entre 3 e 5 mil". Agora abra uma nova conversa e pergunte de novo. "Algo em torno de 8 a 12 mil."
+
+Nenhuma das duas respostas está "errada" no sentido de uma alucinação clássica — ambas são **plausíveis**. O problema é outro: não existe régua. Você não sabe quanto o modelo erra em média, não sabe se ele erra mais para canais pequenos, e não tem como provar para uma marca que a previsão merece confiança antes de ela gastar a verba de mídia.
+
+Esse é exatamente o buraco que a Galaxies quer fechar. As personas sintéticas dela já assistem aos criativos e dão uma opinião qualitativa ("gostei do gancho, a música cansa"). O que falta é o **componente estatístico**: um número treinado em dados reais, com margem de erro medida — e é isso que você vai construir nesta trilha.
+
+:::info[A ideia central da trilha]
+O agente que você vai construir tem duas "inteligências" com papéis diferentes:
+- um **modelo preditivo treinado** (gradient boosting) que produz o número e o intervalo;
+- um **LLM** que orquestra as ferramentas, interpreta os resultados e explica a previsão em linguagem natural.
+
+O LLM **nunca** inventa o número. Ele o recebe de uma ferramenta.
+:::
+
+---
+
+## Gerar vs. prever
+
+LLMs foram treinados para uma tarefa muito específica: prever o próximo token de um texto. Isso os torna excelentes em interpretar, resumir, raciocinar sobre conteúdo e seguir instruções. Mas "quantas curtidas esse vídeo vai ter" não é uma pergunta sobre texto — é uma pergunta sobre **o mundo**, cuja resposta só aparece 30 dias depois da publicação.
+
+<Sketch name="m1/llm-vs-modelo" alt="Comparação: o LLM responde com um número plausível sem régua; o modelo preditivo usa features conhecidas antes de postar e produz um número com intervalo e erro medido contra o resultado real." caption="O LLM responde; o modelo preditivo responde e pode ser cobrado." />
+
+Um **modelo preditivo** é treinado de outro jeito: você mostra a ele milhares de pares *(criativo, resultado real)* do passado e ele aprende uma função que leva das características do criativo ao resultado. A diferença que importa não é "qual é mais inteligente", e sim:
+
+| | LLM perguntado diretamente | Modelo preditivo treinado |
+| :--- | :--- | :--- |
+| **Aprendeu com** | Texto da internet (quase nada sobre *este* canal) | Os posts reais do seu conjunto de dados |
+| **Saída** | Texto plausível | Número + intervalo de predição |
+| **Dá para medir o erro?** | Só se você montar um experimento em volta | Sim, por construção (conjunto de teste) |
+| **Consistência** | Varia com prompt, temperatura, versão | Determinístico dado o modelo |
+| **Custo por previsão** | Chamada de API | Microssegundos em CPU |
+| **Explica o porquê?** | Explica bem, mas a explicação pode não ser a causa real | Explica via SHAP: quais features pesaram, e quanto |
+
+:::tip[Um detalhe honesto]
+LLMs **não** são inúteis para prever popularidade. Um trabalho de 2025 (*LLMs Are Natural Video Popularity Predictors*, ACL Findings) mostrou que um LLM, recebendo descrições textuais dos frames geradas por um VLM, classificou a popularidade de 13.639 vídeos com 82% de acurácia sem nenhum treino, contra 80% de uma rede supervisionada — e a **combinação** dos dois chegou a 85,5%. A questão é que, sozinho, o LLM não é verificável nem calibrado. Na [aula de extensão](/aulas/ml-preditivo-e-agentes/ir-alem/llm-zero-shot-vs-modelo) você monta esse experimento de forma justa.
+:::
+
+---
+
+## O que é "aprender com dados", em uma frase
+
+Aprendizado supervisionado é encontrar uma função $$f$$ tal que, para um criativo novo com características $$x$$, a previsão $$\hat{y} = f(x)$$ fique perto do resultado real $$y$$ — **em dados que o modelo nunca viu**.
+
+Três palavras dessa frase vão ocupar boa parte da trilha:
+
+- **características** ($$x$$): são as <Termo id="feature">features</Termo>. Só vale o que se conhece *antes* da publicação;
+- **resultado real** ($$y$$): é o <Termo id="alvo">alvo</Termo>. Vamos discutir por que ele quase nunca é "curtidas" cru;
+- **dados que o modelo nunca viu**: é o que separa um modelo útil de um modelo que decorou o passado. Neste projeto, "nunca viu" significa **o futuro** — e isso muda tudo na forma de validar.
+
+<Sketch name="m1/momento-da-previsao" alt="Linha do tempo: a previsão acontece antes da publicação; o que se sabe antes pode virar feature; views, curtidas e posts futuros só existem depois e só podem ser alvo." caption="Toda feature precisa existir no instante da previsão. O resto é vazamento." />
+
+---
+
+## Regressão ou classificação?
+
+Os dois grandes formatos de problema supervisionado são:
+
+- **Regressão**: o alvo é um número contínuo. Ex.: $$\log(1 + \text{curtidas})$$.
+- **Classificação**: o alvo é uma categoria. Ex.: "abaixo / na média / acima / viral" em relação ao canal.
+
+O briefing da Galaxies pede os dois, com papéis diferentes:
+
+1. **Alvo primário (regressão)**: $$\log(1+\text{curtidas})$$, ou o log da razão entre as curtidas do post e a mediana dos posts anteriores do canal. O segundo isola o efeito do **conteúdo**, que é o que interessa quando a marca escolhe entre dois criativos do mesmo canal. Isso é aprofundado em [Engajamento é cauda longa](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa).
+2. **Alvo secundário (classificação em faixas)**: para comunicar. "Acima da média do canal" é mais fácil de entender do que "7,93 em escala log".
+
+Na prática, você treina a regressão e **deriva** as faixas a partir da previsão e do histórico do canal — não precisa de dois modelos.
+
+:::warning[O número absoluto é o alvo errado para se apaixonar]
+A literatura (SMP Challenge, SMTPD) é consistente: o **nível** de curtidas de um post é dominado pelo tamanho e pela fase do canal, e o conteúdo mexe relativamente pouco nele. O que é realista — e o que a Galaxies precisa — é acertar a **ordenação**: dado A e B, qual rende mais? A Galaxies disse que cerca de 60% de acerto par-a-par com a arquitetura certa já prova o conceito. Guarde isso: bater o *baseline* e ordenar bem vale mais do que um MAE bonito.
+:::
+
+---
+
+## A arquitetura: quem faz o quê
+
+Esta é a arquitetura de referência do projeto. Você vai voltar a ela em quase todas as aulas — o componente no topo de cada aula mostra em qual caixa você está.
+
+<Sketch name="galaxies/arquitetura" alt="Arquitetura do agente: o criativo e o contexto entram no agente orquestrador (LangGraph), que chama cinco tools — extração de atributos, histórico e comparáveis, predição com GBM e intervalo, explicabilidade com SHAP e ordenação. A base e o pipeline de treino offline alimentam as tools. A saída é exposta como função e servidor MCP." caption="Arquitetura de referência do case Galaxies." />
+
+Lendo de baixo para cima:
+
+1. **Sua base** (módulo 1): Shorts de moda, beleza e automotivo coletados pela YouTube Data API. Neste case, **cada aluno monta a própria base**.
+2. **Pipeline de treino offline** (módulos 2, 3 e 4): features, validação temporal, gradient boosting, registro no MLflow. Roda antes, não durante a conversa com o agente.
+3. **As cinco tools** (módulos 4, 5 e 6): extrair atributos do vídeo, buscar histórico e comparáveis, **prever**, explicar, ordenar.
+4. **O agente** (módulo 6): um grafo em LangGraph que recebe o criativo, chama as tools e monta a resposta.
+5. **A integração** (módulo 6): tudo exposto como função Python e como servidor MCP, para ser consumido pela persona da Galaxies.
+
+Repare onde o LLM aparece: no orquestrador, no extrator de atributos (um VLM respondendo uma rubrica) e no subagente que transforma SHAP em texto. Em **nenhum** desses lugares ele produz a previsão. Essa separação tem três vantagens concretas:
+
+- **Auditabilidade**: quem inspeciona a resposta vê quais atributos entraram, qual número saiu e qual evidência o sustenta.
+- **Avaliação independente**: o modelo é avaliado com métricas de ML clássico, sem depender de o LLM ter um dia bom.
+- **Custo e latência**: prever custa microssegundos; o LLM só entra onde linguagem é necessária.
+
+---
+
+## A pergunta norteadora
+
+> É possível prever, antes da publicação e a partir do conteúdo do criativo e do histórico do canal, como um público real vai reagir a ele — e com que margem de erro?
+
+Note as três restrições embutidas:
+
+- **"antes da publicação"**: proíbe usar qualquer métrica pós-publicação como feature (inclusive as primeiras horas de views — isso seria outro problema, bem mais fácil);
+- **"conteúdo do criativo e histórico do canal"**: define as famílias de features. É por isso que existe a camada multimodal;
+- **"com que margem de erro"**: exige intervalo de predição, não só um número.
+
+A literatura dá uma expectativa realista: Spearman entre cerca de 0,55 e 0,85 antes da publicação, com as features do canal dominando e o conteúdo visual somando algo como +0,02 a +0,04. Se você obtiver números muito acima disso, desconfie primeiro de [vazamento](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados).
+
+---
+
+## O mapa da trilha
+
+| Módulo | Pergunta que ele responde | Semana |
+| :--- | :--- | :---: |
+| [1 · Formulação e Dados](/aulas/ml-preditivo-e-agentes/formulacao-e-dados) | O que prever, com quais dados, e como coletá-los? | 1 |
+| [2 · Avaliação Honesta](/aulas/ml-preditivo-e-agentes/avaliacao-honesta) | Como saber se o modelo é bom de verdade? | 1–2 |
+| [3 · Gradient Boosting](/aulas/ml-preditivo-e-agentes/gradient-boosting) | Qual modelo usar e quais features construir? | 2 |
+| [4 · Do Vídeo às Features](/aulas/ml-preditivo-e-agentes/do-video-as-features) | Como transformar um vídeo em colunas? | 2–3 |
+| [5 · Incerteza e Explicabilidade](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade) | Quanto o modelo pode errar, e por que ele previu isso? | 3 |
+| [6 · Agente Preditivo e MCP](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp) | Como embrulhar tudo num agente e expor como tool? | 3–4 |
+| [7 · Ir Além](/aulas/ml-preditivo-e-agentes/ir-alem) | Extensões opcionais | — |
+
+O [roadmap do projeto](/projetos/galaxies/roadmap) mostra a mesma coisa semana a semana, com checkpoints.
+
+---
+
+## O fio condutor: Lumina A vs. B
+
+Ao longo da trilha, todas as aulas voltam para o mesmo caso. Ele é fictício, mas foi desenhado para ter os dilemas reais do projeto.
+
+<NoProjeto titulo="Conheça a Lumina">
+
+A **Lumina Beauty** é uma marca de maquiagem com cerca de 180 mil inscritos no YouTube. Nos últimos 90 dias, seus Shorts tiveram mediana de cerca de 2.300 curtidas. O time de marketing produziu dois criativos para o lançamento de uma base e só tem verba para impulsionar **um**:
+
+- **Short A: "Pele natural em 5 passos"**. Tutorial de 55 segundos, voiceover calmo e explicativo, abre com o logo da marca, rosto da apresentadora o tempo todo, sem texto na tela. Publicação planejada para uma terça às 14h.
+- **Short B: "1 produto, 20 segundos"**. Antes/depois de 22 segundos, começa com metade do rosto sem maquiagem (gancho forte nos primeiros 2 s), texto grande na tela, música animada. Publicação planejada para uma quinta às 19h.
+
+A pergunta da marca é simples: **qual dos dois vai render mais — e com que confiança?** No fim da trilha, o seu agente vai responder isso com um número para cada um, um intervalo, um ranking e uma explicação baseada em evidência. Nesta primeira aula, a resposta honesta é: *"ainda não sei, e desconfie de quem disser que sabe sem ter medido"*.
+
+</NoProjeto>
+
+Um exemplo secundário, do setor automotivo, aparece de vez em quando: o canal **Garagem 22** decidindo entre um POV de direção e um close do interior de um SUV.
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Começar pelo agente.** O agente é a última camada. Sem base, baseline e validação, ele só embrulha um chute bonito.
+2. **Deixar o LLM produzir o número "só por enquanto".** Esse atalho vira arquitetura. Faça a tool de predição devolver um valor fixo se precisar, mas mantenha o número fora do LLM desde o início.
+3. **Perseguir acurácia absoluta.** O alvo realista é ordenar bem e bater o baseline com validação temporal.
+4. **Esquecer o "antes da publicação".** Toda feature precisa passar no teste da linha do tempo acima.
+:::
+
+<Quiz
+  id="m1-a1"
+  perguntas={[
+    {
+      pergunta: 'Por que o agente do projeto não pode simplesmente pedir ao LLM o número de curtidas previsto?',
+      opcoes: [
+        {texto: 'Porque LLMs não conseguem lidar com números.', explicacao: 'LLMs lidam com números em texto. O problema é outro: a resposta não tem erro medido nem consistência.'},
+        {texto: 'Porque a resposta do LLM é plausível, mas não tem erro medido, calibração nem consistência entre chamadas.', correta: true, explicacao: 'Exato. Um modelo treinado e avaliado num conjunto de teste temporal tem uma régua; o LLM sozinho, não.'},
+        {texto: 'Porque o LLM é caro demais para rodar.', explicacao: 'Custo é uma vantagem secundária da separação, não o motivo principal.'},
+      ],
+    },
+    {
+      pergunta: 'Qual destas informações pode ser usada como *feature* para prever as curtidas de um Short?',
+      opcoes: [
+        {texto: 'O número de views do próprio Short.', explicacao: 'Views só existem depois da publicação: é vazamento.'},
+        {texto: 'A mediana de curtidas dos posts **anteriores** do canal.', correta: true, explicacao: 'Existe no momento da previsão, desde que calculada só com posts publicados antes.'},
+        {texto: 'O número de comentários do Short após 24 horas.', explicacao: 'Métrica pós-publicação. Isso seria o problema de "early popularity", fora do escopo.'},
+      ],
+    },
+    {
+      pergunta: 'A marca quer escolher entre dois criativos do mesmo canal. Qual formulação do alvo isola melhor o efeito do conteúdo?',
+      opcoes: [
+        {texto: 'Curtidas absolutas.', explicacao: 'O nível absoluto é dominado pelo tamanho do canal, não pelo conteúdo.'},
+        {texto: 'log(1 + curtidas).', explicacao: 'Melhora a escala (cauda longa), mas ainda mistura efeito do canal e do conteúdo.'},
+        {texto: 'Log da razão entre as curtidas do post e a mediana dos posts anteriores do canal.', correta: true, explicacao: 'O alvo relativo tira o efeito do canal e deixa o do conteúdo em evidência.'},
+      ],
+    },
+    {
+      pergunta: 'Em quais pontos da arquitetura o LLM aparece?',
+      multipla: true,
+      opcoes: [
+        {texto: 'No orquestrador que chama as tools.', correta: true},
+        {texto: 'Na tool de predição, gerando o número.', explicacao: 'Não! A predição vem do modelo treinado.'},
+        {texto: 'No extrator de atributos do vídeo (VLM respondendo uma rubrica).', correta: true},
+        {texto: 'No subagente que transforma os valores SHAP em explicação textual.', correta: true},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: escreva o problema antes do código]
+Abra o README do seu projeto e escreva, em no máximo 10 linhas:
+
+1. **A decisão** que a previsão vai apoiar (quem decide, entre o quê).
+2. **A unidade de previsão** (um Short? um par de Shorts?).
+3. **O momento da previsão** e o que você sabe nesse momento.
+4. **O alvo** que você pretende usar e por quê.
+5. **Como você vai saber se deu certo** (qual métrica, contra qual baseline).
+:::
+
+<details>
+<summary>Ver um exemplo de resposta</summary>
+
+> **Decisão:** o time de marketing de uma marca escolhe qual de N criativos impulsionar antes de publicar.
+> **Unidade:** um Short de um canal já existente (com pelo menos 10 posts anteriores).
+> **Momento:** antes da publicação. Sei o histórico do canal até a data, o vídeo, a legenda, o horário planejado e o setor.
+> **Alvo:** log da razão curtidas / mediana dos posts anteriores do canal, medido com o vídeo tendo pelo menos 30 dias.
+> **Sucesso:** acurácia par-a-par intra-canal e Spearman acima do baseline "mediana do canal" em validação temporal, com intervalo de 80% cobrindo entre 75% e 85% dos casos de teste.
+
+Não se preocupe se ainda não souber o que alguns desses termos significam: cada um tem uma aula própria.
+
+</details>
+
+---
+
+## Resumo
+
+- O LLM gera respostas **plausíveis**; o modelo preditivo gera previsões **verificáveis**. O projeto precisa das duas coisas, em papéis separados.
+- Aprendizado supervisionado = aprender $$f(x) \approx y$$ com dados do passado e ser avaliado em dados **futuros**.
+- O alvo primário é uma **regressão** em escala log (de preferência relativa ao canal); as faixas são derivadas para comunicação.
+- O objetivo realista é **ordenar bem e bater o baseline**, não acertar o número exato.
+- Na arquitetura, o LLM orquestra, extrai atributos e explica. **O número vem sempre da tool de predição.**
+
+## Referências
+
+- Briefing do case: [Visão geral do projeto Galaxies](/projetos/galaxies).
+- Kayal, Mettes, Dehmamy e Park. [*Large Language Models Are Natural Video Popularity Predictors*](https://aclanthology.org/2025.findings-acl.597/). Findings of ACL, 2025.
+- [SMP Challenge](https://smp-challenge.com/): formulação, métricas e soluções vencedoras de predição de popularidade.
+- Xu et al. [*SMTPD: A New Benchmark for Temporal Prediction of Social Media Popularity*](https://arxiv.org/abs/2503.04446). CVPR, 2025.
+
+**Próxima aula:** [Anatomia de um problema supervisionado](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/anatomia-de-um-problema-supervisionado): features, alvo, função de perda e o que significa um modelo "generalizar".

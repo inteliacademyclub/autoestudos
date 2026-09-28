@@ -1,0 +1,659 @@
+---
+sidebar_position: 5
+sidebar_label: 'Construindo o coletor com a YouTube Data API'
+title: 'Construindo o coletor com a YouTube Data API'
+description: 'Um coletor de Shorts barato, idempotente e incremental: playlist de uploads, paginação, lotes de 50, detecção de Shorts, snapshots datados em DuckDB/Parquet, retries e contador de cota, com testes que rodam sem chave.'
+tags: [ml-preditivo, dados, youtube-api, coletor]
+---
+
+import QuotaCalculator from '@site/src/components/interativos/QuotaCalculator';
+
+# Construindo o Coletor: da Planilha de Canais a uma Base de Shorts Confiável
+
+<LessonMeta
+  tempo="60 min"
+  semana={1}
+  etapa="dados"
+  objetivos={[
+    'Descrever o caminho canal → playlist de uploads → playlistItems → videos.list e o custo de cada etapa',
+    'Implementar paginação, lotes de 50 IDs, retries com backoff e um contador de cota diário',
+    'Detectar Shorts com regras documentadas e reconhecer os limites dos truques não oficiais',
+    'Persistir a base de forma idempotente, com snapshots datados de estatísticas',
+    'Testar o coletor sem chave de API, com respostas no formato real',
+  ]}
+  prerequisitos={[
+    {label: 'Curadoria de canais', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/curadoria-de-canais'},
+    {label: 'Fontes de dados e o plano da sua base', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/fontes-de-dados-e-plano-da-base'},
+  ]}
+/>
+
+O primeiro coletor de quase todo mundo tem a mesma cara: um laço sobre os canais, um `search.list` por canal para achar os vídeos, os resultados anexados num CSV. Ele funciona no teste com três canais. Com 60, a busca esgota o bucket de 100 chamadas antes do almoço e ainda devolve no máximo 500 vídeos por canal. Na segunda tentativa, o script cai com um erro 503 no canal 43; você roda de novo e o CSV fica com os 42 primeiros canais duplicados. Na terceira, você percebe que não guardou **quando** coletou cada número.
+
+Um coletor para este projeto não é um script que roda uma vez. É um processo que vai rodar **todo dia, por quatro semanas**, e cujos erros só aparecem quando o modelo já está treinado. Por isso vale construí-lo com cuidado agora, em etapas pequenas e testadas.
+
+:::info[A ideia central]
+O caminho barato e completo é **canal → playlist de uploads (UU…) → `playlistItems.list` (50 por página) → `videos.list` (50 IDs por chamada)**, sempre a 1 unidade por chamada. Em volta dele, cinco propriedades: **barato** (nada de busca para listar vídeos), **idempotente** (rodar duas vezes não duplica), **incremental** (só busca o que é novo), **resiliente** (refaz erros transitórios e para antes de estourar a cota) e **testável** (roda sem chave com respostas no formato real).
+:::
+
+---
+
+## O fluxo, de ponta a ponta
+
+<Sketch name="m1/fluxo-do-coletor" alt="Fluxo do coletor: a planilha de curadoria fornece os channel_id; cada UC… vira a playlist de uploads UU… sem custo; playlistItems.list lista 50 IDs por página (1 unidade por página, com nextPageToken); os IDs novos vão para videos.list em lotes de 50 (snippet, contentDetails, statistics, player; 1 unidade por lote). Um cliente acima das chamadas conta unidades por dia no horário do Pacífico, refaz erros 5xx e 429 e não insiste em quotaExceeded. Os itens passam por parse_video (duração ISO 8601, detecção de Short, likeCount ausente vira nulo, idade) e vão para o DuckDB, com upsert em videos e snapshots por data de coleta, e daí para um Parquet rotulado com o primeiro snapshot de 30 dias ou mais. Os IDs já na base alimentam a coleta incremental." caption="O coletor da trilha. Cada caixa é uma etapa de código desta aula." />
+
+Três fatos da API sustentam o desenho:
+
+1. **Todo canal tem uma playlist de uploads.** `channels.list(part="contentDetails")` devolve `contentDetails.relatedPlaylists.uploads`, cujo ID é o do canal com `UU` no lugar de `UC`. O coletor usa esse atalho para não gastar uma chamada, mas confira com o valor oficial que você já guardou na planilha de curadoria.
+2. **`playlistItems.list` pagina de 50 em 50.** Cada resposta traz até 50 itens e, se houver mais, um `nextPageToken`. Cada página custa 1 unidade.
+3. **`videos.list` aceita até 50 IDs por chamada**, separados por vírgula, e também custa 1 unidade, independentemente de quantas partes (`snippet`, `statistics`...) você pedir.
+
+---
+
+## Quanto custa, de verdade
+
+Com os números do plano (60 canais com cerca de 300 uploads cada), a **primeira** coleta completa custa:
+
+| Etapa | Chamadas | Unidades |
+| :--- | :--- | :--- |
+| Resolver 60 handles (`channels.list(forHandle=...)`, uma vez só) | 60 | 60 |
+| Listar uploads: 60 canais × 6 páginas de 50 | 360 | 360 |
+| Detalhar 18 mil vídeos em lotes de 50 (`videos.list`) | 360 | 360 |
+| **Total** | **780** | **780**, ou 7,8% da cota diária |
+
+Nas coletas **diárias** seguintes, o custo cai muito: uma página por canal para descobrir o que é novo (cerca de 60 unidades) e alguns lotes para os vídeos novos e para os snapshots dos Shorts jovens (algumas dezenas). Fazer o mesmo com `search.list` seria inviável: o bucket de busca tem 100 chamadas por dia, e uma busca filtrada por canal devolve no máximo 500 vídeos.
+
+O componente abaixo compara o custo das duas estratégias, playlist de uploads e busca, para bases de tamanhos diferentes. O custo por chamada segue a documentação da API:
+
+<QuotaCalculator />
+
+---
+
+## Detectar Shorts: não existe `isShort`
+
+A API não tem um campo que diga "isto é um Short". O que existe é a regra de produto: desde **15/10/2024**, vídeos **quadrados ou verticais de até 3 minutos** são classificados como Shorts; antes disso, o limite era de 60 segundos. Com campos documentados, dá para aproximar essa regra:
+
+- **Duração**: `contentDetails.duration` vem em ISO 8601 (`PT22S`, `PT2M55S`). O `isodate` converte para segundos. A documentação avisa que a duração pode diferir em cerca de 1 segundo da real, então use 1 segundo de folga.
+- **Orientação**: pedindo `part="player"` com `maxHeight`, a API devolve `player.embedWidth` e `player.embedHeight`, **quando a proporção do vídeo é conhecida**. Altura maior ou igual à largura indica vertical ou quadrado.
+
+O resultado é um **Short provável**: duração dentro do limite da época e orientação não horizontal. Existem dois truques não oficiais que você vai encontrar em fóruns:
+
+- **Playlist `UUSH`**: trocar `UC` por `UUSH` no ID do canal parece listar só os Shorts. Não está documentado e pode mudar sem aviso.
+- **Redirect de `youtube.com/shorts/ID`**: uma requisição a essa URL costuma responder direto para Shorts e redirecionar para `/watch` nos demais. Além de não documentado, isso acessa as páginas do YouTube fora da API, o que conflita com a proibição de scraping das Developer Policies (III.E.6).
+
+Use a regra documentada como fonte de verdade. Se quiser, use a `UUSH` como **checagem cruzada** numa amostra, e confira umas 50 classificações com os próprios olhos. Anote a taxa de concordância no data card.
+
+---
+
+## Etapa 1: cota e retries
+
+Antes de chamar a API, o coletor precisa de um cliente que responda a três perguntas: **quanto já gastei hoje**, **devo tentar de novo** e **quando parar**. Toda requisição custa pelo menos 1 unidade, inclusive as que falham, e o dia de cota é o do horário do Pacífico. Erros de servidor (5xx), 429 e `rateLimitExceeded` são transitórios e merecem nova tentativa com espera exponencial; `quotaExceeded` não, porque só se resolve depois da meia-noite no Pacífico.
+
+```python
+# coletor.py, etapa 1: cota e retries
+import json
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from googleapiclient.errors import HttpError
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
+
+PT = ZoneInfo("America/Los_Angeles")  # a cota zera à meia-noite do horário do Pacífico
+
+
+class CotaEsgotada(RuntimeError):
+    """Pare a coleta e retome no próximo dia de cota."""
+
+
+def motivo(e: HttpError) -> str:
+    """Extrai o 'reason' do erro da YouTube API (ex.: quotaExceeded)."""
+    try:
+        return json.loads(e.content)["error"]["errors"][0]["reason"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def transitorio(e: BaseException) -> bool:
+    """Vale tentar de novo? Erros 5xx, 429 e rate limit, sim; cota esgotada, não."""
+    if not isinstance(e, HttpError):
+        return False
+    return e.status_code >= 500 or e.status_code == 429 or motivo(e) == "rateLimitExceeded"
+
+
+class Cliente:
+    """Embrulha o cliente oficial: conta unidades por dia (PT) e refaz erros transitórios."""
+
+    def __init__(self, yt, limite=9_000, arquivo="cota.json", espera=None):
+        self.yt, self.limite = yt, limite
+        self.arquivo = Path(arquivo) if arquivo else None
+        self.gasto = json.loads(self.arquivo.read_text()) if self.arquivo and self.arquivo.exists() else {}
+        self.espera = espera or wait_exponential_jitter(initial=1, max=60)
+
+    def _debitar(self, custo: int) -> None:
+        dia = datetime.now(PT).date().isoformat()
+        if self.gasto.get(dia, 0) + custo > self.limite:
+            raise CotaEsgotada(f"limite local de {self.limite} unidades atingido em {dia} (PT)")
+        self.gasto[dia] = self.gasto.get(dia, 0) + custo
+        if self.arquivo:
+            self.arquivo.write_text(json.dumps(self.gasto))
+
+    def chamar(self, req, custo: int = 1) -> dict:
+        @retry(retry=retry_if_exception(transitorio), wait=self.espera,
+               stop=stop_after_attempt(5), reraise=True)
+        def uma_vez():
+            self._debitar(custo)  # toda requisição custa, inclusive as que falham
+            return req.execute()
+
+        try:
+            return uma_vez()
+        except HttpError as e:
+            if motivo(e) == "quotaExceeded":
+                raise CotaEsgotada("a API respondeu quotaExceeded") from e
+            raise
+```
+
+O limite local de 9.000 unidades deixa margem para chamadas manuais e para a sua curadoria no mesmo dia. O arquivo `cota.json` faz o contador sobreviver entre execuções.
+
+---
+
+## Etapa 2: da playlist de uploads aos detalhes
+
+```python
+# coletor.py, etapa 2: da playlist de uploads aos IDs dos vídeos
+def playlist_uploads(channel_id: str) -> str:
+    """UC... (canal) -> UU... (playlist de uploads). O oficial é ler
+    contentDetails.relatedPlaylists.uploads; este atalho dá o mesmo valor."""
+    if not channel_id.startswith("UC"):
+        raise ValueError(f"channel_id inesperado: {channel_id}")
+    return "UU" + channel_id[2:]
+
+
+def listar_ids(cli, playlist_id: str, conhecidos=frozenset(), max_paginas=None) -> list[str]:
+    """Pagina a playlist (50 itens por página, 1 unidade por página).
+
+    Coleta incremental: para quando uma página inteira já é conhecida.
+    A ordem (mais novo primeiro) é o comportamento observado, não um contrato:
+    faça uma varredura completa de vez em quando (conhecidos=frozenset()).
+    """
+    ids, token, paginas = [], None, 0
+    while True:
+        req = cli.yt.playlistItems().list(
+            part="contentDetails", playlistId=playlist_id, maxResults=50, pageToken=token
+        )
+        resp = cli.chamar(req)
+        paginas += 1
+        pagina = [it["contentDetails"]["videoId"] for it in resp.get("items", [])]
+        ids += [v for v in pagina if v not in conhecidos]
+        token = resp.get("nextPageToken")
+        tudo_conhecido = bool(pagina) and all(v in conhecidos for v in pagina)
+        if not token or tudo_conhecido or (max_paginas and paginas >= max_paginas):
+            return ids
+
+
+PARTES = "snippet,contentDetails,statistics,player"
+
+
+def buscar_videos(cli, ids: list[str]) -> list[dict]:
+    """videos.list em lotes de 50 IDs: 1 unidade por lote.
+    `player` + maxHeight faz a API devolver embedWidth/embedHeight (proporção)."""
+    itens = []
+    for i in range(0, len(ids), 50):
+        req = cli.yt.videos().list(part=PARTES, id=",".join(ids[i : i + 50]), maxHeight=1080)
+        itens += cli.chamar(req).get("items", [])  # removidos/privados simplesmente não voltam
+    return itens
+```
+
+A parada incremental economiza quase toda a paginação nos dias seguintes: se os 50 IDs mais recentes já estão na base, o resto também está. Como essa ordem não é garantida pela documentação, faça uma varredura completa uma vez por semana.
+
+---
+
+## Etapa 3: um item da API vira uma linha
+
+Esta é a função mais importante do coletor, e a mais fácil de testar, porque não chama a rede. Três detalhes que costumam passar batido: a API manda números **como string**; `likeCount` **some** da resposta quando o canal oculta as curtidas (e ausente não é zero); e `publishedAt` vem em UTC com o sufixo `Z`.
+
+```python
+# coletor.py, etapa 3: um item da API -> uma linha da base
+from datetime import datetime, timezone
+
+import isodate
+
+MUDOU_PARA_3_MIN = datetime(2024, 10, 15, tzinfo=timezone.utc)  # antes: Shorts até 60 s
+
+
+def _int(valor):
+    return None if valor is None else int(valor)  # a API manda números como string
+
+
+def parse_video(item: dict, coletado_em: datetime) -> dict:
+    sn = item["snippet"]
+    cd = item.get("contentDetails", {})
+    st = item.get("statistics", {})
+    pl = item.get("player", {})
+    publicado = datetime.fromisoformat(sn["publishedAt"].replace("Z", "+00:00"))
+    duracao = isodate.parse_duration(cd.get("duration", "P0D")).total_seconds()
+
+    w, h = int(pl.get("embedWidth") or 0), int(pl.get("embedHeight") or 0)
+    vertical = (h >= w) if (w and h) else None  # quadrado conta; None = desconhecido
+    # +1 s de folga: a doc avisa que a duração pode diferir em ~1 s da real
+    limite = (180 if publicado >= MUDOU_PARA_3_MIN else 60) + 1
+
+    return {
+        "video_id": item["id"],
+        "channel_id": sn["channelId"],
+        "published_at": publicado,
+        "title": sn.get("title", ""),
+        "description": sn.get("description", ""),
+        "tags": sn.get("tags", []),
+        "category_id": sn.get("categoryId"),
+        "audio_lang": sn.get("defaultAudioLanguage"),
+        "duration_s": duracao,
+        "vertical": vertical,
+        "is_short": 0 < duracao <= limite and vertical is not False,
+        "views": _int(st.get("viewCount")),
+        "likes": _int(st.get("likeCount")),  # ausente = curtidas ocultas -> None, nunca 0
+        "comments": _int(st.get("commentCount")),
+        "age_days": (coletado_em - publicado).total_seconds() / 86_400,
+        "collected_at": coletado_em,
+    }
+```
+
+A idade (`age_days`) é calculada **no momento da coleta** e vai junto com o snapshot. É ela que decide, depois, se a linha pode virar rótulo.
+
+---
+
+## Etapa 4: persistência idempotente
+
+A base tem duas tabelas com papéis diferentes. `videos` guarda o que descreve o Short (título, duração, canal) e é atualizada por **upsert**. `snapshots` guarda as estatísticas **com a data da coleta**, uma linha por vídeo por dia. Rodar o coletor duas vezes no mesmo dia não duplica nada; rodar em dias diferentes cria a série temporal de cada Short.
+
+```python
+# coletor.py, etapa 4: persistência idempotente (DuckDB) e exportação (Parquet)
+import duckdb
+import pandas as pd
+
+DDL = """
+CREATE TABLE IF NOT EXISTS videos (
+    video_id VARCHAR PRIMARY KEY, channel_id VARCHAR, published_at TIMESTAMPTZ,
+    title VARCHAR, description VARCHAR, tags VARCHAR[], category_id VARCHAR,
+    audio_lang VARCHAR, duration_s DOUBLE, vertical BOOLEAN, is_short BOOLEAN,
+    first_seen_at TIMESTAMPTZ, updated_at TIMESTAMPTZ);
+CREATE TABLE IF NOT EXISTS snapshots (
+    video_id VARCHAR, collected_date DATE, collected_at TIMESTAMPTZ,
+    views BIGINT, likes BIGINT, comments BIGINT, age_days DOUBLE,
+    PRIMARY KEY (video_id, collected_date));
+"""
+
+
+def abrir_base(caminho: str = "shorts.duckdb") -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(caminho)
+    con.execute("SET TimeZone = 'UTC'")  # datas de snapshot sempre em UTC
+    con.execute(DDL)
+    return con
+
+
+def salvar(con, linhas: list[dict]) -> None:
+    """Upsert por video_id; um snapshot de estatísticas por vídeo por dia.
+    Rodar duas vezes no mesmo dia não duplica nada."""
+    if not linhas:
+        return
+    con.register("novos", pd.DataFrame(linhas))
+    con.execute("""
+        INSERT INTO videos
+        SELECT video_id, channel_id, published_at, title, description, tags, category_id,
+               audio_lang, duration_s, vertical, is_short, collected_at, collected_at
+        FROM novos
+        ON CONFLICT (video_id) DO UPDATE SET
+            title = excluded.title, description = excluded.description,
+            tags = excluded.tags, updated_at = excluded.updated_at""")
+    con.execute("""
+        INSERT INTO snapshots
+        SELECT video_id, CAST(collected_at AS DATE), collected_at, views, likes, comments, age_days
+        FROM novos WHERE is_short
+        ON CONFLICT (video_id, collected_date) DO UPDATE SET
+            collected_at = excluded.collected_at, views = excluded.views,
+            likes = excluded.likes, comments = excluded.comments, age_days = excluded.age_days""")
+    con.unregister("novos")
+
+
+def exportar_rotulados(con, destino: str = "shorts_rotulados.parquet", idade_min: int = 30) -> int:
+    """Um rótulo por Short: o primeiro snapshot com pelo menos `idade_min` dias."""
+    con.execute(f"""
+        COPY (
+            SELECT v.*, s.likes, s.views, s.comments, s.age_days, s.collected_at
+            FROM videos v JOIN snapshots s USING (video_id)
+            WHERE v.is_short AND s.age_days >= {int(idade_min)}
+            QUALIFY row_number() OVER (PARTITION BY video_id ORDER BY s.age_days) = 1
+        ) TO '{destino}' (FORMAT parquet)""")
+    return con.execute(f"SELECT count(*) FROM '{destino}'").fetchone()[0]
+```
+
+Por que DuckDB? É um arquivo só, fala SQL, tem `ON CONFLICT` para o upsert e lê e escreve Parquet nativamente. O Parquet exportado é o que os módulos seguintes consomem. Se preferir só Parquet, particione os snapshots por `collected_date` e deduplique ao ler; o importante é que a chave `(video_id, data da coleta)` seja única.
+
+---
+
+## Etapa 5: orquestração e coleta incremental
+
+```python
+# coletor.py, etapa 5: orquestração e coleta incremental
+# requer YOUTUBE_API_KEY
+import os
+import sys
+from datetime import datetime, timezone
+
+import pandas as pd
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+def coletar_canal(cli, con, channel_id: str) -> int:
+    """Descobre vídeos novos do canal e grava metadados + snapshot de hoje."""
+    conhecidos = {r[0] for r in con.execute(
+        "SELECT video_id FROM videos WHERE channel_id = ?", [channel_id]).fetchall()}
+    try:
+        novos = listar_ids(cli, playlist_uploads(channel_id), frozenset(conhecidos))
+    except HttpError as e:
+        if e.status_code == 404:  # playlist de uploads inexistente (canal sem vídeos)
+            return 0
+        raise
+    agora = datetime.now(timezone.utc)
+    salvar(con, [parse_video(it, agora) for it in buscar_videos(cli, novos)])
+    return len(novos)
+
+
+def atualizar_snapshots(cli, con, idade_max: int = 60) -> int:
+    """Re-coleta estatísticas dos Shorts ainda 'jovens' (1 unidade a cada 50)."""
+    ids = [r[0] for r in con.execute("""
+        SELECT video_id FROM videos
+        WHERE is_short AND published_at >= now() - to_days(?)
+          AND video_id NOT IN (SELECT video_id FROM snapshots WHERE collected_date = current_date)
+    """, [idade_max]).fetchall()]
+    agora = datetime.now(timezone.utc)
+    salvar(con, [parse_video(it, agora) for it in buscar_videos(cli, ids)])
+    return len(ids)
+
+
+if __name__ == "__main__":
+    yt = build("youtube", "v3", developerKey=os.environ["YOUTUBE_API_KEY"])
+    cli, con = Cliente(yt), abrir_base()
+    canais = pd.read_csv("canais_resolvidos.csv")["channel_id"].tolist()
+    try:
+        for cid in canais:
+            print(cid, coletar_canal(cli, con, cid), "vídeos novos")
+        print(atualizar_snapshots(cli, con), "snapshots atualizados")
+    except CotaEsgotada as e:
+        print("Parando por hoje:", e, file=sys.stderr)  # rode de novo amanhã: é idempotente
+    print("rotulados:", exportar_rotulados(con))
+    print("unidades gastas hoje:", cli.gasto)
+```
+
+Quando a cota acaba, o coletor para com uma mensagem e sai sem corromper nada. No dia seguinte, a mesma linha de comando continua de onde parou, porque tudo é idempotente. Para agendar, um `cron` local basta, por exemplo às 05h de Brasília, depois da virada da cota:
+
+```bash
+# crontab -e   (o cron não herda o seu PATH: use o caminho completo do uv, veja `which uv`)
+# .env contém YOUTUBE_API_KEY=... e está no .gitignore
+0 5 * * * cd ~/galaxies && set -a && . ./.env && /caminho/do/uv run python coletor.py >> coleta.log 2>&1
+```
+
+---
+
+## Etapa 6: testes que rodam sem chave
+
+Os testes substituem o cliente oficial por um objeto que devolve respostas **no mesmo formato JSON da API** (os campos e tipos seguem a documentação dos recursos `video` e `playlistItem`). Assim você testa paginação, lotes, idempotência, retries e parada por cota sem gastar uma unidade.
+
+```python
+# test_coletor.py: roda SEM chave, com respostas no formato real da API
+from datetime import datetime, timezone
+
+import httplib2
+import pytest
+from googleapiclient.errors import HttpError
+from tenacity import wait_none
+
+from coletor import CotaEsgotada, Cliente, abrir_base, coletar_canal, parse_video, salvar
+
+AGORA = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
+
+
+def video(vid, publicado, dur, likes="2410", w="608", h="1080"):
+    item = {
+        "kind": "youtube#video", "id": vid,
+        "snippet": {"publishedAt": publicado, "channelId": "UCabc123LuminaBeauty0000",
+                    "title": "1 produto, 20 segundos", "description": "Base nova #shorts",
+                    "tags": ["maquiagem"], "categoryId": "26", "defaultAudioLanguage": "pt-BR"},
+        "contentDetails": {"duration": dur, "definition": "hd", "caption": "false"},
+        "statistics": {"viewCount": "81234", "likeCount": likes,
+                       "favoriteCount": "0", "commentCount": "57"},
+        "player": {"embedHtml": "<iframe ...></iframe>", "embedWidth": w, "embedHeight": h},
+    }
+    if likes is None:
+        del item["statistics"]["likeCount"]  # canal escondeu as curtidas
+    return item
+
+
+def test_parse_short_vertical():
+    r = parse_video(video("v1", "2026-08-01T22:00:05Z", "PT22S"), AGORA)
+    assert r["is_short"] and r["duration_s"] == 22 and r["likes"] == 2410
+    assert round(r["age_days"]) == 57
+
+
+def test_curtidas_ocultas_viram_nulo():
+    assert parse_video(video("v2", "2026-08-01T22:00:05Z", "PT55S", likes=None), AGORA)["likes"] is None
+
+
+def test_horizontal_ou_longo_nao_e_short():
+    assert not parse_video(video("v3", "2026-08-01T22:00:05Z", "PT50S", w="1920", h="1080"), AGORA)["is_short"]
+    assert not parse_video(video("v4", "2026-08-01T22:00:05Z", "PT15M51S"), AGORA)["is_short"]
+    # antes de 15/10/2024 o limite era 60 s
+    assert not parse_video(video("v5", "2024-05-01T10:00:00Z", "PT1M30S"), AGORA)["is_short"]
+```
+
+```python
+# test_coletor.py (continuação)
+class Req:
+    def __init__(self, fn): self.fn = fn
+    def execute(self): return self.fn()
+
+
+class FakeYT:
+    """Imita yt.playlistItems().list(...).execute() e yt.videos().list(...).execute()."""
+    def __init__(self, paginas, itens):
+        self.paginas, self.itens, self.chamadas = paginas, itens, 0
+    def playlistItems(self): return self
+    def videos(self): return self
+    def list(self, **kw):
+        self.chamadas += 1
+        if "playlistId" in kw:
+            return Req(lambda: self.paginas[kw.get("pageToken") or "p0"])
+        return Req(lambda: {"items": [self.itens[i] for i in kw["id"].split(",")]})
+
+
+def pagina(ids, prox=None):
+    resp = {"kind": "youtube#playlistItemListResponse",
+            "items": [{"kind": "youtube#playlistItem", "contentDetails":
+                       {"videoId": v, "videoPublishedAt": "2026-08-01T22:00:05Z"}} for v in ids]}
+    if prox:
+        resp["nextPageToken"] = prox
+    return resp
+
+
+def test_coleta_idempotente_e_incremental(tmp_path):
+    ids = [f"v{i:02d}" for i in range(60)]
+    itens = {v: video(v, "2026-08-01T22:00:05Z", "PT22S") for v in ids}
+    yt = FakeYT({"p0": pagina(ids[:50], "p1"), "p1": pagina(ids[50:])}, itens)
+    cli, con = Cliente(yt, arquivo=None), abrir_base(str(tmp_path / "t.duckdb"))
+    assert coletar_canal(cli, con, "UCabc123LuminaBeauty0000") == 60
+    assert yt.chamadas == 2 + 2  # 2 páginas + 2 lotes de videos.list
+    assert coletar_canal(cli, con, "UCabc123LuminaBeauty0000") == 0  # nada novo
+    assert con.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 60
+
+
+def erro(status, reason):
+    corpo = f'{{"error": {{"code": {status}, "errors": [{{"reason": "{reason}"}}]}}}}'
+    return HttpError(httplib2.Response({"status": status}), corpo.encode())
+
+
+def test_retry_em_erro_transitorio_e_para_na_cota():
+    respostas = [erro(503, "backendError"), {"items": []}]
+    def fn():
+        r = respostas.pop(0)
+        if isinstance(r, Exception): raise r
+        return r
+    cli = Cliente(None, arquivo=None, espera=wait_none())
+    assert cli.chamar(Req(fn)) == {"items": []}
+    assert sum(cli.gasto.values()) == 2  # a tentativa que falhou também custou
+    def estoura(): raise erro(403, "quotaExceeded")
+    with pytest.raises(CotaEsgotada):
+        cli.chamar(Req(estoura))
+    with pytest.raises(CotaEsgotada):
+        Cliente(None, limite=0, arquivo=None).chamar(Req(lambda: {}))
+```
+
+```bash
+uv run pytest -q test_coletor.py
+# .....                                                   [100%]
+# 5 passed
+```
+
+:::tip[Leia TIMESTAMPTZ com `.df()`]
+Buscar colunas `TIMESTAMPTZ` do DuckDB com `fetchall()` exige o pacote `pytz`, que não está no ambiente do módulo. Use `.df()` (vira `datetime64[us, UTC]` no pandas) ou selecione só colunas de texto e número, como o coletor faz.
+:::
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+O coletor não vai ver os Shorts A e B: eles ainda não foram publicados. O que ele coleta é o **contexto** que o modelo usa para pontuá-los:
+
+- **O histórico do canal.** No módulo 6, a tool de histórico do agente reutiliza `listar_ids`, `buscar_videos` e `parse_video` para buscar os Shorts recentes de um canal no momento da pergunta. Escrever essas funções bem agora é escrever metade daquela tool.
+- **A duração e a orientação.** O A tem 55 s e o B, 22 s; os dois são verticais, então ambos passam na regra de Short. Se a Lumina subisse uma versão horizontal do tutorial, ela seria um vídeo comum, e o modelo treinado em Shorts não deveria pontuá-la.
+- **Os nulos.** Se a Lumina ocultasse as curtidas, a tool de histórico receberia `likes` nulos: não haveria mediana do canal para o alvo relativo, e o agente precisaria dizer isso em vez de inventar uma.
+
+Para a Garagem 22, vale o mesmo: um POV de direção de 2 min 50 s ainda é Short (menos de 3 min); com 3 min 10 s, não é.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Listar vídeos com `search.list`.** É o bucket errado (100 chamadas/dia) e tem teto de 500 vídeos por canal. Vídeos vêm da playlist de uploads.
+2. **Insistir em `quotaExceeded`.** Retry com backoff não traz a cota de volta; só gasta tempo e faz o script parecer travado. Pare e retome no dia seguinte.
+3. **Transformar curtida ausente em zero.** `likeCount` ausente é "oculto", não "ninguém curtiu". Zero vira um alvo falso e puxa o modelo para baixo.
+4. **Anexar em vez de fazer upsert.** CSV com `append` duplica tudo a cada reexecução. A chave `(video_id, data da coleta)` precisa ser única.
+5. **Não guardar `collected_at` nem `age_days`.** Sem eles, você não sabe se um rótulo tem 5 ou 500 dias.
+6. **Confiar no truque não documentado como fonte de verdade.** `UUSH` e o redirect podem mudar amanhã; a regra de duração e orientação está na documentação.
+:::
+
+<Quiz
+  id="m1-a5"
+  perguntas={[
+    {
+      pergunta: 'Qual é o custo, em unidades, de detalhar 1.230 vídeos com `videos.list`?',
+      opcoes: [
+        {texto: '1.230 unidades, uma por vídeo.', explicacao: 'videos.list aceita até 50 IDs por chamada, e cada chamada custa 1 unidade.'},
+        {texto: '25 unidades.', correta: true, explicacao: 'São 25 lotes de até 50 IDs (24 cheios e 1 com 30), a 1 unidade cada.'},
+        {texto: '100 unidades por vídeo, como a busca.', explicacao: 'Esse era o custo do search.list antes de 01/06/2026; videos.list custa 1 unidade por chamada.'},
+      ],
+    },
+    {
+      pergunta: 'A API respondeu 403 com reason `quotaExceeded`. O que o coletor deve fazer?',
+      opcoes: [
+        {texto: 'Tentar de novo com backoff exponencial até conseguir.', explicacao: 'A cota só zera à meia-noite do Pacífico; as novas tentativas vão falhar e não adiantam nada.'},
+        {texto: 'Parar com uma mensagem clara e retomar no próximo dia de cota; como é idempotente, nada se perde.', correta: true, explicacao: 'É o que a exceção CotaEsgotada faz no coletor desta aula.'},
+        {texto: 'Trocar para search.list, que tem outro bucket.', explicacao: 'O bucket de busca é minúsculo e a busca não substitui a listagem de uploads.'},
+      ],
+    },
+    {
+      pergunta: 'Um vídeo vertical de 1 min 30 s foi publicado em maio de 2024. Pela regra documentada, ele é Short?',
+      opcoes: [
+        {texto: 'Sim, porque tem menos de 3 minutos.', explicacao: 'O limite de 3 minutos vale para vídeos enviados a partir de 15/10/2024.'},
+        {texto: 'Não, porque antes de 15/10/2024 o limite era de 60 segundos.', correta: true, explicacao: 'Por isso o coletor usa limite de 60 s (mais 1 s de folga) para vídeos anteriores à mudança.'},
+        {texto: 'Só dá para saber com o redirect de /shorts/.', explicacao: 'O redirect é um truque não documentado e conflita com a proibição de scraping; a regra documentada resolve este caso.'},
+      ],
+    },
+    {
+      pergunta: 'O que garante que rodar o coletor duas vezes no mesmo dia não duplica dados? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'A chave primária de videos em video_id, com upsert.', correta: true, explicacao: 'Metadados são atualizados em vez de duplicados.'},
+        {texto: 'A chave primária de snapshots em (video_id, collected_date).', correta: true, explicacao: 'Só existe um snapshot por vídeo por dia; o segundo sobrescreve o primeiro.'},
+        {texto: 'O retry com backoff do tenacity.', explicacao: 'O retry lida com erros transitórios, não com duplicação de dados.'},
+        {texto: 'A parada incremental quando uma página inteira já é conhecida.', explicacao: 'Ela economiza cota, mas a garantia contra duplicação vem das chaves e do upsert.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: amplie a suíte de testes]
+Escreva um arquivo `test_exercicio.py` com três testes que rodem sem chave, reaproveitando `video`, `FakeYT` e `AGORA` de `test_coletor.py`:
+
+1. Uma transmissão ao vivo agendada, que a API devolve com `duration` igual a `P0D`, **não** é Short.
+2. Um vídeo de 40 s **sem** a parte `player` tem `vertical` nulo e continua sendo Short provável.
+3. Uma playlist cuja primeira página vem vazia termina sem erro, com uma única chamada.
+
+Depois, rode o coletor de verdade num canal pequeno da sua planilha e compare o número de Shorts prováveis com o que você vê na aba "Shorts" do canal.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+# test_exercicio.py: três casos a mais para a suíte
+from datetime import datetime, timezone
+
+from coletor import Cliente, listar_ids, parse_video
+from test_coletor import AGORA, FakeYT, video
+
+
+def test_live_agendada_nao_e_short():
+    item = video("v6", "2026-08-01T22:00:05Z", "P0D")  # lives agendadas vêm com P0D
+    assert not parse_video(item, AGORA)["is_short"]
+
+
+def test_sem_player_proporcao_desconhecida():
+    item = video("v7", "2026-08-01T22:00:05Z", "PT40S")
+    del item["player"]
+    r = parse_video(item, AGORA)
+    assert r["vertical"] is None and r["is_short"]  # "provável": confira por amostragem
+
+
+def test_playlist_vazia():
+    yt = FakeYT({"p0": {"kind": "youtube#playlistItemListResponse", "items": []}}, {})
+    assert listar_ids(Cliente(yt, arquivo=None), "UUabc123LuminaBeauty0000") == []
+    assert yt.chamadas == 1
+```
+
+```bash
+uv run pytest -q test_coletor.py test_exercicio.py
+# 8 passed
+```
+
+O segundo teste documenta uma decisão: sem orientação conhecida, o vídeo é tratado como Short provável. Se na sua checagem manual muitos desses forem horizontais, mude a regra para exigir `vertical is True` e registre a mudança no data card.
+
+</details>
+
+---
+
+## Resumo
+
+- Caminho barato: **playlist de uploads → `playlistItems.list` → `videos.list`**, 1 unidade por chamada de até 50 itens. Uma coleta completa de 60 canais custa cerca de **780 unidades**.
+- Não existe `isShort`: use **duração** (3 min desde 15/10/2024, 60 s antes) e **orientação** via `player.embedWidth/embedHeight`. `UUSH` e o redirect são **truques não oficiais**.
+- `likeCount` ausente é **nulo**, nunca zero; números vêm como string; datas vêm em UTC.
+- Persistência **idempotente**: upsert em `videos` e **snapshots** por `(video_id, data da coleta)`; o rótulo é o primeiro snapshot com **30+ dias**.
+- **Retries** só para erros transitórios; **`quotaExceeded`** para a coleta, e o contador local evita chegar lá.
+
+## Referências
+
+- Google. [`playlistItems.list`](https://developers.google.com/youtube/v3/docs/playlistItems/list), [`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list) e o recurso [`videos`](https://developers.google.com/youtube/v3/docs/videos) (duração ISO 8601, `player.embedHeight`, `statistics`).
+- Google. [Quota Calculator](https://developers.google.com/youtube/v3/determine_quota_cost) e [Implementation: Videos](https://developers.google.com/youtube/v3/guides/implementation/videos).
+- YouTube Help. [Understand three-minute YouTube Shorts](https://support.google.com/youtube/answer/15424877): a regra de 3 minutos a partir de 15/10/2024.
+- Google. [YouTube API Services: Developer Policies](https://developers.google.com/youtube/terms/developer-policies), seção III.E.6 (scraping).
+- [Tenacity](https://tenacity.readthedocs.io/en/latest/), [isodate no PyPI](https://pypi.org/project/isodate/), [DuckDB: `INSERT ... ON CONFLICT`](https://duckdb.org/docs/stable/sql/statements/insert.html) e [google-api-python-client](https://github.com/googleapis/google-api-python-client).
+
+**Próxima aula:** [Engajamento é cauda longa](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa): por que a média engana, o que o `log1p` resolve e como construir o alvo relativo ao canal sem vazar o futuro.

@@ -1,0 +1,445 @@
+---
+sidebar_position: 6
+sidebar_label: 'Detectores leves: rosto, texto e objetos'
+title: 'Detectores leves: rosto, texto e objetos'
+description: 'Rosto com MediaPipe Tasks, texto na tela com PaddleOCR e objetos por setor com OWLv2: features objetivas, baratas e que servem para conferir o VLM.'
+tags: [ml-preditivo, multimodal, visao]
+---
+
+# Detectores Leves: Rosto, Texto e Objetos Sem Pedir Opinião a Ninguém
+
+<LessonMeta
+  tempo="50 min"
+  semana={2}
+  etapa="multimodal"
+  objetivos={[
+    'Detectar rostos com a Tasks API do MediaPipe 1.0 e medir close-up pela área do rosto',
+    'Ler o texto na tela com PaddleOCR e filtrar falsos positivos',
+    'Detectar objetos de cada setor com OWLv2 (vocabulário aberto) e entender a questão de licença do YOLO',
+    'Agregar detecções por frame em colunas det_* e usá-las para conferir o VLM',
+  ]}
+  prerequisitos={[
+    {label: 'Frames, cortes e sinais de baixo nível', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais'},
+    {label: 'Embeddings visuais: CLIP e SigLIP 2', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais'},
+  ]}
+/>
+
+Pergunte a um <Termo id="vlm">VLM</Termo> se um Short "tem rosto nos primeiros 3 segundos" e ele responde, com convicção. Pergunte de novo, com a temperatura em zero, e ele provavelmente responde igual. Mas você não sabe **quantas vezes** ele erra, e quando a base tiver 3.000 vídeos não haverá tempo de assistir a todos para conferir.
+
+Existe uma classe de perguntas sobre um vídeo que não precisa de opinião nenhuma: há um rosto neste frame? Quanto do quadro ele ocupa? Há texto escrito? O que está escrito? Há um carro, um batom, um vestido? Para essas, modelos pequenos e especializados respondem em milissegundos, de forma determinística, com uma caixa delimitadora que você pode desenhar por cima do frame e verificar.
+
+Esta aula monta três desses **detectores leves** e transforma as detecções em colunas `det_*`. Eles têm dois papéis: entram no modelo como features objetivas e servem de **régua para o VLM** da próxima aula. Quando o detector e o VLM discordam, um dos dois está errado, e você quer saber qual antes de treinar.
+
+:::info[A ideia central]
+Detector responde **"existe e onde está"**; VLM responde **"o que significa"**. Rosto, texto e objetos são perguntas de detector: mais baratas, reprodutíveis e verificáveis. Guarde o VLM para o que só ele consegue julgar (força do gancho, clareza do benefício, tom), e use os detectores para medir a confiabilidade dele nas perguntas em que os dois se sobrepõem.
+:::
+
+---
+
+## O pipeline em uma figura
+
+<Sketch name="m4/a6-detectores" alt="Os keyframes do vídeo, da aula 4.3 (três no gancho e cinco no resto), passam por três detectores: MediaPipe FaceDetector (rosto, quantidade, área), PaddleOCR PP-OCRv6 (texto, área, texto no gancho) e OWLv2 com vocabulário aberto (consultas como a lipstick, a car, a dress). As saídas convergem numa agregação por vídeo com colunas det_*: porcentagem de frames com rosto, área máxima do rosto, área média de texto e score máximo por objeto. A agregação e as respostas do VLM da aula 4.7 alimentam uma caixa de concordância detector versus VLM, medida por kappa. Uma nota avisa que o Ultralytics YOLO é AGPL-3.0." caption="Os mesmos keyframes da aula 4.3 alimentam os três detectores." />
+
+Os frames vêm de `instantes_amostragem` e `extrair_frames`, da [aula 4.3](/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais): três instantes dentro do gancho (`gancho_0` a `gancho_2`) e cinco espalhados pelo resto (`uniforme_0` a `uniforme_4`), em RGB com 360 px de largura. Todas as funções abaixo recebem esse formato.
+
+<CardGrid>
+  <ToolCard nome="MediaPipe" versao="1.0.1" licenca="Apache-2.0" custo="grátis (local)" papel="Detector de rosto BlazeFace pela Tasks API. Modelo de 224 KB, roda em CPU." link="https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector/python" alerta="A 1.0 removeu mp.solutions. Tutoriais antigos com mp.solutions.face_detection não funcionam mais." />
+  <ToolCard nome="PaddleOCR" versao="3.7.0" licenca="Apache-2.0" custo="grátis (local)" papel="OCR com detecção e reconhecimento; lang='pt' seleciona os modelos PP-OCRv6." link="https://github.com/PaddlePaddle/PaddleOCR" alerta="Instala o paddlepaddle (cerca de 400 MB). O EasyOCR, alternativa comum, está sem release desde set/2024." />
+  <ToolCard nome="OWLv2" versao="owlv2-base-patch16-ensemble" licenca="Apache-2.0" custo="grátis (local)" papel="Detecção com vocabulário aberto: você descreve a classe em texto." link="https://huggingface.co/google/owlv2-base-patch16-ensemble" alerta="Pesado para CPU: cerca de 6 s por frame no nosso teste. Rode em poucos frames ou na T4." />
+</CardGrid>
+
+---
+
+## Rosto: MediaPipe pela Tasks API
+
+O MediaPipe 1.0 removeu o antigo `mp.solutions`: `hasattr(mediapipe, "solutions")` devolve `False`. A detecção de rosto agora passa pela **Tasks API**, que recebe um arquivo de modelo explícito.
+
+```python
+import mediapipe as mp
+import numpy as np
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import FaceDetector, FaceDetectorOptions, RunningMode
+
+# modelo de 224 KB; baixe uma vez:
+# curl -LO https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite
+detector_rosto = FaceDetector.create_from_options(FaceDetectorOptions(
+    base_options=BaseOptions(model_asset_path="blaze_face_short_range.tflite"),
+    running_mode=RunningMode.IMAGE,
+    min_detection_confidence=0.5,
+))
+
+
+def rostos_no_frame(rgb: np.ndarray) -> dict:
+    """rgb: frame em RGB, como devolve extrair_frames (aula 4.3)."""
+    h, w = rgb.shape[:2]
+    imagem = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    deteccoes = detector_rosto.detect(imagem).detections
+    areas = [d.bounding_box.width * d.bounding_box.height / (w * h) for d in deteccoes]
+    return {"n_rostos": len(deteccoes), "area_maior_rosto": max(areas, default=0.0)}
+
+
+if __name__ == "__main__":
+    from PIL import Image
+    ast = np.array(Image.open("astronaut.png").convert("RGB"))   # foto da NASA, domínio público
+    testes = {"astronauta": ast, "cafe": np.array(Image.open("coffee.png").convert("RGB")),
+              "close (recorte 9:16)": ast[20:260, 150:285]}
+    for nome, img in testes.items():
+        r = rostos_no_frame(img)
+        print(f"{nome:22s} rostos={r['n_rostos']}  área do maior={r['area_maior_rosto']:.3f}")
+```
+
+```text
+astronauta             rostos=1  área do maior=0.034
+cafe                   rostos=0  área do maior=0.000
+close (recorte 9:16)   rostos=1  área do maior=0.315
+```
+
+As imagens de teste são as amostras `astronaut.png` (foto da NASA, domínio público) e `coffee.png` (CC0) do scikit-image. O mesmo rosto ocupa 3,4% do quadro na foto inteira e 31,5% no recorte vertical: é assim que `area_maior_rosto` separa **plano aberto** de **close-up**, sem nenhuma rubrica. O modelo `short_range` é otimizado, segundo a documentação, para imagens tipo selfie da câmera frontal, a curta distância: o caso típico de Shorts de beleza. Para planos abertos (look de corpo inteiro, carro com motorista ao fundo), existe o `blaze_face_full_range.tflite`, na mesma pasta de modelos.
+
+:::warning[Rodamos isto no Linux, não no macOS]
+No macOS com Apple Silicon, o `FaceDetector` do mediapipe 1.0.1 abortou no nosso teste com `Check failed: service_ Service is unavailable` (vindo de um helper de Metal), mesmo com `delegate=BaseOptions.Delegate.CPU`. A saída acima veio de um contêiner Linux (`python:3.12-slim`), que precisou dos pacotes de sistema `libegl1`, `libgles2` e `libgl1`, e da troca de `opencv-contrib-python` por `opencv-contrib-python-headless`. No Colab esses pacotes já existem.
+:::
+
+---
+
+## Texto na tela: PaddleOCR
+
+O texto sobreposto é um dos elementos mais característicos de Shorts: título grande no gancho, lista de passos, preço. Três colunas bastam: **se** há texto, **quanto** do quadro ele ocupa e **o que** diz.
+
+```python
+import numpy as np
+from paddleocr import PaddleOCR
+
+# lang="pt" seleciona os modelos PP-OCRv6 (detecção + reconhecimento latino)
+ocr = PaddleOCR(
+    lang="pt",
+    use_doc_orientation_classify=False,   # frame de vídeo não é documento escaneado
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+)
+
+
+def texto_no_frame(rgb: np.ndarray, conf_min: float = 0.8) -> dict:
+    h, w = rgb.shape[:2]
+    res = ocr.predict(np.ascontiguousarray(rgb[:, :, ::-1]))[0]   # PaddleOCR espera BGR
+    # descarta leituras de baixa confiança e "textos" de 1 caractere (falsos positivos)
+    ok = [i for i, (t, s) in enumerate(zip(res["rec_texts"], res["rec_scores"]))
+          if s >= conf_min and sum(c.isalnum() for c in t) >= 2]
+    caixas = np.asarray(res["rec_boxes"], dtype=float).reshape(-1, 4)[ok]  # vem como int16
+    area = float(((caixas[:, 2] - caixas[:, 0]) * (caixas[:, 3] - caixas[:, 1])).sum() / (h * w))
+    return {
+        "texto": " ".join(res["rec_texts"][i] for i in ok),
+        "n_linhas": len(ok),
+        "area_texto": area,               # fração do frame coberta por texto
+    }
+
+
+if __name__ == "__main__":
+    from PIL import Image
+    for nome in ["frame_texto.png", "coffee.png"]:
+        r = texto_no_frame(np.array(Image.open(nome).convert("RGB")))
+        print(nome, {k: round(v, 3) if isinstance(v, float) else v for k, v in r.items()})
+```
+
+```text
+frame_texto.png {'texto': '1 PRODUTO, 20 SEGUNDOS Base Lumina: pele natural jø', 'n_linhas': 3, 'area_texto': 0.113}
+coffee.png {'texto': '', 'n_linhas': 0, 'area_texto': 0.0}
+```
+
+O `frame_texto.png` é um quadro 9:16 sintético com "1 PRODUTO, 20 SEGUNDOS" em letras grandes e um rodapé menor, "Base Lumina: pele natural já". Três detalhes que o teste revelou:
+
+1. **Acentos quebram.** "já" virou "jø". Para comparar com a transcrição (a sobreposição texto/fala da [aula 4.5](/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala)), normalize removendo acentos, como a função `_tokens` daquela aula já faz.
+2. **`rec_boxes` vem em `int16`.** Multiplicar largura por altura sem converter estoura o inteiro: na primeira versão do teste, a área saiu **negativa**.
+3. **Falsos positivos existem.** Num frame sem texto nenhum (um close do astronauta), o OCR leu um "C" cobrindo 34% do quadro. O filtro de pelo menos dois caracteres alfanuméricos resolveu esse caso; em vídeos reais, confira uma amostra.
+
+---
+
+## Objetos: vocabulário aberto e a questão da licença
+
+Detectores clássicos de objetos são treinados num conjunto fixo de classes, quase sempre as 80 do COCO. Ali há "car", "handbag" e "bottle", mas não há "batom", "pincel de maquiagem" nem "volante". Para o case, isso pesa.
+
+Há ainda a questão da **licença**. O detector mais popular, o **Ultralytics YOLO**, é **AGPL-3.0**. A AGPL exige que quem oferece o software modificado **pela rede** também ofereça o código-fonte aos usuários. Para um trabalho acadêmico com código aberto, isso pode ser aceitável; para um componente que uma empresa vai embutir num produto fechado, vira uma decisão jurídica (a Ultralytics vende uma licença comercial). Isto é contexto para discussão, não aconselhamento jurídico. Alternativas permissivas:
+
+| Modelo | Licença | Vocabulário | Quando usar |
+| :--- | :--- | :--- | :--- |
+| RT-DETR (`PekingU/rtdetr_v2_r18vd`, via transformers) | Apache-2.0 | fechado (80 classes COCO) | "car", "person", "handbag" bastam; rápido |
+| OWLv2 (`google/owlv2-base-patch16-ensemble`) | Apache-2.0 | **aberto** (você escreve a classe) | classes do setor: batom, volante, vestido |
+
+O OWLv2 recebe consultas em texto e devolve caixas com score para cada uma:
+
+```python
+import numpy as np
+import torch
+from transformers import Owlv2ForObjectDetection, Owlv2Processor
+
+MODELO = "google/owlv2-base-patch16-ensemble"      # Apache-2.0, ~620 MB
+processador = Owlv2Processor.from_pretrained(MODELO)
+owl = Owlv2ForObjectDetection.from_pretrained(MODELO).eval()
+
+# vocabulário aberto: você escreve as classes (em inglês funciona melhor)
+CONSULTAS = {
+    "batom": "a lipstick", "pincel": "a makeup brush", "frasco": "a cosmetic bottle",
+    "vestido": "a dress", "bolsa": "a handbag", "sapato": "a shoe",
+    "carro": "a car", "volante": "a steering wheel", "painel": "a car dashboard",
+}
+
+
+@torch.inference_mode()
+def objetos_no_frame(rgb: np.ndarray, consultas: dict = CONSULTAS, limiar: float = 0.1) -> dict:
+    nomes, textos = list(consultas), list(consultas.values())
+    entradas = processador(text=[textos], images=rgb, return_tensors="pt")
+    lado = max(rgb.shape[:2])            # OWLv2 faz padding até ficar quadrado
+    res = processador.post_process_grounded_object_detection(
+        owl(**entradas), threshold=limiar, target_sizes=[(lado, lado)], text_labels=[textos]
+    )[0]
+    saida = {f"obj_{n}": 0.0 for n in nomes} | {f"obj_{n}_area": 0.0 for n in nomes}
+    area_frame = rgb.shape[0] * rgb.shape[1]
+    for rotulo, score, (x1, y1, x2, y2) in zip(res["text_labels"], res["scores"].tolist(),
+                                               res["boxes"].tolist()):
+        n = nomes[textos.index(rotulo)]
+        if score > saida[f"obj_{n}"]:    # guarda a melhor caixa de cada classe
+            saida[f"obj_{n}"] = round(score, 2)
+            saida[f"obj_{n}_area"] = round((x2 - x1) * (y2 - y1) / area_frame, 3)
+    return saida
+
+
+if __name__ == "__main__":
+    from PIL import Image
+    teste = {"xicara": "a coffee cup", "rosto": "a human face", "batom": "a lipstick", "carro": "a car"}
+    for nome in ["astronaut.png", "coffee.png"]:
+        r = objetos_no_frame(np.array(Image.open(nome).convert("RGB")), consultas=teste)
+        print(nome, {k: v for k, v in r.items() if not k.endswith("_area")},
+              "| área xícara:", r["obj_xicara_area"])
+```
+
+```text
+astronaut.png {'obj_xicara': 0.0, 'obj_rosto': 0.17, 'obj_batom': 0.0, 'obj_carro': 0.0} | área xícara: 0.0
+coffee.png {'obj_xicara': 0.77, 'obj_rosto': 0.0, 'obj_batom': 0.0, 'obj_carro': 0.0} | área xícara: 0.283
+```
+
+Os scores do OWLv2 não são probabilidades calibradas, e a escala varia por classe: a xícara, óbvia, tirou 0,77; o rosto do astronauta, igualmente óbvio, só 0,17. Por isso o limiar padrão é baixo (0,1) e a coluna guardada é o **score contínuo**, não um "sim/não". No teste com o vídeo sintético abaixo, o OWLv2 viu "a steering wheel" com score 0,14 no capacete do astronauta: um falso positivo típico de scores baixos. Valide o limiar de cada classe em 20 a 30 frames rotulados à mão antes de interpretar a coluna.
+
+---
+
+## De frames para colunas: a etapa `det_*`
+
+A etapa junta tudo, com o cache da [aula 4.1](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short). O OWLv2 roda só em dois frames (um no gancho, um no meio), porque custou cerca de 6 s por frame em CPU no nosso teste; rosto e OCR rodam nos oito.
+
+```python
+import pandas as pd
+
+# cache_por_video vem da aula 4.1; instantes_amostragem, extrair_frames e duracao_s, da 4.3
+FRAMES_OWL = {"gancho_1", "uniforme_2"}      # OWLv2 é caro: só 2 frames por vídeo
+
+
+def agrega_detectores(por_frame: dict[str, dict]) -> dict:
+    """por_frame: {rótulo do instante: saída dos detectores}; 'gancho_*' = primeiros 3 s."""
+    df = pd.DataFrame.from_dict(por_frame, orient="index")
+    g = df[df.index.str.startswith("gancho")]
+    feats = {
+        "det_pct_frames_rosto": float((df["n_rostos"] > 0).mean()),
+        "det_rosto_no_gancho": bool((g["n_rostos"] > 0).any()),
+        "det_max_rostos": int(df["n_rostos"].max()),
+        "det_area_rosto_max": round(float(df["area_maior_rosto"].max()), 3),  # close-up?
+        "det_pct_frames_texto": float((df["n_linhas"] > 0).mean()),
+        "det_texto_no_gancho": bool((g["n_linhas"] > 0).any()),
+        "det_area_texto_media": round(float(df["area_texto"].mean()), 3),
+        # texto único da tela, para a sobreposição texto/fala da aula 4.5
+        "det_texto_tela": " | ".join(dict.fromkeys(t for t in df["texto"] if t)),
+    }
+    for col in [c for c in df.columns if c.startswith("obj_")]:
+        feats[f"det_{col}"] = float(df[col].max())           # max ignora os NaN
+    return feats
+
+
+@cache_por_video("detectores", versao=1)
+def etapa_detectores(video_id: str, caminho: str) -> dict:
+    frames = extrair_frames(caminho, instantes_amostragem(duracao_s(caminho)))
+    por_frame = {}
+    for rotulo, rgb in frames.items():
+        por_frame[rotulo] = {**rostos_no_frame(rgb), **texto_no_frame(rgb)}
+        if rotulo in FRAMES_OWL:
+            por_frame[rotulo] |= objetos_no_frame(rgb)
+    return agrega_detectores(por_frame)
+
+
+if __name__ == "__main__":
+    print(etapa_detectores("sint_B", "short_b_visual.mp4"))
+```
+
+```text
+{'det_pct_frames_rosto': 1.0, 'det_rosto_no_gancho': True, 'det_max_rostos': 1, 'det_area_rosto_max': 0.062,
+ 'det_pct_frames_texto': 0.375, 'det_texto_no_gancho': True, 'det_area_texto_media': 0.041,
+ 'det_texto_tela': '1 PRODUTO, 20 SEGUNDOS', 'det_obj_batom': 0.0, ..., 'det_obj_volante': 0.14, ...}
+```
+
+O `short_b_visual.mp4` é um vídeo sintético de 6 s em 360 × 640: o rosto do astronauta em plano médio o tempo todo e "1 PRODUTO, 20 SEGUNDOS" nos 3 primeiros segundos. As colunas batem com o que foi construído: rosto em 100% dos frames, texto em 3 de 8 frames (37,5%), todos no gancho.
+
+:::tip[Como este bloco foi testado]
+Como o MediaPipe não rodou no macOS, o teste foi feito por partes, com os mesmos frames: rostos no contêiner Linux, OCR no macOS e OWLv2 no venv da trilha. A agregação e o cache rodaram com as saídas reais de cada detector. No Colab, o bloco roda inteiro num ambiente só.
+:::
+
+---
+
+## Atributos por setor
+
+Os mesmos três detectores cobrem atributos diferentes em cada setor. O que eles não cobrem vai para a rubrica do VLM.
+
+| Setor | Atributo | Detector e coluna | Se o detector não basta |
+| :--- | :--- | :--- | :--- |
+| Beleza | close no rosto, aplicação | `det_area_rosto_max` alta | VLM: `try_on_ou_demonstracao` |
+| Beleza | produto em destaque, *swatch* | `det_obj_batom`, `det_obj_frasco_area` | VLM: `close_up_produto` |
+| Beleza | antes/depois | nenhum detector confiável | VLM: `before_after_ou_transformacao` |
+| Moda | look de corpo inteiro vs. detalhe | `det_obj_vestido_area` grande e rosto pequeno = corpo inteiro | VLM: `elementos_video_top5` |
+| Moda | *try-on* | rosto + roupa no mesmo frame | VLM: `try_on_ou_demonstracao` |
+| Automotivo | interior | `det_obj_volante`, `det_obj_painel` | VLM descreve o plano |
+| Automotivo | exterior e close | `det_obj_carro_area` (grande = close) | idem |
+| Automotivo | POV de direção | volante visível e nenhum rosto | VLM confirma o POV |
+
+---
+
+## Detector como régua do VLM
+
+Rosto e texto na tela aparecem nas duas fontes: nas colunas `det_*` e nos campos `tem_rosto` e `texto_na_tela` da rubrica do VLM. Isso é uma oportunidade: onde as duas fontes concordam, você ganha confiança nas duas; onde discordam, você tem uma lista curta de vídeos para assistir.
+
+```python
+import pandas as pd
+
+
+def divergencias(det: pd.DataFrame, vlm: pd.DataFrame) -> pd.DataFrame:
+    """Vídeos em que detector e VLM discordam sobre rosto ou texto (índice = video_id)."""
+    j = det.join(vlm, how="inner")
+    j["rosto_det"] = j["det_pct_frames_rosto"] > 0
+    j["texto_det"] = j["det_pct_frames_texto"] > 0
+    j["diverge_rosto"] = j["rosto_det"] != j["vlm_tem_rosto"]
+    j["diverge_texto"] = j["texto_det"] != j["vlm_texto_na_tela"]
+    print(f"concordância rosto: {1 - j['diverge_rosto'].mean():.0%} | "
+          f"texto: {1 - j['diverge_texto'].mean():.0%}")
+    return j[j["diverge_rosto"] | j["diverge_texto"]]
+
+
+det = pd.DataFrame({"det_pct_frames_rosto": [1.0, 0.0, 0.25, 0.0],
+                    "det_pct_frames_texto": [0.375, 0.0, 0.0, 0.5]},
+                   index=["sint_B", "v01", "v02", "v03"])
+vlm = pd.DataFrame({"vlm_tem_rosto": [True, False, False, False],
+                    "vlm_texto_na_tela": [True, False, False, True]},
+                   index=["sint_B", "v01", "v02", "v03"])
+print(divergencias(det, vlm)[["det_pct_frames_rosto", "vlm_tem_rosto"]])
+```
+
+```text
+concordância rosto: 75% | texto: 100%
+     det_pct_frames_rosto  vlm_tem_rosto
+v02                  0.25          False
+```
+
+Os números acima são de brinquedo, só para mostrar a saída. Na sua base, assista aos vídeos divergentes e anote quem acertou. Se o detector acerta a maioria, use a coluna `det_*` no modelo e trate a do VLM como redundante. Se o VLM acerta (por exemplo, rostos de perfil que o BlazeFace perde), você aprendeu um limite do detector. Em qualquer caso, a taxa de concordância entra no relatório: ela é a melhor evidência barata de que a rubrica do VLM mede o que diz medir. A [aula 4.7](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado) transforma isso num kappa.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+O Short B foi desenhado para os detectores: rosto em close desde o primeiro frame, texto grande na tela no gancho e, provavelmente, o frasco da base em destaque. Espere `det_rosto_no_gancho = True`, `det_texto_no_gancho = True`, `det_area_rosto_max` alta e `det_obj_frasco` acima do limiar.
+
+O Short A mostra o rosto o tempo todo, mas abre com o logo: o primeiro frame do gancho não tem rosto, e não há texto na tela. Espere `det_pct_frames_rosto` alto (7 de 8 frames, por exemplo), mas `det_texto_no_gancho = False` e `det_area_texto_media` perto de zero.
+
+No simulador da trilha, rosto e texto na tela respondem por cerca de +0,10 e +0,08 em log na previsão do B (×1,10 e ×1,08). São números **ilustrativos**. O ponto desta aula é outro: essas colunas são **medidas**, não opiniões, e podem ser verificadas frame a frame se a marca perguntar "por que o modelo acha que o B tem texto no gancho?".
+
+No **Garagem 22**, o POV de direção deve acender `det_obj_volante` sem rosto; o close do interior do SUV deve acender `det_obj_painel` e `det_obj_volante` com áreas grandes.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Copiar tutorial antigo do MediaPipe.** `mp.solutions.face_detection` não existe na 1.0. Use `mediapipe.tasks.python.vision.FaceDetector`.
+2. **Passar RGB onde se espera BGR (ou o contrário).** Os frames da aula 4.3 são RGB; o PaddleOCR espera BGR em arrays numpy. Inverta os canais com `rgb[:, :, ::-1]`.
+3. **Multiplicar caixas `int16`.** Converta para float antes de calcular áreas.
+4. **Transformar score de OWLv2 em "sim/não" com limiar global.** A escala muda por classe. Guarde o score e valide limiares por classe.
+5. **Ignorar a licença do detector.** YOLO da Ultralytics é AGPL-3.0; discuta isso antes de entregar código que uma empresa vai embutir num produto.
+6. **Rodar o detector caro em todos os frames.** OWLv2 em 8 frames por vídeo em CPU vira dias de processamento. Escolha os frames que respondem à pergunta.
+:::
+
+<Quiz
+  id="m4-a6"
+  perguntas={[
+    {
+      pergunta: 'Um colega copiou `mp.solutions.face_detection.FaceDetection(...)` de um tutorial e recebeu `AttributeError`. O que aconteceu?',
+      opcoes: [
+        {texto: 'Falta instalar o opencv.', explicacao: 'O erro é de atributo inexistente no módulo, não de dependência.'},
+        {texto: 'O MediaPipe 1.0 removeu `mp.solutions`; a detecção de rosto agora é pela Tasks API (`FaceDetector`).', correta: true, explicacao: 'Exato. A Tasks API exige um arquivo de modelo, como o blaze_face_short_range.tflite.'},
+        {texto: 'O modelo de rosto precisa de GPU.', explicacao: 'O BlazeFace roda em CPU; o problema é a API removida.'},
+      ],
+    },
+    {
+      pergunta: 'Você quer saber se um Short de beleza mostra o batom em destaque. Qual combinação é mais adequada?',
+      opcoes: [
+        {texto: 'RT-DETR com as classes COCO.', explicacao: 'O COCO não tem "lipstick"; o detector não tem como responder.'},
+        {texto: 'OWLv2 com a consulta "a lipstick", guardando score e área da melhor caixa.', correta: true, explicacao: 'Vocabulário aberto resolve a classe; a área diz se é destaque (close) ou detalhe.'},
+        {texto: 'Contar quantas vezes a palavra "batom" aparece no OCR.', explicacao: 'Pode ajudar como sinal auxiliar, mas o produto aparece muito mais do que é escrito.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o YOLO da Ultralytics exige cuidado neste case?',
+      opcoes: [
+        {texto: 'Porque é lento demais para Shorts.', explicacao: 'Velocidade não é o problema; o YOLO é rápido.'},
+        {texto: 'Porque é AGPL-3.0: oferecer o software modificado pela rede obriga a disponibilizar o código-fonte, o que conflita com produtos fechados.', correta: true, explicacao: 'Isso. Para uso comercial fechado, é preciso licença comercial ou alternativa permissiva (RT-DETR, OWLv2).'},
+        {texto: 'Porque não detecta rostos.', explicacao: 'Detecta pessoas; a questão levantada na aula é de licença.'},
+      ],
+    },
+    {
+      pergunta: 'Detector e VLM discordam sobre `tem_rosto` em 12% dos vídeos. Qual é o próximo passo?',
+      opcoes: [
+        {texto: 'Descartar a coluna do VLM, porque detectores são sempre corretos.', explicacao: 'Detectores também erram (rostos de perfil, pequenos ou com oclusão).'},
+        {texto: 'Assistir a uma amostra dos vídeos divergentes, anotar quem acertou e decidir qual coluna usar.', correta: true, explicacao: 'A divergência é uma lista barata de casos para auditar; a decisão sai da evidência.'},
+        {texto: 'Tirar a média das duas colunas.', explicacao: 'Média de duas fontes com erros diferentes esconde o problema em vez de resolvê-lo.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: calibre o detector em 30 frames]
+1. Sorteie 30 frames da sua base (10 por setor), usando `extrair_frames`.
+2. Rotule à mão: há rosto? Há texto? Há o objeto-chave do setor (batom, vestido, volante)?
+3. Rode `rostos_no_frame`, `texto_no_frame` e `objetos_no_frame` e calcule, por coluna, a porcentagem de acertos.
+4. Para o OWLv2, varra limiares de 0,05 a 0,4 e escolha, por classe, o que maximiza os acertos.
+:::
+
+<details>
+<summary>Como interpretar e o que costuma acontecer</summary>
+
+- **Rosto** costuma acertar quase sempre em beleza (rostos frontais e grandes). Os erros aparecem em moda (rosto pequeno em look de corpo inteiro) e em automotivo (motorista de perfil). Se o setor tiver muitos rostos pequenos, teste o modelo `blaze_face_full_range.tflite` do MediaPipe, feito para planos mais abertos.
+- **Texto** acerta bem o título grande; erra letras estilizadas, texto sobre fundo movimentado e acentos. Para a feature `det_texto_no_gancho`, isso raramente muda a resposta; para o texto em si, espere erros de grafia.
+- **OWLv2**: o limiar ótimo costuma variar bastante entre classes. Se uma classe não passar de 70% de acerto em nenhum limiar, tire-a da lista e deixe o atributo para o VLM.
+
+</details>
+
+---
+
+## Resumo
+
+- **Detector** responde "existe e onde"; **VLM** responde "o que significa". Use cada um na pergunta certa.
+- MediaPipe 1.0: **Tasks API** com `FaceDetector` e um `.tflite`; `mp.solutions` não existe mais. A **área do rosto** mede close-up.
+- PaddleOCR 3.x com `lang="pt"` usa **PP-OCRv6**; filtre confiança e leituras de um caractere, e normalize acentos.
+- **OWLv2** dá vocabulário aberto sob Apache-2.0; o YOLO da Ultralytics é **AGPL-3.0**. Guarde scores contínuos e valide limiares por classe.
+- A **concordância detector × VLM** é a evidência mais barata da confiabilidade da rubrica.
+
+## Referências
+
+- Google AI Edge. [Face detection guide for Python](https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector/python) (MediaPipe Tasks).
+- Bazarevsky et al. [*BlazeFace: Sub-millisecond Neural Face Detection on Mobile GPUs*](https://arxiv.org/abs/1907.05047). CVPR Workshops, 2019.
+- PaddlePaddle. [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR): documentação da 3.x e modelos PP-OCR.
+- Minderer, Gritsenko e Houlsby. [*Scaling Open-Vocabulary Object Detection*](https://arxiv.org/abs/2306.09683) (OWLv2). NeurIPS, 2023.
+- Zhao et al. [*DETRs Beat YOLOs on Real-time Object Detection*](https://arxiv.org/abs/2304.08069) (RT-DETR). CVPR, 2024.
+- Free Software Foundation. [GNU Affero General Public License v3](https://www.gnu.org/licenses/agpl-3.0.html), seção 13.
+- Ultralytics. [Licença](https://www.ultralytics.com/license) (AGPL-3.0 e licença comercial).
+
+**Próxima aula:** [VLM como extrator estruturado](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado): a rubrica do briefing como schema Pydantic, o Gemini com structured output e como medir se as respostas são confiáveis.

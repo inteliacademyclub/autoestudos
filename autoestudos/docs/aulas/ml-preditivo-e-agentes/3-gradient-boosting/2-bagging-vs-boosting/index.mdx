@@ -1,0 +1,439 @@
+---
+sidebar_position: 2
+sidebar_label: 'Bagging vs. boosting'
+title: 'Bagging vs. boosting'
+description: 'Duas formas de combinar árvores instáveis: a média de árvores fundas (bagging e random forest) e a soma sequencial de árvores rasas (boosting), comparadas em validação temporal.'
+tags: [ml-preditivo, gradient-boosting, ensembles]
+---
+
+# Bagging vs. Boosting: Duas Formas de Domar Árvores Instáveis
+
+<LessonMeta
+  tempo="40 min"
+  semana={2}
+  etapa="modelo"
+  objetivos={[
+    'Decompor o erro de um modelo em viés, variância e ruído, e medir cada parte numa base sintética',
+    'Explicar por que a média de árvores (bagging, random forest) reduz variância e quando sortear colunas ajuda',
+    'Explicar por que somar árvores rasas em sequência (boosting) reduz viés e exige saber a hora de parar',
+    'Comparar árvore única, random forest e gradient boosting em walk-forward e julgar se a diferença é real',
+  ]}
+  prerequisitos={[
+    {label: 'Árvores de decisão por dentro', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao'},
+    {label: 'Análise de erros e ablação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao'},
+  ]}
+/>
+
+A aula anterior terminou com um problema: 50 árvores treinadas em reamostragens do mesmo conjunto discordavam bastante. Para o Short B da Lumina, algumas diziam que ele superava o A por 1,33 em log; outras davam empate. Se você fosse a Lumina, em qual árvore confiaria?
+
+Existem duas respostas clássicas, e elas partem de diagnósticos opostos. A primeira diz: *cada árvore é boa, mas nervosa; tire a média de muitas e o nervosismo se cancela*. É o **bagging**, e o random forest é a versão mais famosa. A segunda diz: *use árvores pequenas e fracas, mas construa cada uma para consertar o que as anteriores erraram*. É o **boosting**, e o gradient boosting é a família de LightGBM, CatBoost e XGBoost, os três que você vai usar no projeto.
+
+Nesta aula você vai medir, com dados sintéticos onde a verdade é conhecida, o que cada estratégia ataca, e comparar os dois na mesma validação temporal. O resultado tem uma lição que vale mais que o placar.
+
+:::info[A ideia central]
+Um **ensemble** combina muitos modelos num só.
+- **Bagging** treina árvores **fundas** (pouco viés, muita variância) de forma **independente**, em reamostragens dos dados, e tira a **média**. Ataca a **variância**.
+- **Boosting** treina árvores **rasas** (muito viés, pouca variância) em **sequência**, cada uma ajustando o que falta, e **soma** as correções. Ataca o **viés**, e por isso precisa parar na hora certa.
+:::
+
+---
+
+## Viés, variância e o erro que sobra
+
+Imagine treinar o mesmo tipo de modelo muitas vezes, cada vez com um conjunto de treino ligeiramente diferente. Para um post de teste $$x$$ com valor verdadeiro $$f(x)$$, o erro quadrático esperado se decompõe em três partes:
+
+$$
+\mathbb{E}\left[(y - \hat{f}(x))^2\right] = \underbrace{\left(\mathbb{E}[\hat{f}(x)] - f(x)\right)^2}_{\text{viés}^2} + \underbrace{\text{Var}\left[\hat{f}(x)\right]}_{\text{variância}} + \underbrace{\sigma^2}_{\text{ruído}}
+$$
+
+- **Viés**: o quanto o modelo, *em média*, erra o alvo. Vem de um modelo rígido demais ou de informação que falta nas features.
+- **Variância**: o quanto a previsão muda quando o treino muda. Vem de um modelo flexível demais para a quantidade de dados.
+- **Ruído**: a parte imprevisível ($$\sigma^2$$). No gerador sintético, o desvio do ruído é 0,5, então $$\sigma^2 = 0{,}25$$ e nenhum modelo passa disso.
+
+Com dados reais você não conhece $$f(x)$$. Com o gerador da [aula 3.1](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao), conhece: é a coluna `sinal_verdadeiro`. O trecho abaixo treina cada modelo em 20 reamostragens do treino e mede as duas primeiras parcelas no teste.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from shorts_sinteticos import gerar_shorts   # o gerador da aula 3.1
+
+df = gerar_shorts()
+df["log_inscritos"] = np.log(df["inscritos"])
+df = pd.concat([df, pd.get_dummies(df["setor"], prefix="setor", dtype=int)], axis=1)
+FEATURES = ["log_inscritos", "setor_beleza", "setor_moda", "setor_automotivo", "duracao_s",
+            "gancho", "rosto", "texto_tela", "energia", "hora", "dia_semana"]
+corte = pd.Timestamp("2026-01-01", tz="UTC")
+treino, teste = df[df["published_at"] < corte], df[df["published_at"] >= corte]
+
+modelos = {
+    "árvore rasa (prof. 2)": lambda s: DecisionTreeRegressor(max_depth=2, random_state=s),
+    "árvore funda (sem limite)": lambda s: DecisionTreeRegressor(random_state=s),
+    "random forest (200)": lambda s: RandomForestRegressor(200, min_samples_leaf=5,
+                                                           n_jobs=-1, random_state=s),
+    "gradient boosting (300)": lambda s: GradientBoostingRegressor(n_estimators=300, learning_rate=0.05,
+                                                                   max_depth=3, random_state=s),
+}
+verdade = teste["sinal_verdadeiro"].to_numpy()   # só existe porque os dados são sintéticos
+print(f"{'modelo':<27} {'viés²':>6} {'variância':>10}")
+for nome, criar in modelos.items():
+    prev = []
+    for s in range(20):                               # 20 treinos em reamostragens
+        amostra = treino.sample(len(treino), replace=True, random_state=s)
+        prev.append(criar(s).fit(amostra[FEATURES], amostra["y"]).predict(teste[FEATURES]))
+    prev = np.array(prev)
+    vies2 = ((prev.mean(axis=0) - verdade) ** 2).mean()
+    variancia = prev.var(axis=0).mean()
+    print(f"{nome:<27} {vies2:>6.3f} {variancia:>10.3f}")
+```
+
+```text
+modelo                       viés²  variância
+árvore rasa (prof. 2)        0.695      0.017
+árvore funda (sem limite)    0.365      0.426
+random forest (200)          0.329      0.036
+gradient boosting (300)      0.310      0.028
+```
+
+A tabela é o resumo da aula:
+
+- A **árvore rasa** é estável (variância 0,017) mas rígida: viés enorme.
+- A **árvore funda** tem menos viés, mas a variância explode para 0,426.
+- O **random forest** usa árvores fundas e mantém o viés delas, mas corta a variância em mais de 10 vezes (0,426 → 0,036).
+- O **gradient boosting** usa árvores rasas, mas chega ao **menor viés** da tabela sem deixar a variância subir.
+
+Repare que nenhum viés chega perto de zero. Parte dele é informação que falta: a tendência de cada canal muda mês a mês e nenhuma coluna de `FEATURES` a enxerga. Guarde isso para o fim da aula. (Com 20 reamostragens, as estimativas são aproximadas: um pouco da variância vaza para o viés estimado, principalmente na árvore funda.)
+
+---
+
+## Bagging: a média de muitos palpites nervosos
+
+**Bagging** vem de *bootstrap aggregating* (Breiman, 1996). A receita:
+
+1. Sorteie, com reposição, um conjunto do mesmo tamanho do treino (uma amostra *bootstrap*; cerca de 63% dos posts aparecem, alguns repetidos).
+2. Treine uma árvore funda nessa amostra.
+3. Repita $$B$$ vezes, de forma independente, e preveja com a **média** das $$B$$ árvores.
+
+Por que a média reduz a variância? Se cada árvore tem variância $$\sigma^2$$ e a correlação média entre duas árvores é $$\rho$$, a variância da média de $$B$$ árvores é (Hastie, Tibshirani e Friedman, eq. 15.1):
+
+$$
+\text{Var}\left(\frac{1}{B}\sum_{b=1}^{B} \hat{f}_b(x)\right) = \rho\,\sigma^2 + \frac{1-\rho}{B}\,\sigma^2
+$$
+
+O segundo termo some quando $$B$$ cresce, mas o primeiro não: **a correlação entre as árvores é o piso**. Se todas errassem igual, a média não ajudaria em nada. O **random forest** (Breiman, 2001) ataca esse piso sorteando, em cada split, só uma fração das features (`max_features`), o que força árvores diferentes entre si.
+
+Só que sortear colunas tem um custo: cada árvore fica pior sozinha. Veja na nossa base:
+
+```python
+from sklearn.metrics import mean_absolute_error as mae
+
+X, y, Xt, yt = treino[FEATURES], treino["y"], teste[FEATURES], teste["y"]
+print(f"{'max_features':<13} {'corr. dos erros':>15} {'MAE 1 árvore':>13} {'MAE OOB':>8} {'MAE teste':>10}")
+for mf in [1.0, 0.5, 0.2]:           # 1.0 = bagging puro (padrão do sklearn); <1 = sorteia colunas
+    rf = RandomForestRegressor(n_estimators=300, min_samples_leaf=5, max_features=mf,
+                               oob_score=True, n_jobs=-1, random_state=0).fit(X, y)
+    erros = np.array([t.predict(Xt.to_numpy()) for t in rf.estimators_]) - yt.to_numpy()
+    rho = np.corrcoef(erros[:100])[np.triu_indices(100, 1)].mean()
+    print(f"{mf:<13} {rho:>15.2f} {np.abs(erros).mean():>13.3f} "
+          f"{mae(y, rf.oob_prediction_):>8.3f} {mae(yt, rf.predict(Xt)):>10.3f}")
+```
+
+```text
+max_features  corr. dos erros  MAE 1 árvore  MAE OOB  MAE teste
+1.0                      0.71         0.707    0.500      0.593
+0.5                      0.67         0.771    0.542      0.636
+0.2                      0.67         0.978    0.666      0.803
+```
+
+Sortear colunas baixou a correlação dos erros só um pouco (0,71 → 0,67), e piorou muito cada árvore (0,707 → 0,978). Resultado líquido: pior. O motivo é que uma feature, `log_inscritos`, domina; uma árvore que não pode usá-la no split da raiz é uma árvore ruim. Breiman chamou isso de equilíbrio entre **força** das árvores e **correlação** entre elas. Não existe valor universal: `max_features` é um hiperparâmetro, e o padrão do scikit-learn para regressão é 1.0 (bagging puro).
+
+A tabela mostra mais duas coisas importantes:
+
+- **OOB é otimista neste problema.** Cada árvore não vê cerca de 37% dos posts; prever esses posts com as árvores que não os viram dá o erro *out-of-bag*, uma validação "de graça". Só que ela é **aleatória**: mistura períodos e canais. O MAE OOB (0,500) promete muito mais do que o teste temporal entrega (0,593). É o mesmo problema do split aleatório que você viu no [módulo 2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal).
+- **Mais árvores nunca pioram o random forest.** O erro só cai e estabiliza, como mostra o primeiro trecho da próxima seção.
+
+---
+
+## Boosting: cada árvore corrige a anterior
+
+O boosting inverte a lógica. Em vez de árvores fundas e independentes, ele usa árvores **rasas** (profundidade 3 a 6, as *weak learners*), cada uma treinada nos **resíduos** da soma das anteriores:
+
+1. Comece com uma previsão constante $$F_0$$, a média de $$y$$.
+2. Calcule os resíduos $$r_i = y_i - F_{m-1}(x_i)$$.
+3. Treine uma árvore rasa $$h_m$$ para prever $$r_i$$.
+4. Atualize $$F_m = F_{m-1} + \nu\, h_m$$, com uma taxa de aprendizado $$\nu$$ pequena, e volte ao passo 2.
+
+Cada árvore sozinha é fraca e estável. A soma vai ficando flexível, árvore por árvore, e é isso que derruba o viés. O preço é que, se você somar árvores demais, o modelo começa a ajustar o ruído do treino. A [aula 3.3](/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo) implementa esse algoritmo do zero e explica por que "resíduo" é, na verdade, um gradiente.
+
+<Sketch name="m3/bagging-vs-boosting" alt="Dois painéis lado a lado. À esquerda, bagging: os dados de treino geram três amostras com reposição, cada uma treina uma árvore funda de forma independente, e a previsão é a média das árvores; nota: reduz a variância. À direita, boosting: parte de F zero igual à média de y, depois árvores rasas 1, 2 e 3 em sequência, cada uma aprendendo os resíduos da soma anterior, e a previsão é F zero mais ni vezes h1 mais ni vezes h2 mais ni vezes h3; nota: reduz o viés e precisa saber a hora de parar." caption="Bagging combina em paralelo e tira a média; boosting combina em série e soma." />
+
+A diferença de comportamento aparece quando você acompanha o erro de teste conforme as árvores entram:
+
+```python
+from sklearn.ensemble import GradientBoostingRegressor
+
+rf = RandomForestRegressor(n_estimators=500, min_samples_leaf=5, n_jobs=-1, random_state=0).fit(X, y)
+por_arvore = np.array([t.predict(Xt.to_numpy()) for t in rf.estimators_])
+print("RF   n_arvores: MAE teste")
+for n in [1, 5, 20, 100, 500]:
+    print(f"{n:>14}: {mae(yt, por_arvore[:n].mean(axis=0)):.3f}")
+
+gb = GradientBoostingRegressor(n_estimators=500, learning_rate=0.3, max_depth=3,
+                               random_state=0).fit(X, y)
+erros = [mae(yt, p) for p in gb.staged_predict(Xt)]   # previsão após cada árvore
+print("GB   n_arvores: MAE teste (lr=0.3)")
+for n in [1, 5, 20, 100, 500]:
+    print(f"{n:>14}: {erros[n - 1]:.3f}")
+print(f"melhor: {min(erros):.3f} com {int(np.argmin(erros)) + 1} árvores")
+```
+
+```text
+RF   n_arvores: MAE teste
+             1: 0.727
+             5: 0.626
+            20: 0.597
+           100: 0.593
+           500: 0.593
+GB   n_arvores: MAE teste (lr=0.3)
+             1: 1.173
+             5: 0.749
+            20: 0.612
+           100: 0.595
+           500: 0.657
+melhor: 0.582 com 53 árvores
+```
+
+O random forest estabiliza em 0,593 e fica lá. O boosting, com uma taxa de aprendizado alta de propósito (0,3), chega a 0,582 com 53 árvores e depois **piora** até 0,657. Por isso todo boosting sério usa <Termo id="early-stopping">early stopping</Termo>. Cuidado com um detalhe: aqui o "melhor" foi escolhido olhando o teste, só para ilustrar. No projeto, quem escolhe o número de árvores é um conjunto de **validação** temporal.
+
+---
+
+## Na prática: a comparação em walk-forward
+
+Uma única janela de teste pode enganar. O trecho abaixo compara os três modelos em <Termo id="walk-forward">walk-forward</Termo>: três janelas de teste de 4 meses, sempre treinando com tudo que veio antes. Continue na mesma sessão do primeiro trecho (ele define `df` e `FEATURES`).
+
+```python
+from scipy.stats import spearmanr
+from sklearn.metrics import mean_absolute_error
+
+modelos = {
+    "árvore (prof. 6)": lambda: DecisionTreeRegressor(max_depth=6, min_samples_leaf=20, random_state=0),
+    "random forest": lambda: RandomForestRegressor(n_estimators=500, min_samples_leaf=5,
+                                                   n_jobs=-1, random_state=0),
+    "gradient boosting": lambda: GradientBoostingRegressor(n_estimators=300, learning_rate=0.05,
+                                                           max_depth=3, random_state=0),
+}
+# walk-forward: 3 janelas de teste de 4 meses; treina sempre com TUDO que veio antes
+janelas = ["2025-03-01", "2025-07-01", "2025-11-01", "2026-03-01"]
+linhas = []
+for ini, fim in zip(janelas[:-1], janelas[1:]):
+    ini, fim = pd.Timestamp(ini, tz="UTC"), pd.Timestamp(fim, tz="UTC")
+    tr = df[df["published_at"] < ini]
+    te = df[(df["published_at"] >= ini) & (df["published_at"] < fim)]
+    for nome, criar in modelos.items():
+        p = criar().fit(tr[FEATURES], tr["y"]).predict(te[FEATURES])
+        linhas.append({"janela": ini.strftime("%Y-%m"), "modelo": nome,
+                       "MAE": mean_absolute_error(te["y"], p),
+                       "Spearman": spearmanr(te["y"], p).statistic})
+res = pd.DataFrame(linhas)
+print(res.pivot(index="janela", columns="modelo", values="MAE").round(3))
+print(res.groupby("modelo")[["MAE", "Spearman"]].mean().round(3))
+```
+
+```text
+modelo   gradient boosting  random forest  árvore (prof. 6)
+janela                                                     
+2025-03              0.491          0.499             0.553
+2025-07              0.506          0.518             0.588
+2025-11              0.519          0.523             0.581
+                     MAE  Spearman
+modelo                            
+gradient boosting  0.505     0.917
+random forest      0.513     0.914
+árvore (prof. 6)   0.574     0.887
+```
+
+O gradient boosting vence nas três janelas, e os dois ensembles batem a árvore única com folga. Mas a vantagem do boosting sobre o random forest é de 0,005 a 0,012 de MAE. Isso é real ou sorte? O exercício no fim da aula responde com um bootstrap pareado, e a resposta é: com esta base, **não dá para afirmar**.
+
+E aqui está a lição que vale mais que o placar. Lembre da tabela de viés: todos os modelos carregam um viés parecido, porque todos olham para as mesmas colunas, e nenhuma delas conta como o canal vem performando nos últimos meses. **Quando o gargalo é informação, trocar de algoritmo rende centésimos.** As features de histórico da [aula 3.5](/aulas/ml-preditivo-e-agentes/gradient-boosting/features-do-canal-e-do-tempo) rendem décimos. Os Spearman acima de 0,9 também merecem uma ressalva: a base sintética tem canais de tamanhos muito diferentes e é mais fácil de ordenar do que a sua base real (a expectativa da literatura é de 0,55 a 0,85).
+
+---
+
+## Quando cada um brilha
+
+| | Random forest (bagging) | Gradient boosting |
+| :--- | :--- | :--- |
+| **Ataca** | variância | viés |
+| **Árvores** | fundas, independentes | rasas, em sequência |
+| **Treino** | paralelo entre árvores | sequencial entre árvores (paralelo dentro de cada uma) |
+| **Mais árvores** | nunca piora; estabiliza | piora depois de um ponto; exige early stopping |
+| **Ajuste de hiperparâmetros** | pouco; os padrões costumam ser bons | taxa de aprendizado, profundidade e número de árvores interagem |
+| **Validação embutida** | OOB (aleatória: otimista em problema temporal) | nenhuma; você monta a validação temporal |
+| **Perdas e restrições** | essencialmente quadrática | qualquer perda diferenciável: Huber, quantil (pinball), restrições monotônicas |
+
+Traduzindo para o projeto:
+
+- **Random forest** é um ótimo segundo baseline: forte, rápido de configurar e difícil de estragar. Se o seu boosting não vence um random forest com defaults, desconfie do boosting (ou da validação).
+- **Gradient boosting** é o modelo final. Não porque vença sempre por muito, mas porque oferece o que o projeto pede e o random forest não oferece com a mesma facilidade: perda Huber para lidar com virais, perda quantílica para os intervalos do [módulo 5](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica), restrições monotônicas e suporte de primeira classe no SHAP.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Refazendo o experimento de instabilidade da aula 3.1, agora com ensembles: 20 treinos em reamostragens, previsão da diferença B − A (em log) para os Shorts da Lumina.
+
+```text
+random forest      B - A: média 0.77, desvio 0.16, mín 0.49, máx 1.04
+gradient boosting  B - A: média 0.69, desvio 0.18, mín 0.38, máx 0.99
+```
+
+<details>
+<summary>Ver o código (continua o primeiro trecho da aula)</summary>
+
+```python
+lumina = pd.DataFrame({
+    "log_inscritos": np.log(180_000), "setor_beleza": 1, "setor_moda": 0, "setor_automotivo": 0,
+    "duracao_s": [55, 22], "gancho": [3, 8], "rosto": [1, 1], "texto_tela": [0, 1],
+    "energia": [3, 7], "hora": [14, 19], "dia_semana": [1, 3]}, index=["A", "B"])[FEATURES]
+criar = {
+    "random forest": lambda s: RandomForestRegressor(300, min_samples_leaf=5, n_jobs=-1, random_state=s),
+    "gradient boosting": lambda s: GradientBoostingRegressor(n_estimators=300, learning_rate=0.05,
+                                                             max_depth=3, random_state=s),
+}
+for nome, f in criar.items():
+    difs = []
+    for s in range(20):
+        amostra = treino.sample(len(treino), replace=True, random_state=s)
+        a, b = f(s).fit(amostra[FEATURES], amostra["y"]).predict(lumina)
+        difs.append(b - a)
+    print(f"{nome:<18} B - A: média {np.mean(difs):.2f}, desvio {np.std(difs):.2f}, "
+          f"mín {np.min(difs):.2f}, máx {np.max(difs):.2f}")
+```
+
+</details>
+
+Compare com a árvore única, que ia de 0,00 (empate) a 1,33. Os ensembles **nunca** deram empate e o intervalo entre o menor e o maior valor encolheu bastante. Qualquer um dos dois diria à Lumina, de forma consistente, que B rende mais que A.
+
+Mas ambos continuam **subestimando** a diferença verdadeira (1,09 no gerador). Isso é viés, não variância, e tem a mesma origem da tabela de viés: com as features atuais, o modelo gasta sua capacidade separando canais grandes de pequenos e ainda não sabe o nível atual do canal da Lumina. Quando as features de histórico entrarem (aula 3.5), o modelo pode usar os splits para o conteúdo.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas com ensembles]
+1. **Confiar no OOB (ou em qualquer validação aleatória) num problema temporal.** No experimento, o OOB prometeu MAE 0,500 e o teste no futuro entregou 0,593.
+2. **Declarar vencedor por 0,01 de MAE numa janela só.** Use walk-forward e um bootstrap pareado antes de concluir.
+3. **Aumentar `n_estimators` do boosting sem early stopping.** No random forest isso é inofensivo; no boosting, com taxa de aprendizado alta, o erro volta a subir.
+4. **Reduzir `max_features` por hábito.** Quando uma feature domina, sortear colunas pode piorar cada árvore mais do que reduz a correlação entre elas. Trate como hiperparâmetro.
+5. **Esperar que o algoritmo compense a falta de informação.** Viés causado por features ausentes não some trocando random forest por boosting.
+:::
+
+<Quiz
+  id="m3-a2"
+  perguntas={[
+    {
+      pergunta: 'Seu modelo tem erro de treino muito baixo e o erro de validação muda bastante quando você troca a semente. Qual ensemble ataca diretamente esse problema?',
+      opcoes: [
+        {texto: 'Bagging / random forest.', correta: true, explicacao: 'O sintoma é variância alta. Tirar a média de muitas árvores treinadas em reamostragens reduz exatamente a variância.'},
+        {texto: 'Boosting com mais árvores.', explicacao: 'Boosting ataca o viés; somar mais árvores tende a aumentar a flexibilidade e piorar a variância.'},
+        {texto: 'Uma árvore única mais profunda.', explicacao: 'Árvores mais profundas têm ainda mais variância.'},
+      ],
+    },
+    {
+      pergunta: 'Pela fórmula da variância da média, o que acontece com um random forest de árvores perfeitamente correlacionadas (ρ = 1) quando B vai de 10 para 1.000?',
+      opcoes: [
+        {texto: 'A variância cai 100 vezes.', explicacao: 'Isso só valeria com ρ = 0. Com ρ = 1, o termo que depende de B é zero.'},
+        {texto: 'A variância não muda: continua σ².', correta: true, explicacao: 'Com ρ = 1, Var = σ² + 0. Árvores que erram igual não se cancelam: a correlação é o piso.'},
+        {texto: 'A variância aumenta, porque há mais árvores.', explicacao: 'Adicionar árvores nunca aumenta a variância da média.'},
+      ],
+    },
+    {
+      pergunta: 'O MAE out-of-bag do seu random forest é 0,50 e o MAE no teste temporal é 0,59. O que explica melhor a diferença?',
+      opcoes: [
+        {texto: 'O random forest fez overfitting nas árvores OOB.', explicacao: 'As previsões OOB usam só árvores que não viram o post; não há overfitting direto ali.'},
+        {texto: 'O OOB é uma validação aleatória: mistura períodos e canais, e por isso é otimista num problema em que se prevê o futuro.', correta: true, explicacao: 'Posts do mesmo mês e do mesmo canal aparecem no treino das árvores que preveem cada post OOB. É o mesmo vazamento temporal do split aleatório.'},
+        {texto: 'O teste tem um bug: os dois números deveriam ser iguais.', explicacao: 'Não há bug. Eles medem coisas diferentes: interpolação no passado versus previsão do futuro.'},
+      ],
+    },
+    {
+      pergunta: 'Quais afirmações sobre gradient boosting são verdadeiras? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Usa árvores rasas que, sozinhas, têm viés alto.', correta: true, explicacao: 'As weak learners são simples; a flexibilidade vem da soma.'},
+        {texto: 'Cada árvore é treinada nos resíduos da soma das anteriores.', correta: true, explicacao: 'Com perda quadrática, sim. A aula 3.3 generaliza: são os gradientes negativos da perda.'},
+        {texto: 'Adicionar árvores nunca piora o erro de teste.', explicacao: 'Isso vale para o random forest. No boosting, o erro de teste volta a subir depois de um ponto.'},
+        {texto: 'Aceita perdas como Huber e pinball, úteis para virais e intervalos.', correta: true, explicacao: 'Qualquer perda diferenciável serve; LightGBM, CatBoost e XGBoost trazem várias prontas.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: a vitória do boosting é real?]
+Na comparação em walk-forward, o gradient boosting ganhou do random forest nas três janelas, por pouco.
+
+1. Junte os erros absolutos de todas as janelas para os dois modelos, **post a post**.
+2. Faça um bootstrap pareado: sorteie posts com reposição (os mesmos para os dois modelos), calcule a diferença de MAE, repita 2.000 vezes.
+3. Calcule o intervalo de 95% da diferença. Ele contém o zero?
+4. Pergunta para discutir: se a diferença não é significativa, que critério você usaria para escolher o modelo final?
+:::
+
+<details>
+<summary>Ver a solução</summary>
+
+```python
+modelos = {
+    "rf": lambda: RandomForestRegressor(n_estimators=500, min_samples_leaf=5, n_jobs=-1, random_state=0),
+    "gb": lambda: GradientBoostingRegressor(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=0),
+}
+erros = {k: [] for k in modelos}
+for ini, fim in zip(janelas[:-1], janelas[1:]):
+    ini, fim = pd.Timestamp(ini, tz="UTC"), pd.Timestamp(fim, tz="UTC")
+    tr = df[df["published_at"] < ini]
+    te = df[(df["published_at"] >= ini) & (df["published_at"] < fim)]
+    for k, criar in modelos.items():
+        erros[k].append(np.abs(te["y"] - criar().fit(tr[FEATURES], tr["y"]).predict(te[FEATURES])))
+erros = {k: np.concatenate(v) for k, v in erros.items()}
+
+rng = np.random.default_rng(0)
+d = erros["gb"] - erros["rf"]                          # mesmos posts, pareados
+boot = [d[rng.integers(0, len(d), len(d))].mean() for _ in range(2000)]
+lo, hi = np.percentile(boot, [2.5, 97.5])
+print(f"MAE(gb) - MAE(rf) = {d.mean():+.3f}  IC95% [{lo:+.3f}, {hi:+.3f}]")
+```
+
+```text
+MAE(gb) - MAE(rf) = -0.008  IC95% [-0.019, +0.004]
+```
+
+O intervalo contém o zero: com esta base e estas features, não há evidência de que o boosting seja melhor. Critérios razoáveis para decidir mesmo assim: o que o projeto exige além do MAE (perda quantílica para intervalos, restrições monotônicas, SHAP rápido) e a simplicidade de manutenção. Esses critérios apontam para o boosting. O importante é registrar, no seu relatório, que a escolha **não** foi pela métrica.
+
+</details>
+
+---
+
+## Resumo
+
+- O erro esperado se decompõe em **viés²**, **variância** e **ruído**; com dados sintéticos dá para medir cada parte.
+- **Bagging** tira a média de árvores fundas treinadas em amostras **bootstrap**; reduz a variância até o piso dado pela **correlação** entre as árvores. O **random forest** sorteia colunas para baixar essa correlação, ao custo de árvores mais fracas.
+- **Boosting** soma árvores rasas em sequência, cada uma ajustando os **resíduos** da anterior; reduz o viés e exige **early stopping**.
+- A validação **OOB** é aleatória e, num problema temporal, otimista.
+- Na base sintética, o boosting venceu por pouco e sem significância; o gargalo é **informação**, não algoritmo.
+
+## Referências
+
+- Breiman. [*Bagging predictors*](https://doi.org/10.1007/BF00058655). Machine Learning, 24, 1996.
+- Breiman. [*Random forests*](https://doi.org/10.1023/A:1010933404324). Machine Learning, 45, 2001. Introduz o equilíbrio entre força e correlação das árvores.
+- Hastie, Tibshirani e Friedman. [*The Elements of Statistical Learning*](https://hastie.su.domains/ElemStatLearn/), 2ª ed., 2009: seção 7.3 (viés e variância), capítulo 10 (boosting) e capítulo 15 (random forests, eq. 15.1).
+- Friedman. [*Greedy function approximation: a gradient boosting machine*](https://doi.org/10.1214/aos/1013203451). Annals of Statistics, 29(5), 2001.
+- Grinsztajn, Oyallon e Varoquaux. [*Why do tree-based models still outperform deep learning on tabular data?*](https://arxiv.org/abs/2207.08815) NeurIPS Datasets and Benchmarks, 2022.
+- Documentação do scikit-learn: [Ensembles](https://scikit-learn.org/stable/modules/ensemble.html) (random forests, OOB, gradient boosting).
+
+**Próxima aula:** [Gradient boosting passo a passo](/aulas/ml-preditivo-e-agentes/gradient-boosting/gradient-boosting-passo-a-passo): o algoritmo implementado do zero em NumPy, por que o resíduo é um gradiente e como parar na hora certa.

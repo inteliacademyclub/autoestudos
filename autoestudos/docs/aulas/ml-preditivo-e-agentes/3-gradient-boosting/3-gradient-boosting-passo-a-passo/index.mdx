@@ -1,0 +1,429 @@
+---
+sidebar_position: 3
+sidebar_label: 'Gradient boosting passo a passo'
+title: 'Gradient boosting passo a passo'
+description: 'O algoritmo de gradient boosting implementado do zero em NumPy, por que o resíduo é um gradiente, como learning rate e número de árvores interagem e como parar com validação temporal.'
+tags: [ml-preditivo, gradient-boosting, early-stopping]
+---
+
+import BoostingPlayground from '@site/src/components/interativos/BoostingPlayground';
+
+# Gradient Boosting Passo a Passo: Descendo o Gradiente com Árvores
+
+<LessonMeta
+  tempo="50 min"
+  semana={2}
+  etapa="modelo"
+  objetivos={[
+    'Descrever o algoritmo de gradient boosting: F₀, pseudo-resíduos, árvore, valor das folhas e atualização com learning rate',
+    'Mostrar que o resíduo é o gradiente negativo da perda quadrática e generalizar para MAE, Huber e quantil (pinball)',
+    'Implementar gradient boosting do zero em NumPy e conferir que ele reproduz o GradientBoostingRegressor do scikit-learn',
+    'Escolher o número de árvores com early stopping em validação temporal, e não com a validação aleatória embutida',
+  ]}
+  prerequisitos={[
+    {label: 'Árvores de decisão por dentro', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao'},
+    {label: 'Bagging vs. boosting', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/bagging-vs-boosting'},
+  ]}
+/>
+
+Você já viu gradient descent treinando redes neurais: calcula-se o gradiente da perda em relação aos pesos e dá-se um passo pequeno na direção contrária. Em 2001, Jerome Friedman publicou um artigo com uma ideia que parece estranha à primeira vista: fazer gradient descent **no espaço das funções**. Em vez de ajustar pesos, o algoritmo soma uma função inteira (uma árvore) na direção que mais reduz a perda.
+
+Esse artigo é a base de LightGBM, CatBoost e XGBoost. E, por trás da matemática, o algoritmo cabe em vinte linhas de Python. Nesta aula você vai escrever essas vinte linhas, conferir que elas reproduzem o scikit-learn até o erro de arredondamento e, com uma troca de uma linha, transformar o mesmo algoritmo em regressão robusta (Huber) e em regressão quantílica (pinball). São exatamente as duas perdas que o projeto precisa: uma para não se deixar levar por virais, outra para os intervalos do módulo 5.
+
+:::info[A ideia central]
+Gradient boosting constrói o modelo como uma soma $$F(x) = F_0 + \nu \sum_m h_m(x)$$. Cada nova árvore $$h_m$$ é treinada para prever o **gradiente negativo da perda** em cada exemplo de treino, ou seja, a direção em que cada previsão deveria andar. Para a perda quadrática, esse gradiente é simplesmente o **resíduo** $$y - F(x)$$. Trocar a perda muda o gradiente e o valor das folhas, e nada mais.
+:::
+
+---
+
+## O algoritmo em cinco passos
+
+Dado um conjunto de treino $$\{(x_i, y_i)\}$$ e uma perda $$L(y, F)$$ diferenciável em $$F$$:
+
+1. **Comece com uma constante.** $$F_0 = \arg\min_c \sum_i L(y_i, c)$$. Para a perda quadrática, é a média de $$y$$.
+2. **Calcule os pseudo-resíduos.** Para cada exemplo, $$g_i = -\left.\dfrac{\partial L(y_i, F)}{\partial F}\right|_{F = F_{m-1}(x_i)}$$.
+3. **Treine uma árvore rasa** $$h_m$$ para prever $$g_i$$ a partir de $$x_i$$. A árvore define as regiões (as folhas) $$R_{1m}, \dots, R_{Jm}$$.
+4. **Ajuste o valor de cada folha** para a perda original: $$\gamma_{jm} = \arg\min_\gamma \sum_{x_i \in R_{jm}} L\left(y_i, F_{m-1}(x_i) + \gamma\right)$$.
+5. **Atualize com um passo pequeno.** $$F_m(x) = F_{m-1}(x) + \nu \sum_j \gamma_{jm}\, \mathbf{1}[x \in R_{jm}]$$, com $$0 < \nu \le 1$$ (a *learning rate*). Volte ao passo 2 até a validação parar de melhorar.
+
+<Sketch name="m3/gradient-boosting-loop" alt="Laço do gradient boosting em cinco passos numerados: 1, F zero igual à constante ótima; 2, gradiente negativo g i, que na perda quadrática é y menos F; 3, árvore rasa ajusta g i e escolhe as regiões; 4, cada folha recebe a constante ótima da perda nos resíduos da folha; 5, F recebe F mais ni vezes h. Depois do passo 5, um losango pergunta se a validação temporal ainda melhora: se sim, volta ao passo 2; se não, para e guarda a melhor iteração. Abaixo, uma tabela com quatro perdas: quadrática, gradiente y menos F, folha com a média; absoluta, gradiente sinal de y menos F, folha com a mediana; Huber, resíduo cortado em mais ou menos delta, folha com mediana mais correção robusta; quantil alfa, gradiente alfa se y maior que F e alfa menos 1 se não, folha com o quantil alfa dos resíduos." caption="O laço do gradient boosting. Trocar a perda muda só as colunas da tabela." />
+
+Os passos 3 e 4 parecem redundantes, mas não são. No passo 3, a árvore usa o critério quadrático de sempre para decidir **onde** cortar, olhando para os gradientes. No passo 4, o algoritmo decide **quanto** somar em cada folha, olhando para a perda verdadeira. Na perda quadrática os dois coincidem (a média dos resíduos já é o valor ótimo), por isso o passo 4 some na implementação mais simples.
+
+---
+
+## Por que o resíduo é um gradiente
+
+Tome a perda quadrática $$L(y, F) = \tfrac{1}{2}(y - F)^2$$. A derivada em relação à previsão é
+
+$$
+\frac{\partial L}{\partial F} = -(y - F) \quad\Longrightarrow\quad g_i = -\frac{\partial L}{\partial F} = y_i - F(x_i)
+$$
+
+O gradiente negativo é exatamente o resíduo. Agora pense nas $$n$$ previsões de treino $$F(x_1), \dots, F(x_n)$$ como $$n$$ "parâmetros". Gradient descent nesses parâmetros seria mover cada $$F(x_i)$$ um pouco na direção de $$g_i$$. O problema é que isso só define o passo **nos pontos de treino**; para um Short novo, não haveria regra.
+
+A solução de Friedman é aproximar o vetor de gradientes por uma função que generaliza: uma árvore treinada para prever $$g_i$$ a partir de $$x_i$$. A árvore agrupa posts com gradientes parecidos (por exemplo, "canais grandes com gancho forte estão sendo subestimados") e aplica o mesmo passo a todos eles, inclusive aos posts que o modelo ainda não viu. A *learning rate* $$\nu$$ faz o papel do tamanho do passo, como no gradient descent de sempre.
+
+---
+
+## Do zero, em NumPy
+
+O trecho abaixo usa o gerador da [aula 3.1](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao) (`shorts_sinteticos.py`) e o mesmo split temporal. A classe `GBDoZero` tem os passos 1, 2, 3 e 5; o passo 4 é desnecessário na perda quadrática.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error as mae
+from shorts_sinteticos import gerar_shorts
+
+df = gerar_shorts()
+df["log_inscritos"] = np.log(df["inscritos"])
+df = pd.concat([df, pd.get_dummies(df["setor"], prefix="setor", dtype=int)], axis=1)
+FEATURES = ["log_inscritos", "setor_beleza", "setor_moda", "setor_automotivo", "duracao_s",
+            "gancho", "rosto", "texto_tela", "energia", "hora", "dia_semana"]
+corte = pd.Timestamp("2026-01-01", tz="UTC")
+treino, teste = df[df["published_at"] < corte], df[df["published_at"] >= corte]
+X, y = treino[FEATURES].to_numpy(float), treino["y"].to_numpy()
+Xt, yt = teste[FEATURES].to_numpy(float), teste["y"].to_numpy()
+
+
+class GBDoZero:
+    """Gradient boosting com perda quadrática."""
+
+    def __init__(self, n_arvores=300, lr=0.05, profundidade=3, seed=0):
+        self.n_arvores, self.lr, self.profundidade, self.seed = n_arvores, lr, profundidade, seed
+
+    def fit(self, X, y):
+        rs = np.random.RandomState(self.seed)      # um gerador para todas as árvores, como no sklearn
+        self.f0 = y.mean()                          # passo 1: F0 = média
+        F = np.full(len(y), self.f0)
+        self.arvores = []
+        for _ in range(self.n_arvores):
+            residuo = y - F                         # passo 2: gradiente negativo da perda quadrática
+            h = DecisionTreeRegressor(max_depth=self.profundidade, random_state=rs).fit(X, residuo)
+            F += self.lr * h.predict(X)             # passo 5: passo pequeno na direção da árvore
+            self.arvores.append(h)
+        return self
+
+    def predict(self, X):
+        return self.f0 + self.lr * sum(h.predict(X) for h in self.arvores)
+
+
+nosso = GBDoZero(n_arvores=300, lr=0.05, profundidade=3).fit(X, y)
+sk = GradientBoostingRegressor(n_estimators=300, learning_rate=0.05, max_depth=3,
+                               random_state=0).fit(X, y)
+p_nosso, p_sk = nosso.predict(Xt), sk.predict(Xt)
+print(f"MAE teste  do zero: {mae(yt, p_nosso):.4f} | sklearn: {mae(yt, p_sk):.4f}")
+print(f"maior diferença entre as previsões: {np.abs(p_nosso - p_sk).max():.2e}")
+```
+
+```text
+MAE teste  do zero: 0.5843 | sklearn: 0.5843
+maior diferença entre as previsões: 1.24e-14
+```
+
+As previsões batem até o erro de arredondamento do ponto flutuante (diferença da ordem de $$10^{-14}$$). Um detalhe explica o `RandomState` compartilhado: o scikit-learn passa **o mesmo** gerador aleatório para todas as árvores do boosting, e esse gerador só serve para desempatar splits de ganho igual. Se você der a cada árvore uma semente fixa diferente (`random_state=m`), o MAE fica igual, mas algumas previsões individuais mudam até 0,2, porque um desempate diferente numa árvore propaga para todas as seguintes. É mais um lembrete da instabilidade que você viu na aula 3.1.
+
+No componente abaixo, cada árvore rasa soma uma correção à curva anterior. Mexa na learning rate e na profundidade e observe quando a curva de validação para de melhorar. Os dados são **simulados**.
+
+<BoostingPlayground />
+
+---
+
+## Learning rate e número de árvores
+
+A learning rate $$\nu$$ encolhe cada correção (por isso também se chama *shrinkage*). Com $$\nu$$ menor, cada árvore contribui menos, e você precisa de mais árvores para chegar ao mesmo lugar. Os dois hiperparâmetros trocam entre si, e o jeito certo de lidar com isso é **fixar a learning rate e deixar o early stopping escolher o número de árvores**.
+
+O trecho a seguir separa uma validação temporal **dentro** do treino (o segundo semestre de 2025), escolhe o número de árvores nela e só então reajusta em todo o treino e mede no teste:
+
+```python
+# validação temporal DENTRO do treino: 2º semestre de 2025
+lim_val = pd.Timestamp("2025-07-01", tz="UTC")
+tr, val = treino[treino["published_at"] < lim_val], treino[treino["published_at"] >= lim_val]
+
+print("  lr  | melhor n_arvores | MAE validação | MAE teste (refit com esse n)")
+for lr in [0.3, 0.1, 0.03, 0.01]:
+    gb = GradientBoostingRegressor(n_estimators=3000, learning_rate=lr, max_depth=3, random_state=0)
+    gb.fit(tr[FEATURES], tr["y"])
+    curva = [mae(val["y"], p) for p in gb.staged_predict(val[FEATURES])]
+    melhor = int(np.argmin(curva)) + 1
+    final = GradientBoostingRegressor(n_estimators=melhor, learning_rate=lr, max_depth=3,
+                                      random_state=0).fit(treino[FEATURES], treino["y"])
+    print(f"{lr:>5} | {melhor:>16} | {min(curva):>13.3f} | {mae(teste['y'], final.predict(teste[FEATURES])):.3f}")
+```
+
+```text
+  lr  | melhor n_arvores | MAE validação | MAE teste (refit com esse n)
+  0.3 |               54 |         0.509 | 0.584
+  0.1 |              185 |         0.502 | 0.579
+ 0.03 |              733 |         0.508 | 0.583
+ 0.01 |             1950 |         0.508 | 0.583
+```
+
+Três leituras:
+
+- O produto $$\nu \times$$ árvores fica numa faixa estreita (de 16 a 22 aqui): dividir a learning rate por 10 exige cerca de 10 vezes mais árvores.
+- Learning rates menores costumam generalizar um pouco melhor, mas nesta base o ganho some no ruído. Uma regra prática: use 0,05 a 0,1 enquanto itera nas features, porque é rápido, e baixe para 0,02 a 0,05 no modelo final, se o tempo de treino permitir.
+- Depois de escolher o número de árvores, reajustar com treino + validação usa os dados mais recentes, que são os mais parecidos com o futuro. Como o conjunto ficou maior, alguns praticantes aumentam o número de árvores na mesma proporção; os dois caminhos são defensáveis, desde que o teste não participe da escolha.
+
+---
+
+## Early stopping com validação temporal
+
+O scikit-learn oferece early stopping embutido: `GradientBoostingRegressor(n_iter_no_change=..., validation_fraction=...)`. O problema é **como** ele separa a validação. No código do scikit-learn 1.9.1, a separação é feita com `train_test_split`, que embaralha as linhas. Em outras palavras: uma validação **aleatória**, com posts do mesmo mês e do mesmo canal dos dois lados.
+
+```python
+# early stopping embutido do sklearn: validação ALEATÓRIA (train_test_split embaralhado)
+for lr in [0.3, 0.1]:
+    gb = GradientBoostingRegressor(n_estimators=3000, learning_rate=lr, max_depth=3, n_iter_no_change=50,
+                                   validation_fraction=0.2, random_state=0).fit(treino[FEATURES], treino["y"])
+    print(f"lr={lr}: parou em {gb.n_estimators_} árvores; MAE teste {mae(teste['y'], gb.predict(teste[FEATURES])):.3f}")
+```
+
+```text
+lr=0.3: parou em 101 árvores; MAE teste 0.596
+lr=0.1: parou em 294 árvores; MAE teste 0.589
+```
+
+Com validação aleatória, o modelo "aprende" que continuar ajustando detalhes de cada canal e de cada período compensa, porque a validação tem vizinhos temporais do treino. Ele para mais tarde (101 contra 54 árvores; 294 contra 185) e erra mais no futuro (0,596 contra 0,584; 0,589 contra 0,579). O `HistGradientBoostingRegressor` tem o mesmo comportamento com `validation_fraction`, mas desde versões recentes aceita `fit(X, y, X_val=..., y_val=...)`, e aí você passa a sua validação temporal. LightGBM, XGBoost e CatBoost também recebem um conjunto de validação explícito, como a [próxima aula](/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost) mostra.
+
+:::warning[Regra do projeto]
+Early stopping **sempre** com uma validação temporal que você mesmo separou: posts publicados depois de todos os posts de treino. Nunca com `validation_fraction` nem com qualquer split embaralhado.
+:::
+
+---
+
+## Outras perdas: o mesmo algoritmo com outro gradiente
+
+A perda quadrática prevê a **média** condicional de $$y$$. Isso nem sempre é o que você quer:
+
+- **Erro absoluto** $$|y - F|$$: prevê a **mediana**. Gradiente negativo: $$\text{sinal}(y - F)$$. Cada post "puxa" com força 1, seja o erro de 0,1 ou de 3.
+- **Huber** com parâmetro $$\delta$$: quadrática para erros pequenos, absoluta para grandes. Gradiente negativo: o resíduo cortado em $$\pm\delta$$. Um viral com resíduo 3 puxa com força $$\delta$$, não 3.
+- **Quantil** $$\alpha$$ (a <Termo id="pinball">pinball loss</Termo>): prevê o quantil $$\alpha$$ de $$y$$.
+
+$$
+L_\alpha(y, F) = \begin{cases} \alpha\,(y - F) & \text{se } y \ge F \\ (1 - \alpha)\,(F - y) & \text{se } y < F \end{cases}
+\qquad
+g = \begin{cases} \alpha & \text{se } y > F \\ \alpha - 1 & \text{se } y < F \end{cases}
+$$
+
+Com $$\alpha = 0{,}9$$, cada post acima da previsão empurra para cima com força 0,9 e cada post abaixo empurra para baixo com força 0,1. O equilíbrio acontece quando 90% dos posts ficam abaixo da previsão, que é a definição do quantil 0,9.
+
+Nessas perdas, o passo 4 deixa de ser opcional. O gradiente da perda absoluta vale sempre ±1, então a média dele numa folha diz a direção, mas não o tamanho do passo. O valor ótimo da folha é a mediana dos resíduos (absoluta) ou o quantil $$\alpha$$ dos resíduos (pinball). A versão genérica abaixo continua o trecho anterior:
+
+```python
+def gradiente_negativo(perda, r, alpha, delta):      # r = y - F
+    return {"quadratica": r, "absoluta": np.sign(r), "huber": np.clip(r, -delta, delta),
+            "quantil": np.where(r > 0, alpha, alpha - 1)}[perda]
+
+def valor_otimo(perda, r, alpha, delta):             # constante que minimiza a perda nos resíduos r
+    if perda == "quadratica": return r.mean()
+    if perda == "absoluta": return np.median(r)
+    if perda == "quantil": return np.quantile(r, alpha)
+    d = r - np.median(r)                             # huber: passo de Friedman (2001) para M-regression
+    return np.median(r) + np.mean(np.sign(d) * np.minimum(np.abs(d), delta))
+
+def gb_generico(X, y, perda, n=300, lr=0.05, prof=3, alpha=0.9, delta=1.0):
+    F0 = valor_otimo(perda, y, alpha, delta)
+    F, modelo = np.full(len(y), F0), []
+    for m in range(n):
+        g = gradiente_negativo(perda, y - F, alpha, delta)
+        h = DecisionTreeRegressor(max_depth=prof, random_state=m).fit(X, g)   # a árvore ajusta o gradiente
+        folha = h.apply(X)
+        valores = {f: valor_otimo(perda, (y - F)[folha == f], alpha, delta) for f in np.unique(folha)}
+        F += lr * np.array([valores[f] for f in folha])                     # mas cada folha usa o valor ótimo da PERDA
+        modelo.append((h, valores))
+    return lambda Xn: F0 + lr * sum(np.array([v[f] for f in h.apply(Xn)]) for h, v in modelo)
+
+prever_q90 = gb_generico(X, y, "quantil", alpha=0.9)
+sk_q90 = GradientBoostingRegressor(loss="quantile", alpha=0.9, n_estimators=300, learning_rate=0.05,
+                                   max_depth=3, random_state=0).fit(X, y)
+print(f"quantil 0,9 | fração do teste abaixo da previsão: do zero {np.mean(yt <= prever_q90(Xt)):.3f} "
+      f"| sklearn {np.mean(yt <= sk_q90.predict(Xt)):.3f}")
+for perda in ["absoluta", "huber"]:
+    print(f"{perda:<10} MAE teste do zero: {mae(yt, gb_generico(X, y, perda)(Xt)):.3f}")
+```
+
+```text
+quantil 0,9 | fração do teste abaixo da previsão: do zero 0.888 | sklearn 0.887
+absoluta   MAE teste do zero: 0.593
+huber      MAE teste do zero: 0.583
+```
+
+O modelo quantílico do zero deixa 88,8% dos posts de teste abaixo da previsão, praticamente igual ao do scikit-learn e perto dos 90% pedidos. É assim que se constrói o limite superior de um intervalo de predição, assunto da aula de [regressão quantílica](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/regressao-quantilica). O Huber do scikit-learn difere do nosso num ponto: ele recalcula $$\delta$$ a cada árvore como um quantil dos resíduos absolutos (parâmetro `alpha=0.9`), em vez de usar um valor fixo.
+
+---
+
+## Huber e os virais
+
+Por que isso importa para o projeto? Porque a sua base terá virais: posts com 10 ou 20 vezes a mediana do canal, por motivos que nenhuma feature captura (um compartilhamento de uma celebridade, uma trend). Na perda quadrática, um resíduo de 2,5 pesa 6,25; ele puxa as árvores seguintes na direção dele. O experimento abaixo infla o alvo de 3% dos posts de treino em +2,5 no log (cerca de 12 vezes mais curtidas) e mede o quanto cada perda se desloca:
+
+```python
+# "virais": 3% dos posts de treino com o log das curtidas inflado em +2,5 (cerca de 12x)
+rng = np.random.default_rng(1)
+y_sujo = y + 2.5 * (rng.random(len(y)) < 0.03)
+print(f"{'perda':<15} {'MAE limpo':>10} {'MAE c/ virais':>14} {'desloc. médio':>14}")
+for perda in ["squared_error", "absolute_error", "huber"]:
+    cfg = dict(loss=perda, n_estimators=300, learning_rate=0.05, max_depth=3, random_state=0)
+    p_limpo = GradientBoostingRegressor(**cfg).fit(X, y).predict(Xt)
+    p_sujo = GradientBoostingRegressor(**cfg).fit(X, y_sujo).predict(Xt)
+    print(f"{perda:<15} {mae(yt, p_limpo):>10.3f} {mae(yt, p_sujo):>14.3f} {np.mean(p_sujo - p_limpo):>+14.3f}")
+```
+
+```text
+perda            MAE limpo  MAE c/ virais  desloc. médio
+squared_error        0.584          0.599         +0.063
+absolute_error       0.590          0.601         +0.024
+huber                0.581          0.593         +0.027
+```
+
+A perda quadrática deslocou todas as previsões de teste em +0,063, quase os 0,075 que os virais somam à média (3% × 2,5). A absoluta e a Huber se deslocaram menos da metade disso. A Huber ainda teve o menor MAE nos dois cenários: ela se comporta como a quadrática para a maioria dos posts e como a absoluta para os extremos. Não é coincidência que o vencedor da trilha de vídeo do SMP Challenge 2025 (MVP, arXiv:2507.00950) tenha usado CatBoost com perda Huber.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A escolha da perda decide **o que** o seu modelo diz sobre A e B:
+
+- Com perda **quadrática** sobre $$\log(1+\text{curtidas})$$, a previsão é a média do log, ou seja, algo próximo da média geométrica das curtidas. Se a Lumina teve um viral no passado, as previsões de A **e** de B sobem juntas.
+- Com **Huber**, esse viral pesa menos, e a diferença B − A reflete mais o conteúdo e menos o acaso do histórico.
+- Com **quantil** 0,1 e 0,9, você obtém uma faixa para cada Short. Se as faixas de A e B se sobrepõem bastante, a resposta honesta à Lumina é "B tende a render mais, mas não é garantido". O módulo 5 calibra essas faixas.
+
+E o **early stopping temporal** garante que a comparação A vs. B vem de um modelo cujo tamanho foi escolhido olhando o futuro que ele não viu, e não um passado embaralhado.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas no gradient boosting]
+1. **Usar `validation_fraction` / `n_iter_no_change` do scikit-learn num problema temporal.** A validação é embaralhada; o modelo para tarde e erra mais no futuro.
+2. **Otimizar learning rate e número de árvores como se fossem independentes.** Fixe a learning rate e deixe o early stopping escolher as árvores.
+3. **Usar árvores fundas no boosting.** Profundidade 10 transforma cada "aprendiz fraco" numa árvore que decora o treino. Comece com profundidade 3 a 6 (ou `num_leaves` de 15 a 63 no LightGBM).
+4. **Esquecer que a perda define o que é previsto.** Um modelo quantílico de 0,9 avaliado por MAE parece péssimo, e deveria: ele não tenta acertar o centro.
+5. **Escolher a melhor iteração olhando o teste.** A curva do teste serve para ilustrar; quem escolhe é a validação.
+:::
+
+<Quiz
+  id="m3-a3"
+  perguntas={[
+    {
+      pergunta: 'Com perda quadrática e y = [3, 5, 10], quais são F₀ e os pseudo-resíduos da primeira árvore?',
+      opcoes: [
+        {texto: 'F₀ = 5; resíduos [−2, 0, 5].', explicacao: '5 é a mediana. Ela seria o F₀ da perda absoluta, não da quadrática.'},
+        {texto: 'F₀ = 6; resíduos [−3, −1, 4].', correta: true, explicacao: 'Na quadrática, F₀ é a média (6) e o gradiente negativo é y − F₀.'},
+        {texto: 'F₀ = 0; resíduos [3, 5, 10].', explicacao: 'O algoritmo começa da constante ótima, não de zero. Começar de zero desperdiçaria as primeiras árvores só para achar a média.'},
+      ],
+    },
+    {
+      pergunta: 'Com learning rate 0,1, o early stopping escolheu 185 árvores. Você baixa para 0,05, mantendo o resto. O que esperar?',
+      opcoes: [
+        {texto: 'Algo em torno de 370 árvores, com erro de validação parecido ou um pouco melhor.', correta: true, explicacao: 'Learning rate e número de árvores trocam entre si: o produto fica aproximadamente constante.'},
+        {texto: 'As mesmas 185 árvores, porque o número de árvores depende só dos dados.', explicacao: 'Com passos menores, o modelo precisa de mais árvores para chegar ao mesmo ponto.'},
+        {texto: 'Cerca de 90 árvores, porque cada árvore passa a pesar menos.', explicacao: 'É o contrário: pesando menos, são necessárias mais árvores.'},
+      ],
+    },
+    {
+      pergunta: 'Na pinball loss com α = 0,9, qual é o gradiente negativo de um post cujo valor real ficou **acima** da previsão?',
+      opcoes: [
+        {texto: '−0,1', explicacao: 'Esse é o valor para um post abaixo da previsão (α − 1).'},
+        {texto: '+0,9', correta: true, explicacao: 'Posts acima da previsão empurram para cima com força α. O equilíbrio é atingido quando 90% dos posts ficam abaixo.'},
+        {texto: 'O próprio resíduo, y − F.', explicacao: 'Isso vale para a perda quadrática. Na pinball, o gradiente só depende do lado em que o post caiu.'},
+      ],
+    },
+    {
+      pergunta: 'Por que a validação embutida do `GradientBoostingRegressor` (`validation_fraction`) é inadequada no projeto?',
+      opcoes: [
+        {texto: 'Porque ela usa só 10% dos dados.', explicacao: 'O tamanho é configurável. O problema é como as linhas são escolhidas.'},
+        {texto: 'Porque ela sorteia as linhas: posts do mesmo período e canal ficam dos dois lados, e o modelo para tarde demais.', correta: true, explicacao: 'No experimento, parou em 101 árvores (contra 54 na validação temporal) e errou mais no teste.'},
+        {texto: 'Porque o scikit-learn não permite early stopping em regressão.', explicacao: 'Permite; o problema é o tipo de split usado.'},
+      ],
+    },
+    {
+      pergunta: 'Sua base tem alguns virais extremos que nenhuma feature explica. Quais escolhas reduzem o impacto deles nas previsões? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Perda Huber.', correta: true, explicacao: 'O gradiente de cada post é limitado a ±δ; um viral não puxa mais que um erro moderado.'},
+        {texto: 'Perda absoluta.', correta: true, explicacao: 'Prevê a mediana, que é pouco sensível a extremos. No experimento, deslocou 0,024 contra 0,063 da quadrática.'},
+        {texto: 'Aumentar a learning rate para 0,5.', explicacao: 'Passos maiores fazem cada árvore seguir os resíduos grandes com mais força, não menos.'},
+        {texto: 'Modelar em log(1 + curtidas) em vez de curtidas cruas.', correta: true, explicacao: 'O log comprime a cauda: um post com 12× a mediana vira um resíduo de cerca de 2,5, não de 11 vezes a mediana.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: early stopping no GBDoZero]
+Adicione early stopping à classe `GBDoZero`:
+
+1. O método `fit` passa a receber `X_val`, `y_val` e `paciencia`.
+2. A cada árvore, atualize também a previsão da validação e calcule o MAE.
+3. Guarde a melhor iteração; se passarem `paciencia` árvores sem melhora, pare.
+4. No fim, descarte as árvores depois da melhor iteração.
+5. Rode com `lr=0.1`, até 3.000 árvores e paciência 50, usando `tr` e `val` da seção de learning rate. A melhor iteração bate com a tabela (185)?
+:::
+
+<details>
+<summary>Ver a solução</summary>
+
+```python
+class GBComParada(GBDoZero):
+    def fit(self, X, y, X_val, y_val, paciencia=50):
+        rs = np.random.RandomState(self.seed)
+        self.f0 = y.mean()
+        F, F_val = np.full(len(y), self.f0), np.full(len(y_val), self.f0)
+        self.arvores, melhor = [], np.inf
+        for m in range(self.n_arvores):
+            h = DecisionTreeRegressor(max_depth=self.profundidade, random_state=rs).fit(X, y - F)
+            F += self.lr * h.predict(X)
+            F_val += self.lr * h.predict(X_val)
+            self.arvores.append(h)
+            erro = np.abs(y_val - F_val).mean()
+            if erro < melhor:
+                melhor, self.melhor_iter = erro, m + 1
+            elif m + 1 - self.melhor_iter >= paciencia:        # paciência esgotada
+                break
+        self.arvores = self.arvores[: self.melhor_iter]          # descarta as árvores depois do melhor ponto
+        return self
+
+a = lambda d: d[FEATURES].to_numpy(float)
+gb = GBComParada(n_arvores=3000, lr=0.1).fit(a(tr), tr["y"].to_numpy(), a(val), val["y"].to_numpy())
+print(f"parou; melhor iteração = {gb.melhor_iter}, MAE validação = {mae(val['y'], gb.predict(a(val))):.3f}")
+```
+
+```text
+parou; melhor iteração = 185, MAE validação = 0.502
+```
+
+Bate exatamente com o scikit-learn, porque a implementação é a mesma (inclusive o gerador aleatório compartilhado). Com paciência muito pequena, como 5, o laço pode parar num mínimo local da curva de validação; paciências de 50 a 200 árvores são comuns.
+
+</details>
+
+---
+
+## Resumo
+
+- Gradient boosting é **gradient descent no espaço das funções**: cada árvore aproxima o gradiente negativo da perda e o modelo dá um passo pequeno ($$\nu$$) nessa direção.
+- Na perda quadrática, o gradiente negativo é o **resíduo** e o valor ótimo da folha é a média; por isso o algoritmo cabe em 20 linhas e reproduz o scikit-learn exatamente.
+- **Learning rate** e **número de árvores** trocam entre si: fixe a primeira e escolha a segunda com **early stopping** numa validação **temporal**.
+- Trocar a perda troca o gradiente e o valor das folhas: **absoluta** (mediana), **Huber** (robusta a virais) e **quantil/pinball** (limites de intervalo).
+- A validação embutida do scikit-learn é **aleatória**; no projeto, passe sempre a sua validação temporal.
+
+## Referências
+
+- Friedman. [*Greedy function approximation: a gradient boosting machine*](https://doi.org/10.1214/aos/1013203451). Annals of Statistics, 29(5), 2001. Deriva os algoritmos para perda quadrática, absoluta (LAD) e Huber (M-regression) usados nesta aula.
+- Friedman. [*Stochastic gradient boosting*](https://doi.org/10.1016/S0167-9473(01)00065-2). Computational Statistics & Data Analysis, 38(4), 2002. Subamostragem de linhas a cada árvore.
+- Hastie, Tibshirani e Friedman. [*The Elements of Statistical Learning*](https://hastie.su.domains/ElemStatLearn/), 2ª ed., 2009, seção 10.10 e tabela 10.2 (gradientes das perdas mais comuns).
+- Koenker e Bassett. [*Regression quantiles*](https://doi.org/10.2307/1913643). Econometrica, 46(1), 1978. A origem da perda quantílica.
+- Documentação do scikit-learn: [Gradient Boosting](https://scikit-learn.org/stable/modules/ensemble.html#gradient-boosting) (perdas, shrinkage, early stopping).
+- Ye et al. [*MVP: Winning Solution to SMP Challenge 2025 Video Track*](https://arxiv.org/abs/2507.00950). arXiv:2507.00950, 2025.
+
+**Próxima aula:** [LightGBM, CatBoost e XGBoost na prática](/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost): o que cada biblioteca faz diferente, os hiperparâmetros que importam e uma busca com Optuna em validação walk-forward.

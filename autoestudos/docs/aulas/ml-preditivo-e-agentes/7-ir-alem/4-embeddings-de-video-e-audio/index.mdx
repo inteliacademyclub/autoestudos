@@ -1,0 +1,637 @@
+---
+sidebar_position: 4
+sidebar_label: 'Embeddings de vídeo e áudio'
+title: 'Embeddings de vídeo e áudio'
+description: 'Quando e como ir além da média de frames: X-CLIP, VideoMAE e Qwen3-VL-Embedding para o vídeo inteiro, CLAP para o áudio, PCA ajustada no treino e ablação para provar o ganho.'
+tags: [ml-preditivo, ir-alem, multimodal, embeddings]
+---
+
+# Embeddings de Vídeo e Áudio: O Que a Média dos Frames Não Vê
+
+<LessonMeta
+  tempo="45 min"
+  semana="4+"
+  etapa="multimodal"
+  opcional
+  objetivos={[
+    'Explicar por que a média de embeddings por frame descarta a ordem e o ritmo do vídeo',
+    'Extrair embeddings de vídeo completo com X-CLIP e de áudio com CLAP, em CPU e de forma reprodutível',
+    'Escolher entre X-CLIP, VideoMAE e Qwen3-VL-Embedding pesando o que cada um enxerga, o custo e a licença',
+    'Reduzir os vetores com PCA ajustada só no treino e provar (ou refutar) o ganho com ablação e bootstrap',
+  ]}
+  prerequisitos={[
+    {label: 'Embeddings visuais: CLIP e SigLIP 2', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais'},
+    {label: 'Áudio e fala', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala'},
+    {label: 'Fusão e ablação multimodal', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao'},
+    {label: 'Análise de erros e ablação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao'},
+  ]}
+/>
+
+Pegue o Short B da Lumina: ele abre com metade do rosto sem maquiagem e termina com o rosto pronto. Agora inverta o vídeo: ele passa a abrir pronto e terminar com o rosto lavado. Para qualquer pessoa, são dois vídeos opostos. Para a feature da aula de [embeddings visuais](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais), a média dos embeddings SigLIP dos frames, os dois são **idênticos** até a última casa decimal. A média é uma soma, e a soma não se importa com a ordem.
+
+O som tem o mesmo problema. A tem voiceover calmo; B, música animada. Nenhum embedding de frame ouve isso, e o Whisper pega as palavras, mas não o clima.
+
+Esta aula apresenta os modelos que prometem fechar essas lacunas, os embeddings de **vídeo completo** (X-CLIP, VideoMAE, Qwen3-VL-Embedding) e de **áudio** (CLAP), e ensina a desconfiar da promessa: você vai medir o que um deles realmente captura.
+
+:::info[A ideia central]
+Embeddings de vídeo e de áudio são uma **camada 3 opcional** de features:
+- **Quando:** só depois que a camada 2 (sinais de baixo nível, CLIP/SigLIP por frame, detectores e rubrica do VLM, do módulo 4) estiver estável e medida.
+- **Como:** extrair uma vez, em cache versionado, reduzir com PCA ajustada no treino e aceitar o bloco só se a ablação mostrar ganho com intervalo de confiança.
+- **Quanto esperar:** pouco. A expectativa do briefing é que o visual some algo como +0,02 a +0,04 de Spearman; o canal continua dominando.
+:::
+
+:::info[Ambiente desta aula]
+Além do ambiente do módulo (na [aula 7.1](/aulas/ml-preditivo-e-agentes/ir-alem/pipeline-agnostico), com `transformers==5.17.0` e `torch==2.14.0`), você precisa do PyAV. Os pesos do X-CLIP e do CLAP somam cerca de 1,4 GB, e tudo roda em CPU.
+
+```bash
+uv add "av==18.1.0"
+```
+:::
+
+---
+
+## O que a média dos frames joga fora
+
+Se $$v_1, \dots, v_N$$ são os embeddings dos $$N$$ frames amostrados, a feature da camada 2 é
+
+$$
+\bar{v} = \frac{1}{N} \sum_{i=1}^{N} v_i
+$$
+
+Qualquer permutação dos frames produz o mesmo $$\bar{v}$$. Com isso se perdem três coisas que importam em Shorts:
+
+- **ordem:** a narrativa, como antes → depois ou problema → solução;
+- **ritmo:** quantos cortes, quão rápido a imagem muda;
+- **<Termo id="gancho">gancho</Termo>:** os 2 primeiros segundos são diluídos na média com o resto do vídeo.
+
+Antes de baixar qualquer modelo, dá para recuperar parte disso **de graça**, com os embeddings por frame do módulo 4. O trecho simula o Short B (8 frames "antes", 8 "depois") em três versões: original, invertida e embaralhada.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+D, N = 512, 16  # dimensão do embedding, frames amostrados
+
+# Short B simulado: 8 frames "antes" (rosto sem maquiagem) e 8 "depois".
+antes, depois = rng.normal(size=D), rng.normal(size=D)
+frames_b = np.array([antes + 0.3 * rng.normal(size=D) for _ in range(8)] +
+                    [depois + 0.3 * rng.normal(size=D) for _ in range(8)])
+frames_b /= np.linalg.norm(frames_b, axis=1, keepdims=True)
+
+variantes = {
+    "original": frames_b,
+    "invertido": frames_b[::-1],               # "depois → antes": outra história
+    "embaralhado": frames_b[rng.permutation(N)],  # cortes aleatórios
+}
+
+
+def cos(a, b):
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def feats_temporais(f, frac_gancho=0.125):
+    """Features baratas a partir de embeddings POR FRAME que você já tem (aula 4.4)."""
+    sim = (f[1:] * f[:-1]).sum(axis=1)       # cosseno entre frames vizinhos
+    k = max(1, round(len(f) * frac_gancho))  # primeiros ~2 s de um Short de 16 s
+    return {
+        "ritmo": float((1 - sim).mean()),     # mudança visual média entre frames
+        "maior_corte": float((1 - sim).max()),
+        "emb_gancho": f[:k].mean(axis=0),     # bloco separado: o que aparece no início
+    }
+
+
+ref = feats_temporais(frames_b)
+for nome, f in variantes.items():
+    ft = feats_temporais(f)
+    print(f"{nome:<12} média = original? {np.allclose(f.mean(0), frames_b.mean(0))}"
+          f" | ritmo {ft['ritmo']:.2f} | maior corte {ft['maior_corte']:.2f}"
+          f" | cos(gancho, gancho original) {cos(ft['emb_gancho'], ref['emb_gancho']):.2f}")
+```
+
+```text
+original     média = original? True | ritmo 0.15 | maior corte 1.05 | cos(gancho, gancho original) 1.00
+invertido    média = original? True | ritmo 0.15 | maior corte 1.05 | cos(gancho, gancho original) -0.03
+embaralhado  média = original? True | ritmo 0.66 | maior corte 1.06 | cos(gancho, gancho original) -0.04
+```
+
+A média não distingue as três versões. O **ritmo** separa o embaralhado (cheio de cortes), e o **embedding do gancho**, como bloco separado, separa o original do invertido. Se ainda não testou essas features na camada 2, teste antes de seguir.
+
+---
+
+## Modelos de vídeo completo
+
+Os modelos abaixo recebem vários frames de uma vez e devolvem **um vetor por vídeo**.
+
+<Sketch name="m7/embeddings-video-audio" alt="Diagrama: o Short B (frames e áudio) segue três caminhos. No primeiro, CLIP ou SigLIP por frame seguido de média. No segundo, um modelo de vídeo completo (X-CLIP, VideoMAE ou Qwen3-VL-Embedding). No terceiro, o áudio mono em 48 kHz passa pelo CLAP em janelas de 10 segundos. Os três vetores de 512 dimensões entram numa PCA ajustada só no treino, com 16 a 32 colunas por bloco, que alimenta o GBM junto com as camadas 1 e 2. O GBM passa por ablação com bootstrap pareado. Notas: a média ignora a ordem; o X-CLIP troca contexto entre frames, mas quase não vê a ordem, e o VideoMAE vê movimento; só vale depois da camada 2 estável, com ganho esperado de +0,02 a +0,04 de Spearman." caption="Três caminhos do Short ao vetor. A régua é a mesma para todos: ablação com split temporal." />
+
+| Modelo (checkpoint) | O que enxerga | Entrada | Saída | Licença | Pesos |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **X-CLIP** (`microsoft/xclip-base-patch32`) | CLIP ViT-B/32 por frame, com atenção entre frames e um transformer que integra os frames; treinado de forma supervisionada no Kinetics-400 | 8 frames, 224×224 | 512 | MIT | ~750 MB |
+| **VideoMAE** (`MCG-NJU/videomae-base`) | autoencoder mascarado sobre cubos espaço-temporais (*tubelets* de 2 frames consecutivos), auto-supervisionado | 16 frames, 224×224 | 768 por token (faça *pooling*) | **CC-BY-NC-4.0** | ~380 MB |
+| **Qwen3-VL-Embedding-2B** (`Qwen/Qwen3-VL-Embedding-2B`) | VLM de 2B parâmetros usado como encoder; aceita texto, imagem, vídeo e misturas, com instrução | vídeo + instrução | até 2.048 (escolhível de 64 a 2.048) | Apache-2.0 | ~4,3 GB |
+
+**X-CLIP** (Ni et al., ECCV 2022) estende o CLIP para vídeo com uma atenção que troca mensagens entre frames e um pequeno transformer que os integra num vetor só. Foi a escolha do **MVP**, vencedor da trilha de vídeo do SMP Challenge 2025 (arXiv:2507.00950): frames amostrados uniformemente, X-CLIP, média, PCA e CatBoost. Na ablação do paper, tirar o embedding de vídeo piorou o MAPE de 0,1754 para 0,1818; tirar o perfil do usuário, para 0,3010. O vídeo ajuda, mas o canal manda. Um detalhe: o MVP cita o X-CLIP de Ma et al. (arXiv:2207.07285, outro modelo com o mesmo nome) e não diz qual checkpoint usou; o `microsoft/xclip-base-patch32` é o de Ni et al.
+
+**VideoMAE** (Tong et al., NeurIPS 2022) aprende reconstruindo vídeos com 90% ou mais dos cubos escondidos. Como cada token vem de 2 frames consecutivos, o vetor depende da ordem **por construção**. Mas os checkpoints oficiais são **não comerciais**, o que bloqueia o uso num produto da Galaxies.
+
+**Qwen3-VL-Embedding-2B** saiu em janeiro de 2026 ([relatório técnico](https://arxiv.org/abs/2601.04720)), com dimensão de saída ajustável (*Matryoshka*) e instrução junto com o vídeo. É o mais expressivo e o mais caro dos três: planeje GPU. Não o executamos nesta aula.
+
+:::warning[Teste o que o modelo vê antes de acreditar no nome]
+Rodamos o X-CLIP no mesmo vídeo com os frames na ordem original e invertida (etapa 2, abaixo): a distância de cosseno $$1 - \cos$$ entre os vetores foi de cerca de **4×10⁻⁶**, praticamente zero. Num teste à parte, o embedding de um frame mudou cerca de 3% quando trocamos os **outros** frames. Ou seja, o X-CLIP troca **contexto** entre frames, mas essa atenção não tem noção de posição, e o transformer final, que tem, quase não altera o resultado. Para a narrativa antes → depois, use as features temporais baratas ou um modelo com *tubelets*.
+:::
+
+---
+
+## Áudio: CLAP
+
+O **CLAP** (Wu et al., arXiv:2211.06687) faz para o áudio o que o CLIP faz para imagens: coloca áudio e texto no mesmo espaço vetorial. Foi treinado no LAION-Audio-630K, com 633.526 pares áudio-texto. O checkpoint `laion/clap-htsat-unfused` (Apache-2.0) espera áudio a **48 kHz**, usa janelas de **10 s** e devolve 512 dimensões.
+
+O Whisper transcreve **o que** é dito; o CLAP resume **como soa** (música ou fala, energia, silêncio). E, como texto e áudio dividem o espaço, você pode criar **sondas** ("*upbeat music with drums*") e usar a similaridade com cada uma como coluna interpretável, em vez de 512 dimensões opacas.
+
+A armadilha: quando o áudio passa de 10 s, o extrator do checkpoint *unfused* usa `truncation="rand_trunc"` e **sorteia** um trecho. Medimos: o mesmo áudio de 30 s, processado duas vezes, deu vetores com cosseno de 0,9946, e não 1. Uma feature que muda a cada execução estraga a comparação entre experimentos. A solução é cortar as janelas você mesmo e tirar a média (etapa 3).
+
+---
+
+## Na prática: extrair, guardar e medir
+
+As etapas 1 a 4 formam um único script; a etapa 5 é independente e roda sem os modelos.
+
+**Etapa 1: frames e áudio com PyAV.** Para testar sem um Short real, o trecho gera um vídeo vertical sintético de 12 s (escuro, depois claro, com um tom intermitente).
+
+```python
+import av
+import numpy as np
+
+
+def gerar_short_sintetico(caminho, segundos=12, fps=24, sr=48_000, com_audio=True):
+    """Vídeo vertical de teste: escuro → claro (antes/depois) e um tom com 'batida'."""
+    with av.open(caminho, "w") as c:
+        v = c.add_stream("mpeg4", rate=fps)
+        v.width, v.height, v.pix_fmt = 360, 640, "yuv420p"
+        a = c.add_stream("aac", rate=sr, layout="mono") if com_audio else None
+        for i in range(segundos * fps):
+            nivel = int(40 + 180 * (i >= segundos * fps // 2))  # corte no meio
+            img = np.full((640, 360, 3), nivel, dtype=np.uint8)
+            c.mux(v.encode(av.VideoFrame.from_ndarray(img, format="rgb24")))
+        c.mux(v.encode(None))
+        if a is None:
+            return
+        t = np.arange(segundos * sr) / sr
+        som = 0.3 * np.sin(2 * np.pi * 220 * t) * (np.sin(2 * np.pi * 2 * t) > 0)
+        for ini in range(0, len(som), 1024):
+            fr = av.AudioFrame.from_ndarray(som[None, ini:ini + 1024].astype(np.float32),
+                                            format="flt", layout="mono")
+            fr.sample_rate = sr
+            c.mux(a.encode(fr))
+        c.mux(a.encode(None))
+
+
+def amostrar_frames(caminho, n=8):
+    """n frames RGB uniformemente espaçados no tempo (uma passada de decodificação)."""
+    with av.open(caminho) as c:
+        dur = c.duration / av.time_base
+        alvos = [(k + 0.5) * dur / n for k in range(n)]
+        frames = []
+        for f in c.decode(video=0):
+            if f.time is not None and f.time >= alvos[len(frames)]:
+                frames.append(f.to_ndarray(format="rgb24"))
+                if len(frames) == n:
+                    break
+    return frames
+
+
+def ler_audio(caminho, sr=48_000):
+    """Áudio mono em float32 na taxa pedida (o CLAP espera 48 kHz)."""
+    rs = av.AudioResampler(format="flt", layout="mono", rate=sr)
+    partes = []
+    with av.open(caminho) as c:
+        for f in c.decode(audio=0):
+            partes += [x.to_ndarray().ravel() for x in rs.resample(f)]
+    partes += [x.to_ndarray().ravel() for x in rs.resample(None)]  # esvazia o buffer
+    return np.concatenate(partes)
+
+
+gerar_short_sintetico("short_b.mp4")
+frames, audio = amostrar_frames("short_b.mp4"), ler_audio("short_b.mp4")
+print(len(frames), frames[0].shape, [int(f.mean()) for f in frames])
+print(audio.shape, audio.dtype, f"{len(audio) / 48_000:.1f} s")
+```
+
+```text
+8 (640, 360, 3) [38, 38, 38, 38, 218, 218, 218, 218]
+(577536,) float32 12.0 s
+```
+
+**Etapa 2: embedding de vídeo com X-CLIP.** Dois detalhes. O processador faz um *center crop* de 224×224, que num vídeo 9:16 corta cerca de 22% do topo e 22% da base, justamente onde costuma ficar o texto na tela; por isso o trecho completa cada frame com bordas pretas. E, no `transformers` 5.x, o `get_video_features` devolve um objeto, não um tensor: o vetor está em `pooler_output`.
+
+```python
+import time
+
+import numpy as np
+import torch
+from transformers import XCLIPModel, XCLIPProcessor
+
+# continua da etapa 1 (amostrar_frames)
+ID_XCLIP = "microsoft/xclip-base-patch32"  # ~750 MB (safetensors), licença MIT
+proc_v = XCLIPProcessor.from_pretrained(ID_XCLIP)
+modelo_v = XCLIPModel.from_pretrained(ID_XCLIP).eval()
+N_FRAMES = modelo_v.config.vision_config.num_frames  # 8 neste checkpoint
+
+
+def quadrado(frame: np.ndarray) -> np.ndarray:
+    """Completa com preto até ficar quadrado. Sem isso, o center crop de 224x224
+    corta ~22% do topo e ~22% da base de um vídeo 9:16 (onde costuma estar o texto)."""
+    h, w, _ = frame.shape
+    lado = max(h, w)
+    out = np.zeros((lado, lado, 3), dtype=frame.dtype)
+    y, x = (lado - h) // 2, (lado - w) // 2
+    out[y:y + h, x:x + w] = frame
+    return out
+
+
+def embedding_xclip(frames: list[np.ndarray]) -> np.ndarray:
+    """Um vetor de 512 dimensões (normalizado) por vídeo."""
+    assert len(frames) == N_FRAMES, f"o checkpoint espera {N_FRAMES} frames"
+    entrada = proc_v(videos=[[quadrado(f) for f in frames]], return_tensors="pt")
+    with torch.inference_mode():
+        saida = modelo_v.get_video_features(**entrada)  # pixel_values: (1, 8, 3, 224, 224)
+    # transformers 5.x devolve um objeto; o vetor projetado está em pooler_output
+    vetor = saida.pooler_output[0]
+    return torch.nn.functional.normalize(vetor, dim=-1).numpy()
+
+
+frames = amostrar_frames("short_b.mp4", n=N_FRAMES)
+t0 = time.perf_counter()
+e = embedding_xclip(frames)
+print(e.shape, f"{time.perf_counter() - t0:.1f} s")
+
+e_inv = embedding_xclip(frames[::-1])  # mesmo conteúdo, ordem invertida
+print("1 - cos(original, invertido):", f"{1 - float(e @ e_inv):.1e}")
+```
+
+```text
+(512,) 5.5 s
+1 - cos(original, invertido): 4.4e-06
+```
+
+O tempo de 5,5 s inclui o aquecimento da primeira chamada, numa máquina ocupada; veja a seção de custo para os números estáveis.
+
+**Etapa 3: embedding de áudio com CLAP.** Janelas de 10 s cortadas por você, média dos embeddings e três sondas de texto testadas em áudios sintéticos.
+
+```python
+import numpy as np
+import torch
+from transformers import ClapModel, ClapProcessor
+
+ID_CLAP = "laion/clap-htsat-unfused"  # ~615 MB, licença Apache-2.0
+proc_a = ClapProcessor.from_pretrained(ID_CLAP)
+modelo_a = ClapModel.from_pretrained(ID_CLAP).eval()
+SR = proc_a.feature_extractor.sampling_rate           # 48000
+JANELA = proc_a.feature_extractor.max_length_s * SR   # 10 s
+
+
+def embedding_clap(audio: np.ndarray) -> np.ndarray:
+    """Média de embeddings de janelas de 10 s. Cortar você mesmo evita o
+    'rand_trunc' do extrator, que sorteia um trecho quando o áudio passa de 10 s."""
+    janelas = [audio[i:i + JANELA] for i in range(0, len(audio), JANELA)]
+    janelas = [j for j in janelas if len(j) >= SR] or [audio]  # descarta sobra < 1 s
+    entrada = proc_a(audio=janelas, sampling_rate=SR, return_tensors="pt")
+    with torch.inference_mode():
+        e = modelo_a.get_audio_features(**entrada).pooler_output  # (n_janelas, 512)
+    return torch.nn.functional.normalize(e.mean(0), dim=-1).numpy()
+
+
+# Colunas interpretáveis: similaridade do áudio com descrições em texto (em inglês,
+# a língua em que o CLAP foi treinado).
+SONDAS = ["upbeat music with drums", "a person speaking calmly", "silence"]
+with torch.inference_mode():
+    t = proc_a(text=SONDAS, return_tensors="pt", padding=True)
+    emb_sondas = torch.nn.functional.normalize(
+        modelo_a.get_text_features(**t).pooler_output, dim=-1).numpy()
+
+# Três áudios sintéticos de 25 s
+rng, tt = np.random.default_rng(0), np.arange(25 * SR) / SR
+batida = (np.sin(2 * np.pi * 60 * tt) * np.exp(-30 * (tt % 0.5))
+          + 0.3 * rng.normal(size=tt.size) * np.exp(-60 * ((tt + 0.25) % 0.5)))
+testes = {"batida 120 bpm": batida, "tom puro 440 Hz": 0.3 * np.sin(2 * np.pi * 440 * tt),
+          "quase silêncio": 0.001 * rng.normal(size=tt.size)}
+for nome, x in testes.items():
+    e = embedding_clap(x.astype(np.float32))
+    sims = {s: round(float(v), 2) for s, v in zip(SONDAS, emb_sondas @ e)}
+    print(f"{nome:<16} {e.shape} {sims}")
+
+e1, e2 = embedding_clap(batida.astype(np.float32)), embedding_clap(batida.astype(np.float32))
+print("determinístico?", np.allclose(e1, e2))
+```
+
+```text
+batida 120 bpm   (512,) {'upbeat music with drums': 0.2, 'a person speaking calmly': -0.09, 'silence': -0.07}
+tom puro 440 Hz  (512,) {'upbeat music with drums': 0.13, 'a person speaking calmly': 0.19, 'silence': 0.21}
+quase silêncio   (512,) {'upbeat music with drums': -0.09, 'a person speaking calmly': 0.14, 'silence': 0.32}
+determinístico? True
+```
+
+As sondas acertam a batida e o silêncio; o tom puro não combina com nenhuma, e as três similaridades ficam baixas e próximas. Valide as sondas em áudios reais da sua base antes de transformá-las em feature.
+
+**Etapa 4: extração em lote com cache.** A extração roda uma vez e precisa sobreviver a quedas de sessão. O cache guarda um arquivo por vídeo, pula o que já existe e leva a **versão** da extração no nome da pasta: mudou o número de frames ou o recorte, os vetores antigos deixam de ser comparáveis.
+
+```python
+import pathlib
+
+import numpy as np
+import pandas as pd
+
+# continua das etapas 1 a 3
+VERSAO = "xclip-b32-8f-quadrado|clap-unfused-10s|v1"  # mude se mudar qualquer detalhe
+CACHE = pathlib.Path("cache_emb") / VERSAO.replace("|", "__")
+CACHE.mkdir(parents=True, exist_ok=True)
+
+
+def extrair_lote(videos: dict[str, str]) -> dict[str, str]:
+    """videos: post_id -> caminho. Salva um .npz por vídeo e pula os que já existem,
+    então a sessão pode cair (ou a cota de GPU acabar) sem perder o que foi feito."""
+    falhas = {}
+    for pid, caminho in videos.items():
+        destino = CACHE / f"{pid}.npz"
+        if destino.exists():
+            continue
+        try:
+            ev = embedding_xclip(amostrar_frames(caminho, N_FRAMES))
+            try:
+                ea = embedding_clap(ler_audio(caminho))
+            except (IndexError, ValueError):  # vídeo sem trilha de áudio
+                ea = np.full(512, np.nan, dtype=np.float32)
+            np.savez(destino, xclip=ev, clap=ea)
+        except Exception as e:  # arquivo corrompido, removido, formato estranho...
+            falhas[pid] = repr(e)[:120]
+    return falhas
+
+
+def consolidar() -> pd.DataFrame:
+    linhas = {}
+    for f in sorted(CACHE.glob("*.npz")):
+        z = np.load(f)
+        linhas[f.stem] = np.concatenate([z["xclip"], z["clap"]])
+    cols = [f"xclip_{i}" for i in range(512)] + [f"clap_{i}" for i in range(512)]
+    return pd.DataFrame.from_dict(linhas, orient="index", columns=cols)
+
+
+gerar_short_sintetico("short_a.mp4", segundos=20)
+gerar_short_sintetico("sem_audio.mp4", segundos=4, com_audio=False)
+falhas = extrair_lote({"lumina_a": "short_a.mp4", "lumina_b": "short_b.mp4",
+                       "sem_audio": "sem_audio.mp4", "sumiu": "nao_existe.mp4"})
+emb = consolidar()
+emb.to_parquet("embeddings_video_audio.parquet")
+print(emb.shape, "| falhas:", falhas)
+```
+
+```text
+(3, 1024) | falhas: {'sumiu': "FileNotFoundError(2, 'No such file or directory', 'nao_existe.mp4')"}
+```
+
+O `sem_audio.mp4` entrou com as 512 colunas do CLAP em `NaN`, que o LightGBM trata nativamente, e o arquivo inexistente virou uma falha registrada, sem derrubar o lote. Rodar de novo não reprocessa nada.
+
+**Etapa 5: PCA ajustada no treino e ablação.** Sem modelo de vídeo: uma base sintética de 1.600 Shorts com um efeito pequeno de "ritmo" **plantado** num embedding de 512 dimensões, misturado a muita variação visual que **não** importa. O bloco de embedding melhora o Spearman no teste temporal?
+
+```python
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.decomposition import PCA
+
+# --- Etapa 5a: base sintética (o alvo já é relativo ao canal) ---
+rng = np.random.default_rng(7)
+n, D = 1600, 512
+df = pd.DataFrame({
+    "dia": np.sort(rng.integers(0, 600, n)),
+    "hora_nobre": rng.integers(0, 2, n),
+    "gancho_vlm": rng.integers(0, 11, n),       # camada 2: rubrica do VLM
+    "rosto_no_gancho": rng.integers(0, 2, n),   # camada 2: detector
+})
+ritmo = rng.normal(size=n)                      # efeito plantado que só o embedding "vê"
+df["y"] = (0.12 * df.hora_nobre + 0.06 * (df.gancho_vlm - 5) + 0.15 * df.rosto_no_gancho
+           + 0.15 * ritmo + rng.normal(0, 0.45, n))
+fatores = rng.normal(size=(n, 12)) * 3          # variação visual grande que NÃO importa
+E = (fatores @ rng.normal(size=(12, D)) + np.outer(ritmo, rng.normal(size=D))
+     + rng.normal(0, 2, (n, D)))                # (luz, cenário, cor da roupa...)
+treino = (df.dia < 480).to_numpy()              # split temporal: o fim do período é teste
+teste = ~treino
+```
+
+```python
+# --- Etapa 5b: ablação com PCA ajustada só no treino e bootstrap pareado ---
+base = ["hora_nobre", "gancho_vlm", "rosto_no_gancho"]
+params = dict(n_estimators=300, learning_rate=0.03, num_leaves=15, min_child_samples=30,
+              subsample=0.8, subsample_freq=1, verbose=-1, random_state=0)
+
+
+def prever(X: pd.DataFrame) -> np.ndarray:
+    m = lgb.LGBMRegressor(**params).fit(X[treino], df.y[treino])
+    return m.predict(X[teste])
+
+
+def bootstrap_ganho(p_ref, p_novo, y, B=1000, seed=0):
+    """Bootstrap pareado da diferença de Spearman (mesmos exemplos nos dois modelos)."""
+    r = np.random.default_rng(seed)
+    difs = []
+    for _ in range(B):
+        i = r.integers(0, len(y), len(y))
+        difs.append(spearmanr(p_novo[i], y[i]).statistic - spearmanr(p_ref[i], y[i]).statistic)
+    return np.mean(difs), *np.percentile(difs, [5, 95])
+
+
+y_teste = df.y[teste].to_numpy()
+p_base = prever(df[base])
+print(f"camadas 1+2          Spearman {spearmanr(p_base, y_teste).statistic:.3f}")
+for k in (8, 16):
+    pca = PCA(n_components=k, random_state=0).fit(E[treino])  # ajusta SÓ no treino
+    P = pd.DataFrame(pca.transform(E), columns=[f"vid_pc{i}" for i in range(k)])
+    p = prever(pd.concat([df[base], P], axis=1))
+    ganho, lo, hi = bootstrap_ganho(p_base, p, y_teste)
+    print(f"+ embedding PCA {k:<3}  Spearman {spearmanr(p, y_teste).statistic:.3f}"
+          f" | var. explicada {pca.explained_variance_ratio_.sum():.2f}"
+          f" | ganho {ganho:+.3f} (IC 90%: {lo:+.3f} a {hi:+.3f})")
+```
+
+```text
+camadas 1+2          Spearman 0.417
++ embedding PCA 8    Spearman 0.287 | var. explicada 0.71 | ganho -0.131 (IC 90%: -0.189 a -0.074)
++ embedding PCA 16   Spearman 0.448 | var. explicada 0.97 | ganho +0.029 (IC 90%: -0.044 a +0.101)
+```
+
+Três lições:
+
+1. **A <Termo id="pca">PCA</Termo> guarda o que varia mais, não o que importa.** Com 8 componentes, ela pegou só a variação irrelevante, e o GBM gastou divisões com ruído: o modelo **piorou** 0,13. O ritmo só entrou com 16 componentes.
+2. **Ganho plausível não é ganho provado.** Com 16 componentes, o Spearman subiu 0,029, na faixa do briefing, mas o IC do <Termo id="bootstrap">bootstrap</Termo> pareado cruza o zero. Com esse teste, você não pode afirmar que o bloco ajuda.
+3. **A PCA é ajustada só no treino.** Ela não vê o alvo, então o vazamento é sutil, mas ajustá-la na base inteira usa a distribuição do futuro e gera colunas que mudam a cada retreino. Salve o objeto `pca` junto com o modelo.
+
+---
+
+## Custo: CPU, GPU e a cota do Kaggle
+
+Medimos num Apple M2, em CPU com 4 threads e com outros processos disputando a máquina (mediana de 3 a 5 repetições):
+
+| Passo | Tempo por Short |
+| :--- | :--- |
+| Decodificar e amostrar 8 frames (vídeo de 30 s, 720×1280) | 1,23 s |
+| X-CLIP (8 frames) | 1,15 s |
+| CLAP (30 s de áudio, 3 janelas) | 0,38 s |
+| **Total** | **cerca de 2,8 s** |
+
+São cerca de 4 horas de CPU para 5.000 Shorts: X-CLIP e CLAP **cabem em CPU** numa base do tamanho do projeto, desde que a extração rode uma vez, em cache. Decodificar custa tanto quanto o modelo, e a GPU não acelera essa parte. Meça nos seus primeiros 20 vídeos e extrapole.
+
+O Qwen3-VL-Embedding-2B é outra conversa: não o medimos, mas, com 2B parâmetros e centenas de tokens visuais por vídeo, ele pede GPU. A opção gratuita mais comum é o Kaggle, com 2×T4 (16 GB cada), cota semanal de GPU de cerca de 30 horas e sessões de até 12 horas. A cota varia; confira na [documentação](https://www.kaggle.com/docs/notebooks). Três cuidados:
+
+- a T4 não tem suporte nativo a `bfloat16`: carregue em `float16`;
+- use o cache da etapa 4, para que o limite de 12 horas por sessão não custe trabalho;
+- os vídeos baixados seguem as regras de retenção de [Documentação, ética e termos de uso](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos).
+
+---
+
+## Quando vale a pena
+
+Só avance para a camada 3 se todas as respostas forem "sim":
+
+1. **A camada 2 está estável?** Split temporal, *baseline* batido e ablação da camada 2 feita, como em [fusão e ablação](/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao).
+2. **Você tem uma hipótese?** Por exemplo, "os maiores erros são Shorts com música e cortes rápidos". Olhe os 20 piores resíduos antes.
+3. **Já testou as features baratas?** Ritmo, maior corte e embedding do gancho custam zero inferência.
+4. **O critério de aceite foi definido antes?** Por exemplo, IC de 90% do ganho de Spearman acima de zero, com bootstrap pareado e <Termo id="walk-forward">walk-forward</Termo>.
+5. **A licença permite uso comercial?** X-CLIP (MIT), CLAP e Qwen3-VL-Embedding (Apache-2.0) permitem; o VideoMAE oficial, não.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+O que muda na análise de **A vs. B**:
+
+- **Features temporais baratas:** o gancho de B (rosto sem maquiagem) destoa do resto do vídeo, e o ritmo de B é maior. A abre com o logo e mantém o rosto o tempo todo, com ritmo baixo. Esses sinais já estavam nos embeddings por frame; faltava extraí-los.
+- **Recorte vertical:** sem a função `quadrado`, o *center crop* pode cortar o texto grande de B, um dos diferenciais do criativo.
+- **CLAP:** a sonda "*upbeat music with drums*" deve pontuar mais em B, e "*a person speaking calmly*", em A. A linha "Áudio" da tabela da Lumina vira duas colunas mensuráveis.
+- **O que não muda:** o histórico do canal, o mesmo para A e B, continua dominando. O bloco novo deve reforçar um pouco a vantagem de B, mas os intervalos, que já se sobrepõem, continuarão se sobrepondo. Só diga à Lumina que "o áudio de B favorece o resultado" se a ablação mostrar ganho de ordenação com IC acima de zero; antes disso, é hipótese.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Confiar no nome do modelo.** "Modelo de vídeo" não garante sensibilidade à ordem. Teste com o vídeo invertido.
+2. **Deixar o *center crop* cortar o vídeo vertical.** Em 9:16, perde-se cerca de 44% da altura, com o texto na tela.
+3. **Aceitar o `rand_trunc` do CLAP.** Embeddings que mudam a cada execução tornam os experimentos incomparáveis.
+4. **Jogar 512 ou 1.024 colunas cruas no GBM.** Com poucos milhares de Shorts, é convite a *overfitting*.
+5. **Ajustar a PCA na base inteira ou sem versionar.** A coluna `vid_pc3` de dois retreinos passa a significar coisas diferentes.
+6. **Não versionar a extração.** Outro número de frames, recorte ou checkpoint exige nova pasta de cache.
+7. **Ignorar a licença.** O VideoMAE oficial é CC-BY-NC-4.0.
+8. **Começar por aqui.** Sem a camada 2 medida, não há régua para a camada 3.
+:::
+
+<Quiz
+  id="m7-a4"
+  perguntas={[
+    {
+      pergunta: 'Você inverteu a ordem dos 16 frames de um Short e recalculou a **média** dos embeddings SigLIP por frame. O que acontece com o vetor?',
+      opcoes: [
+        {texto: 'Muda pouco, porque os frames são os mesmos.', explicacao: 'Não muda nada: a média é uma soma dividida por N, e a soma é invariante à ordem.'},
+        {texto: 'Fica idêntico.', correta: true, explicacao: 'Exato. Qualquer permutação dos frames produz a mesma média. Para capturar ordem e ritmo, extraia features temporais explícitas ou use um modelo sensível à ordem.'},
+        {texto: 'Muda bastante, porque o gancho agora é outro.', explicacao: 'O gancho só aparece se você o tratar como um bloco separado (média dos primeiros frames). Na média global, ele se dilui.'},
+        {texto: 'Depende do modelo de embedding usado.', explicacao: 'Não depende: cada frame é embutido de forma independente, e a média de qualquer conjunto de vetores ignora a ordem.'},
+      ],
+    },
+    {
+      pergunta: 'No teste da aula, a distância de cosseno do X-CLIP entre um vídeo e sua versão invertida foi de cerca de 4×10⁻⁶. Qual conclusão é correta?',
+      opcoes: [
+        {texto: 'O X-CLIP é igual à média simples dos frames e não traz nada novo.', explicacao: 'Não é bem assim: o embedding de um frame mudou cerca de 3% quando os outros frames mudaram. Ele troca contexto entre frames; só não codifica bem a ordem.'},
+        {texto: 'O X-CLIP troca contexto entre frames, mas quase não codifica a ordem; para narrativa antes → depois, adicione features temporais explícitas ou use um modelo com tubelets.', correta: true, explicacao: 'Isso mesmo. A atenção entre frames não tem posição, e o transformer final, que tem, quase não altera o vetor.'},
+        {texto: 'Houve um bug: o processador descartou os frames.', explicacao: 'O `pixel_values` tem formato (1, 8, 3, 224, 224) e o vetor muda quando o conteúdo muda. O comportamento vem da arquitetura.'},
+        {texto: 'Modelos de vídeo nunca são sensíveis à ordem.', explicacao: 'Generalização errada: o VideoMAE, por exemplo, forma tokens a partir de pares de frames consecutivos e depende da ordem por construção.'},
+      ],
+    },
+    {
+      pergunta: 'Quais práticas tornam o embedding CLAP reprodutível e útil para o modelo? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Cortar o áudio em janelas de 10 s e tirar a média dos embeddings.', correta: true, explicacao: 'Evita o sorteio de trecho do `rand_trunc` e cobre o áudio inteiro.'},
+        {texto: 'Deixar o extrator com a configuração padrão, mesmo para áudios de 60 s.', explicacao: 'O padrão do checkpoint *unfused* sorteia 10 s do áudio: medimos cosseno de 0,9946 entre duas execuções do mesmo arquivo.'},
+        {texto: 'Reamostrar para 48 kHz mono antes de extrair.', correta: true, explicacao: 'É a taxa que o `laion/clap-htsat-unfused` espera.'},
+        {texto: 'Usar a similaridade com sondas de texto como colunas interpretáveis.', correta: true, explicacao: 'Poucas colunas com significado claro combinam bem com GBM e SHAP, desde que validadas em áudios reais.'},
+        {texto: 'Passar o áudio de 16 kHz usado no Whisper direto para o CLAP.', explicacao: 'Se você declarar `sampling_rate=16000`, o extrator recusa com `ValueError`; se omitir, ele interpreta o áudio como 48 kHz e o som fica 3× mais rápido. Reamostre.'},
+      ],
+    },
+    {
+      pergunta: 'Sua ablação deu +0,029 de Spearman para o bloco de vídeo, com IC de 90% de −0,044 a +0,101. O que fazer?',
+      opcoes: [
+        {texto: 'Adotar o bloco: o ganho médio é positivo e está na faixa esperada.', explicacao: 'O intervalo cruza o zero: com esse teste, você não consegue distinguir o ganho de ruído.'},
+        {texto: 'Concluir que embeddings de vídeo são inúteis para o projeto.', explicacao: 'Ausência de prova não é prova de ausência. No exemplo sintético, o efeito existe (foi plantado), mas o teste é pequeno demais para prová-lo.'},
+        {texto: 'Tratar o ganho como não provado: aumentar a evidência (walk-forward, mais dados de teste) ou decidir pelo custo, sem afirmar à marca que o vídeo ajuda.', correta: true, explicacao: 'Isso mesmo. Registre o resultado, tente obter mais evidência e só comunique o ganho quando o IC ficar acima de zero.'},
+      ],
+    },
+    {
+      pergunta: 'A Galaxies vai usar o agente comercialmente. Qual combinação de checkpoints é compatível com isso, pelas licenças publicadas no Hugging Face?',
+      opcoes: [
+        {texto: 'VideoMAE (`MCG-NJU/videomae-base`) + CLAP.', explicacao: 'O VideoMAE oficial é CC-BY-NC-4.0: uso não comercial.'},
+        {texto: 'X-CLIP (`microsoft/xclip-base-patch32`) + CLAP (`laion/clap-htsat-unfused`).', correta: true, explicacao: 'MIT e Apache-2.0, ambas permissivas. Mesmo assim, registre as licenças no model card.'},
+        {texto: 'Qualquer uma: modelos no Hugging Face são livres para uso comercial.', explicacao: 'Não são. Cada checkpoint tem sua licença, e algumas proíbem uso comercial.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: quando o embedding vira evidência]
+**Parte A (sem vídeo, 10 minutos).** Rode a etapa 5 e responda:
+
+1. O que acontece com o ganho se você usar 32 e 64 componentes?
+2. E se o efeito plantado de ritmo cair de 0,15 para 0,05?
+3. Dobre a base (`n = 3200`). O IC do ganho com 16 componentes passa a excluir o zero?
+
+**Parte B (na sua base).** Extraia X-CLIP e CLAP para os Shorts do seu período de treino e de teste com as etapas 1 a 4. Monte uma tabela de ablação com quatro linhas: camadas 1+2; + features temporais baratas; + X-CLIP (PCA 16); + CLAP (três sondas). Use o mesmo split temporal e o bootstrap pareado. Decida o que entra no modelo final e escreva uma frase de justificativa para o README.
+:::
+
+<details>
+<summary>Ver resultados da Parte A e dicas para a Parte B</summary>
+
+Resultados obtidos com as seeds da aula:
+
+```text
+PCA 32 (efeito 0,15): Spearman 0.448 | ganho +0.030 (IC 90%: -0.034 a +0.097)
+PCA 64 (efeito 0,15): Spearman 0.456 | ganho +0.036 (IC 90%: -0.031 a +0.102)
+PCA 16 (efeito 0,05): Spearman 0.381 | ganho -0.059 (IC 90%: -0.118 a +0.001)
+PCA 16, n = 3200:     Spearman 0.487 | ganho +0.109 (IC 90%: +0.071 a +0.148)
+```
+
+- **Mais componentes** não atrapalharam aqui, porque o ritmo já estava contido em 16. Na sua base, mais colunas significam mais risco de *overfitting*: compare 8, 16 e 32 e fique com a menor que entregar o ganho.
+- **Com efeito fraco**, o bloco tende a **piorar** o modelo (o IC fica quase todo abaixo de zero): o GBM paga o custo das colunas extras sem sinal suficiente em troca.
+- **Com o dobro de dados**, o IC passa a excluir o zero. (A base inteira é sorteada de novo, então o *baseline* também muda.) Muitas vezes, o que falta para provar o ganho do vídeo é tamanho de teste, não um modelo melhor.
+- **Na Parte B**, espere ganhos pequenos ou nulos. Uma conclusão como "X-CLIP não melhorou; as sondas do CLAP ficaram com IC cruzando o zero; mantivemos só as features baratas" é excelente para o README: mostra rigor e evita complexidade que não se paga.
+
+</details>
+
+---
+
+## Resumo
+
+- A **média de embeddings por frame** ignora a ordem e perde narrativa, ritmo e gancho. Features temporais baratas (ritmo, maior corte, **embedding do gancho**) recuperam parte disso sem inferência extra.
+- **X-CLIP** (MIT, 8 frames, 512 dims) troca contexto entre frames, mas, no nosso teste, quase não codificou a ordem. **VideoMAE** depende da ordem, mas é não comercial. **Qwen3-VL-Embedding-2B** é o mais expressivo e pede GPU.
+- **CLAP** resume como o vídeo soa. Corte você mesmo as janelas de 10 s para evitar o `rand_trunc` e considere **sondas de texto** como colunas interpretáveis.
+- Extraia **uma vez**, em **cache versionado**: em CPU, cerca de 2,8 s por Short na nossa medição.
+- Use **PCA ajustada só no treino** e aceite o bloco apenas se a **ablação com bootstrap pareado** mostrar IC acima de zero. Espere algo como +0,02 a +0,04 de Spearman.
+
+## Referências
+
+- Ni et al. [*Expanding Language-Image Pretrained Models for General Video Recognition*](https://arxiv.org/abs/2208.02816) (X-CLIP). ECCV, 2022. Checkpoint: [`microsoft/xclip-base-patch32`](https://huggingface.co/microsoft/xclip-base-patch32).
+- Tong et al. [*VideoMAE: Masked Autoencoders are Data-Efficient Learners for Self-Supervised Video Pre-Training*](https://arxiv.org/abs/2203.12602). NeurIPS, 2022. Checkpoint: [`MCG-NJU/videomae-base`](https://huggingface.co/MCG-NJU/videomae-base).
+- Qwen Team. [*Qwen3-VL-Embedding and Qwen3-VL-Reranker*](https://arxiv.org/abs/2601.04720). Relatório técnico, 2026. Checkpoint: [`Qwen/Qwen3-VL-Embedding-2B`](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B).
+- Wu et al. [*Large-scale Contrastive Language-Audio Pretraining with Feature Fusion and Keyword-to-Caption Augmentation*](https://arxiv.org/abs/2211.06687) (CLAP). arXiv, 2022. Checkpoint: [`laion/clap-htsat-unfused`](https://huggingface.co/laion/clap-htsat-unfused).
+- Ye et al. [*MVP: Winning Solution to SMP Challenge 2025 Video Track*](https://arxiv.org/abs/2507.00950). arXiv, 2025.
+- Documentação do [X-CLIP](https://huggingface.co/docs/transformers/model_doc/xclip) e do [CLAP](https://huggingface.co/docs/transformers/model_doc/clap) no `transformers`.
+- Kaggle. [Documentação de notebooks](https://www.kaggle.com/docs/notebooks): limites de sessão e cota de GPU.
+- Leituras do projeto: [/projetos/galaxies/leituras](/projetos/galaxies/leituras).
+
+**Próxima aula:** [Conformal adaptativo e drift](/aulas/ml-preditivo-e-agentes/ir-alem/conformal-adaptativo): por que os intervalos perdem cobertura quando o regime muda, e como o ACI corrige isso online.

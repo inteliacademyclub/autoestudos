@@ -1,0 +1,121 @@
+---
+sidebar_position: 4
+sidebar_label: 'Stack 2026 e o que mudou'
+title: 'Stack 2026: ferramentas, versões e o que mudou desde o briefing'
+description: 'As ferramentas recomendadas para o case Galaxies, com versões verificadas que funcionam juntas, licenças, custos e as mudanças de 2026 que o briefing não cobre.'
+---
+
+# Stack 2026: Ferramentas, Versões e o que Mudou
+
+O briefing recomenda ferramentas, mas **nada é obrigatório**: a escolha precisa ser justificada no README. Esta página traz uma combinação **testada em conjunto** em setembro de 2026 e as mudanças recentes que podem quebrar o seu código se você seguir um tutorial antigo.
+
+:::info[Verificado em 27/09/2026]
+As versões abaixo foram instaladas e resolvidas juntas num ambiente Python 3.12. Bibliotecas de IA mudam rápido, então **fixe as versões** no seu `pyproject.toml` e anote no README.
+:::
+
+---
+
+## Ambiente completo
+
+```bash
+uv init galaxies-agente --python 3.12 && cd galaxies-agente
+
+# dados e modelo
+uv add pandas==3.0.6 numpy==2.5.3 scipy==1.18.1 pyarrow==25.0.1 duckdb==1.5.5 \
+       scikit-learn==1.9.1 lightgbm==4.7.0 catboost==1.2.10 xgboost==3.4.1 \
+       optuna==5.0.0 shap==0.52.0 mapie==1.5.0 mlflow==3.16.1 \
+       pydantic==2.13.5 pandera==0.33.1 pytest
+
+# coleta
+uv add google-api-python-client==2.200.0 isodate==0.7.2 tenacity==9.1.4 httpx==0.28.1
+
+# multimodal (em Colab/Kaggle com GPU, se possível)
+uv add torch==2.14.0 transformers==5.17.0 sentence-transformers==6.1.0 \
+       opencv-python-headless==5.0.0.93 scenedetect==0.7.1 faster-whisper==1.2.1 \
+       librosa==1.0.0 "yt-dlp[default]==2026.8.19" google-genai==2.25.0
+
+# agente e integração
+uv add langgraph==1.2.12 langchain==1.4.2 langchain-core==1.6.5 \
+       langchain-mcp-adapters==0.3.2 fastmcp==3.4.7 mcp==1.30.0 faiss-cpu==1.15.1
+```
+
+:::danger[A pegadinha do MCP]
+`langchain-mcp-adapters 0.3.2` exige **`mcp<2`**. Por isso a combinação que funciona num ambiente só é **`fastmcp==3.4.7` + `mcp==1.30.0`**.
+
+Existem versões mais novas, mas elas são incompatíveis com o adapter:
+- **FastMCP 4.x** (ago/2026);
+- **SDK oficial `mcp` 2.x**, em que a classe `FastMCP` virou `MCPServer` e **não há alias**, então `from mcp.server.fastmcp import FastMCP` quebra.
+
+Se quiser usá-las, rode o servidor MCP num ambiente separado do agente. Detalhes na aula [MCP do zero](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero).
+
+Sobre o protocolo: a revisão **2026-07-28** da spec do MCP é *stateless*. Ela remove o `initialize`, leva versão e capacidades no `_meta` de cada mensagem e cria o `server/discover`. O `mcp` 1.30 ainda fala a versão `2025-11-25` com handshake, e os clientes atuais negociam essa versão sem problema.
+:::
+
+---
+
+## Por camada
+
+### Coleta e dados
+
+<CardGrid>
+  <ToolCard nome="YouTube Data API v3" versao="google-api-python-client 2.200" licenca="Termos da API" custo="grátis (10.000 un./dia)" papel="Fonte principal. `playlistItems.list` e `videos.list` custam 1 unidade por 50 itens." link="https://developers.google.com/youtube/v3" alerta="`search.list` tem balde próprio de só 100 chamadas/dia desde 01/06/2026." />
+  <ToolCard nome="pandas + Parquet" versao="3.0.6" licenca="BSD-3" custo="grátis" papel="Manipulação e armazenamento colunar. Parquet preserva tipos e é rápido." link="https://pandas.pydata.org/" alerta="pandas 3 liga Copy-on-Write por padrão: atribuição encadeada (`df[a][b] = x`) não funciona mais." />
+  <ToolCard nome="DuckDB" versao="1.5.5" licenca="MIT" custo="grátis" papel="SQL direto sobre arquivos Parquet. Ótimo para EDA e para joins “as-of”." link="https://duckdb.org/" />
+  <ToolCard nome="pandera" versao="0.33.1" licenca="MIT" custo="grátis" papel="Valida o esquema mínimo da base (tipos, nulos, faixas) antes de treinar." link="https://pandera.readthedocs.io/" />
+</CardGrid>
+
+### Modelo, validação e incerteza
+
+<CardGrid>
+  <ToolCard nome="LightGBM" versao="4.7.0" licenca="MIT" custo="grátis" papel='GBM rápido. `objective="quantile"` dá os limites do intervalo.' link="https://lightgbm.readthedocs.io/" alerta="No macOS, se aparecer erro de `libomp`, rode `brew install libomp`." />
+  <ToolCard nome="CatBoost" versao="1.2.10" licenca="Apache-2.0" custo="grátis" papel="Lida bem com categóricas (ordered target statistics). `MultiQuantile` treina vários quantis num modelo só. Foi usado pelo vencedor do SMP 2025." link="https://catboost.ai/" />
+  <ToolCard nome="MAPIE" versao="1.5.0" licenca="BSD-3" custo="grátis" papel="Predição conformal: `SplitConformalRegressor` e `ConformalizedQuantileRegressor`." link="https://mapie.readthedocs.io/" alerta="API nova na 1.x (`fit` → `conformalize` → `predict_interval`). O helper de split é aleatório: separe por data à mão." />
+  <ToolCard nome="SHAP" versao="0.52.0" licenca="MIT" custo="grátis" papel="`TreeExplainer` exato e rápido para GBMs." link="https://shap.readthedocs.io/" alerta="Exige Python ≥ 3.12." />
+  <ToolCard nome="MLflow" versao="3.16.1" licenca="Apache-2.0" custo="grátis" papel="Registro de experimentos e modelos; tracing do agente." link="https://mlflow.org/" alerta="MLflow 3: `log_model(..., name=...)` substitui `artifact_path`." />
+  <ToolCard nome="Optuna" versao="5.0.0" licenca="MIT" custo="grátis" papel="Busca de hiperparâmetros, sempre com validação temporal." link="https://optuna.org/" />
+</CardGrid>
+
+### Multimodal
+
+<CardGrid>
+  <ToolCard nome="SigLIP 2" versao="transformers 5.17" licenca="Apache-2.0" custo="grátis" papel="Embeddings de imagem (frames e thumbnail), multilíngue. Ex.: `google/siglip2-base-patch16-224` roda em CPU." link="https://huggingface.co/blog/siglip2" />
+  <ToolCard nome="faster-whisper" versao="1.2.1" licenca="MIT" custo="grátis" papel="Transcrição local rápida (CTranslate2), com VAD e timestamps." link="https://github.com/SYSTRAN/faster-whisper" />
+  <ToolCard nome="Groq Whisper" licenca="serviço" custo="free: 2.000 req/dia" papel="Transcrição via API, rápida. Free: 20 RPM, 28.800 s de áudio/dia, arquivo até 25 MB." link="https://console.groq.com/docs/speech-to-text" />
+  <ToolCard nome="PySceneDetect" versao="0.7.1" licenca="BSD-3" custo="grátis" papel="Detecção de cortes de cena (ritmo de edição)." link="https://www.scenedetect.com/" alerta="A 0.7 mudou a API de timestamps: tutoriais antigos quebram." />
+  <ToolCard nome="MediaPipe" versao="1.0.1" licenca="Apache-2.0" custo="grátis" papel="Detecção de rosto (presença, quantidade, área)." link="https://ai.google.dev/edge/mediapipe/solutions/vision/face_detector" alerta="`mp.solutions` foi REMOVIDO: use a Tasks API (`FaceDetector`). No Mac com Apple Silicon o detector aborta: rode no Colab ou em Linux." />
+  <ToolCard nome="PaddleOCR" versao="3.x" licenca="Apache-2.0" custo="grátis" papel="OCR de texto na tela (PP-OCRv6; `lang='pt'`). Testado com paddlepaddle 3.3.1 no macOS arm64 e no Linux." link="https://github.com/PaddlePaddle/PaddleOCR" alerta="EasyOCR está sem releases desde 2024." />
+  <ToolCard nome="Detecção de objetos" licenca="varia" custo="grátis" papel="OWLv2 (open-vocabulary: “batom”, “carro”) e RT-DETR via transformers, com licença Apache-2.0." link="https://huggingface.co/docs/transformers/model_doc/owlv2" alerta="Ultralytics (YOLO) é AGPL-3.0: cuidado com uso comercial." />
+  <ToolCard nome="Gemini API" versao="google-genai 2.25" licenca="serviço" custo="free tier + pago" papel="VLM que aceita vídeo e até URL pública do YouTube. Structured output com schema Pydantic. Modelos: `gemini-3.5-flash-lite`, `gemini-2.5-flash-lite`." link="https://ai.google.dev/gemini-api/docs/video-understanding" alerta="No free tier, o conteúdo pode ser usado pelo Google. Os limites não são mais publicados em número: veja no AI Studio." />
+  <ToolCard nome="VLMs locais" licenca="Apache-2.0" custo="grátis (GPU)" papel="Qwen3-VL (2B/4B/8B), Gemma 4 (com vídeo) e SmolVLM2 são o fallback quando a cota do Gemini acabar." link="https://huggingface.co/Qwen" alerta="Na T4 (Colab/Kaggle) não há Flash Attention 2: use 4-bit e atenção eager." />
+  <ToolCard nome="yt-dlp" versao="2026.8.19" licenca="Unlicense" custo="grátis" papel="Download de vídeo/áudio para extração local." link="https://github.com/yt-dlp/yt-dlp" alerta="Exige runtime JS (Deno) e PO tokens em alguns clientes. IPs de datacenter (Colab) recebem bloqueio anti-bot. Os termos do YouTube proíbem scraping: leia a aula 1.8." />
+</CardGrid>
+
+### Agente e integração
+
+<CardGrid>
+  <ToolCard nome="LangGraph" versao="1.2.12" licenca="MIT" custo="grátis" papel="`StateGraph` para o fluxo determinístico de previsão; `create_agent` (LangChain 1.x) para ReAct." link="https://docs.langchain.com/oss/python/langgraph/overview" alerta="`langgraph.prebuilt.create_react_agent` está descontinuado." />
+  <ToolCard nome="FastMCP" versao="3.4.7" licenca="Apache-2.0" custo="grátis" papel="Servidor MCP a partir de funções Python com type hints. Tem cliente in-memory para testes." link="https://gofastmcp.com/" alerta="Veja a pegadinha de versões no topo desta página." />
+  <ToolCard nome="langchain-mcp-adapters" versao="0.3.2" licenca="MIT" custo="grátis" papel="Consome tools MCP dentro de um agente LangGraph (o lado da persona)." link="https://github.com/langchain-ai/langchain-mcp-adapters" />
+  <ToolCard nome="MCP Inspector" licenca="MIT" custo="grátis" papel="UI para testar o seu servidor MCP: `npx @modelcontextprotocol/inspector`." link="https://modelcontextprotocol.io/docs/tools/inspector" />
+</CardGrid>
+
+---
+
+## O que mudou desde o briefing
+
+| Tema | O briefing diz | Em set/2026 |
+| :--- | :--- | :--- |
+| **Base de dados** | Entregue pela liga no kickoff | **Cada aluno monta a sua** ([guia](/projetos/galaxies/monte-sua-base)) |
+| **VLM local** | Qwen2.5-VL 3B/7B | **Qwen3-VL** (2B/4B/8B) e **Gemma 4** (Apache-2.0, com vídeo) são as opções atuais. Qwen2.5-VL ainda funciona |
+| **Gemini** | "Gemini Flash-Lite free tier (~1.000 req/dia)" | Modelos 3.x (`gemini-3.5-flash-lite`). O 2.0 Flash foi desligado em 01/06/2026. Limites do free tier só no AI Studio. **Aceita URL do YouTube direto** |
+| **Leitura de frames** | ffmpeg ou decord | **decord está abandonado**: use OpenCV, ffmpeg/PyAV ou torchcodec |
+| **MediaPipe** | MediaPipe | **`mp.solutions` removido**: Tasks API |
+| **PySceneDetect** | PySceneDetect | 0.7 mudou a API de timestamps |
+| **yt-dlp** | Manter atualizado, cookies, sleep | Agora exige **runtime JS (Deno)**. PO tokens em clientes web |
+| **YouTube API** | search = 100 unidades | `search.list` tem **balde próprio de 100 chamadas/dia** (jun/2026). Novo `videos.batchGetStats` (03/06/2026, balde próprio). Nova seção III.L das políticas sobre métricas derivadas |
+| **Views como alvo** | curtidas ou views | A contagem de views de Shorts mudou em **31/03/2025** e de novo em **24/08/2026**: quebras de regime. **Prefira curtidas** |
+| **Agente** | LangGraph + LangChain | LangGraph 1.x: `create_react_agent` descontinuado → `create_agent` |
+| **MCP** | FastMCP | Três "FastMCP" no mercado. Use **FastMCP 3.4.7 + mcp 1.30** com o adapter (veja acima) |
+| **SHAP** | SHAP | 0.52 exige **Python ≥ 3.12** |
+| **MAPIE** | MAPIE | API 1.x nova. O split helper é aleatório |
+| **Papers** | HyperFusion "vencedor de 2025" | HyperFusion é da trilha de **imagem**. O vencedor de vídeo em 2025 é o MVP. Já existe o **SMP 2026** (vídeo: MAPE 0,1529). Veja as [leituras](/projetos/galaxies/leituras) |

@@ -1,0 +1,363 @@
+---
+sidebar_position: 4
+sidebar_label: 'Comparáveis: retrieval de criativos'
+title: 'Comparáveis: retrieval de criativos'
+description: 'Busca de Shorts parecidos por kNN no espaço de embeddings, com filtros de setor e de tempo que impedem vazamento, usada como evidência na resposta e como feature do modelo.'
+tags: [ml-preditivo, galaxies, agente, retrieval, faiss]
+---
+
+import EmbeddingMap from '@site/src/components/interativos/EmbeddingMap';
+
+# Comparáveis: Retrieval de Criativos Sem Olhar Para o Futuro
+
+<LessonMeta
+  tempo="50 min"
+  semana={3}
+  etapa="agente"
+  objetivos={[
+    'Buscar Shorts parecidos por kNN em embeddings normalizados, com FAISS ou scikit-learn',
+    'Filtrar vizinhos por setor e por data (só o passado já maduro) para não vazar o futuro',
+    'Usar os comparáveis como evidência na resposta e como feature point-in-time do modelo',
+    'Medir, por ablação, se a feature de vizinhos ajuda de verdade',
+  ]}
+  prerequisitos={[
+    {label: 'Embeddings visuais: CLIP e SigLIP 2', to: '/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais'},
+    {label: 'Vector databases', to: '/aulas/rag-e-rerankers/vector-databases'},
+    {label: 'Vazamento de dados', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados'},
+  ]}
+/>
+
+Quando o time da Lumina olha o Short B, a primeira reação não é estatística. É memória: *"isso parece aquele antes/depois de corretivo que foi bem em março"*. Essa intuição tem valor. Um Short muito parecido com outros que renderam acima da média do canal carrega uma pista que nem sempre cabe em cinco atributos extraídos por um VLM.
+
+Transformar essa intuição em código é, no fundo, o mesmo *retrieval* que você usa em RAG: um *embedding* por criativo, uma busca pelos vizinhos mais próximos e um uso do que foi recuperado. A diferença está no que pode dar errado. Num chatbot, recuperar um documento de amanhã é impossível. Numa base de Shorts, a tentação é constante: o vizinho mais parecido pode ter sido publicado **depois** da data planejada, ou há três dias, com as curtidas ainda subindo. Se ele entrar, o modelo vai parecer ótimo no teste e errar em produção.
+
+:::info[A ideia central]
+**Comparáveis** são os *k* Shorts mais parecidos com o criativo, buscados no espaço de *embeddings* (texto + visual) **dentro do mesmo setor** e **só entre posts publicados pelo menos 30 dias antes da data planejada**. Eles entram na resposta de duas formas: como **evidência** (lista com id, similaridade e desempenho relativo) e como **feature** (a mediana do alvo relativo dos vizinhos), calculada no treino com a mesma regra de tempo.
+:::
+
+---
+
+## Por que olhar para os vizinhos
+
+Um modelo tabular só enxerga o que virou coluna. Os atributos do módulo 4 (gancho, rosto, texto na tela, energia da música, duração) capturam muito, mas não tudo: o enquadramento, a paleta, o tipo de transformação, o jeito de falar. Um *embedding* visual e de texto guarda parte disso de forma difusa, e o desempenho de criativos próximos nesse espaço funciona como um resumo do que o modelo não conseguiu nomear.
+
+A ideia tem nome na literatura. O **MMRA** (Zhong et al., SIGIR 2024) prevê a popularidade de microvídeos recuperando vídeos semelhantes num banco de memória, com representações multimodais, e usa o que foi recuperado para melhorar a previsão. O experimento foi feito no MicroLens, uma base de microvídeos que não é a sua. O que se transfere para o projeto é o desenho, não os números: **recuperar, depois prever**.
+
+Na trilha, os comparáveis cumprem dois papéis:
+
+| Papel | Formato | Quem usa |
+| :--- | :--- | :--- |
+| **Evidência** | Lista com `post_id`, `titulo`, `curtidas`, `relativo_canal` e `similaridade` | A persona e o marketing: "5 Shorts parecidos renderam, em mediana, 1,7 vez a mediana dos seus canais" |
+| **Feature** | `rel_vizinhos`: mediana do alvo relativo (log) dos *k* vizinhos | O GBM, junto com as outras *features* |
+
+O mapa abaixo mostra criativos projetados em 2D e os vizinhos mais próximos de um ponto escolhido. Os dados são simulados.
+
+<EmbeddingMap />
+
+---
+
+## A geometria: cosseno em vetores normalizados
+
+Os *embeddings* vêm do [módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais) (por exemplo, SigLIP 2 para os frames e um *encoder* de texto para a legenda, concatenados). A similaridade usada é o **cosseno**. Com vetores normalizados para norma 1, o cosseno é igual ao produto interno, e um índice de produto interno exato (`faiss.IndexFlatIP`) resolve a busca sem aproximação. Se você precisa relembrar como índices vetoriais funcionam, veja [Vector databases](/aulas/rag-e-rerankers/vector-databases) e [Retrieval](/aulas/rag-e-rerankers/retrieval).
+
+Com alguns milhares de Shorts, a busca exata leva milissegundos; índices aproximados (IVF, HNSW) só compensam em escalas bem maiores. O que exige cuidado é o **filtro**.
+
+---
+
+## Os dois filtros que impedem o vazamento
+
+<Sketch name="m6/comparaveis-no-tempo" alt="Linha do tempo de posts. Os posts antes da marca 'data menos 30 dias' estão em ciano e podem ser vizinhos. Entre essa marca e a data planejada, dois posts em vermelho estão fora porque as curtidas ainda estão subindo. Depois da data planejada, dois posts vermelhos vazados estão fora porque são futuro. Abaixo, um espaço de embeddings com o criativo novo em roxo e os k vizinhos em ciano, selecionados com IDSelectorRange de 0 a n. À direita, as duas saídas: evidência na resposta (post_id, similaridade, curtidas sobre a mediana do canal) e a feature rel_vizinhos do modelo (mediana do alvo relativo dos k vizinhos)." caption="Mesmo setor, passado maduro: só esses podem ser comparáveis." />
+
+1. **Mesmo setor.** Um Short automotivo parecido com um de beleza não diz nada útil sobre curtidas de beleza. O jeito mais simples é manter **um índice por setor**.
+2. **Passado maduro.** Só entram posts publicados pelo menos **30 dias antes** da data planejada. O motivo do "antes" é óbvio. O dos 30 dias é mais sutil: as curtidas de um Short publicado há três dias ainda estão subindo, e a sua base guarda o valor final, coletado semanas depois. Usar esse valor é usar informação que não existia no momento da previsão. É a mesma lógica da aula [O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente).
+
+O truque de implementação é colocar os posts de cada setor no índice **em ordem cronológica**. Assim, o id interno de cada vetor é a posição dele no tempo, e "publicado antes da data limite" vira um intervalo de ids: `[0, n)`. O FAISS 1.15 aceita esse filtro durante a busca com `SearchParameters(sel=IDSelectorRange(0, n))`, sem precisar remontar o índice.
+
+```python
+# galaxies_tool/comparaveis.py — kNN sem vazamento: só posts ANTERIORES e já "maduros"
+import faiss
+import numpy as np
+import pandas as pd
+
+from galaxies_tool.modelo import preparar_treino
+
+MATURIDADE = pd.Timedelta(days=30)  # as curtidas de um post só se estabilizam ~30 dias depois
+
+
+class IndiceComparaveis:
+    """Um IndexFlatIP por setor. Os ids seguem a ordem cronológica, então
+    "publicado antes de T" vira um intervalo de ids: [0, n)."""
+
+    def __init__(self, base: pd.DataFrame):
+        self._por_setor = {}
+        for setor, posts in base.dropna(subset=["rel"]).groupby("sector"):
+            posts = posts.sort_values("published_at", ignore_index=True)
+            X = np.vstack(posts["emb"].to_numpy()).astype("float32")
+            faiss.normalize_L2(X)  # produto interno entre vetores unitários = cosseno
+            indice = faiss.IndexFlatIP(X.shape[1])
+            indice.add(X)
+            self._por_setor[setor] = (indice, posts)
+
+    def buscar(self, emb, setor: str, antes_de, k: int = 10) -> pd.DataFrame:
+        indice, posts = self._por_setor[setor]  # filtro 1: mesmo setor
+        limite = pd.Timestamp(antes_de) - MATURIDADE  # filtro 2: só o passado maduro
+        n = int(posts["published_at"].searchsorted(limite, side="left"))
+        if n == 0:
+            return posts.iloc[0:0].assign(similarity=np.array([], dtype="float32"))
+        q = np.asarray([emb], dtype="float32")
+        faiss.normalize_L2(q)
+        filtro = faiss.SearchParameters(sel=faiss.IDSelectorRange(0, n))
+        sims, ids = indice.search(q, min(k, n), params=filtro)
+        ok = ids[0] >= 0
+        return posts.iloc[ids[0][ok]].assign(similarity=sims[0][ok]).reset_index(drop=True)
+
+
+def adicionar_rel_vizinhos(base: pd.DataFrame, k: int = 10) -> pd.DataFrame:
+    """Feature point-in-time: mediana do alvo relativo dos k vizinhos anteriores (ideia do MMRA)."""
+    alvo = preparar_treino(base).set_index("post_id")["y"]
+    base = base.assign(rel=base["post_id"].map(alvo))
+    indice = IndiceComparaveis(base)
+    vizinhos = [indice.buscar(p.emb, p.sector, p.published_at, k) for p in base.itertuples()]
+    base["rel_vizinhos"] = [v["rel"].median() for v in vizinhos]
+    base["sim_vizinho"] = [v["similarity"].max() if len(v) else np.nan for v in vizinhos]
+    return base
+```
+
+A função `adicionar_rel_vizinhos` é a que torna a *feature* honesta no treino: para **cada post da base**, ela busca os vizinhos com a mesma regra que a tool usará em produção, usando a data de publicação do próprio post como "data planejada". O post nunca é vizinho de si mesmo, porque ele não está no passado dele. Ela também guarda `sim_vizinho`, a similaridade do vizinho mais próximo, que alimenta a regra `fora_da_distribuicao` do `confidence_flag` (o limiar é o percentil 1 dessa coluna na base).
+
+:::danger[faiss-cpu + lightgbm no macOS: segfault]
+Os dois pacotes trazem, cada um, a sua cópia do `libomp`. No macOS, usar os dois no mesmo processo com várias *threads* de OpenMP derruba o Python com *segmentation fault*: no nosso teste, a primeira previsão do LightGBM depois de uma busca no FAISS matava o processo. A correção é limitar o OpenMP a uma *thread* **antes** de importar os dois. Como o pacote é importado primeiro, o lugar certo é o `__init__.py`:
+
+```python
+# galaxies_tool/__init__.py
+import os
+
+# faiss-cpu e lightgbm trazem, cada um, a sua cópia do libomp. No macOS, as duas
+# rodando em paralelo no mesmo processo derrubam o Python (segfault). Uma thread
+# de OpenMP resolve e não custa nada aqui: a previsão é de UMA linha por vez.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+```
+
+Com uma linha por previsão, uma *thread* não custa nada. No treino de bases grandes, rode o treino num processo sem FAISS, ou use o `n_jobs` do LightGBM com o FAISS fora do processo.
+:::
+
+---
+
+## Quanto vale a feature, e quanto vale o vazamento
+
+A pergunta certa não é "a *feature* de vizinhos é boa?", e sim "quanto ela acrescenta sobre o que o modelo já tem?". É uma [ablação](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao): treine com e sem, no mesmo split temporal, e compare.
+
+```python
+# treinar_com_vizinhos.py — aula 6.4: a feature de vizinhos entra no treino
+from galaxies_tool.comparaveis import adicionar_rel_vizinhos
+from galaxies_tool.modelo import treinar_e_salvar
+from galaxies_tool.sintetico import gerar_base
+
+base = gerar_base()
+sem = treinar_e_salvar(base, "artefatos_sem_vizinhos")
+com = treinar_e_salvar(adicionar_rel_vizinhos(base), "artefatos")  # o que o servidor usa
+for nome, b in [("sem rel_vizinhos", sem), ("com rel_vizinhos", com)]:
+    m = b.metricas
+    print(f"{nome:<17} spearman={m['spearman']:.3f} par-a-par={m['par_a_par_intra_canal']:.3f} "
+          f"cobertura={m['cobertura_80']:.3f}  {b.versao}")
+```
+
+```text
+sem rel_vizinhos  spearman=0.903 par-a-par=0.638 cobertura=0.826  gbm-quantil-20260927-af06930
+com rel_vizinhos  spearman=0.910 par-a-par=0.672 cobertura=0.830  gbm-quantil-20260927-f9e6dda
+```
+
+O acerto par-a-par dentro do canal sobe de 63,8% para 67,2%. Antes de comemorar, leia a letra miúda: na base sintética, existe um fator de "estilo" que afeta as curtidas e que **só o *embedding* enxerga**, sem nenhum atributo extraído correspondente. O ganho aqui existe por construção. Na sua base real, o ganho pode ser menor ou nulo, e a única forma de saber é repetir essa ablação. Se não houver ganho, os comparáveis continuam valendo como evidência, só não como *feature*.
+
+Agora, o que acontece se você esquecer os filtros de tempo no treino? O código abaixo calcula a mesma *feature* buscando na base inteira, com o futuro e o próprio post incluídos (o acesso ao índice interno é só para a demonstração):
+
+```python
+# vazamento_knn.py — o que acontece se a feature de vizinhos olhar para o futuro
+import faiss
+import numpy as np
+import pandas as pd
+
+from galaxies_tool.comparaveis import IndiceComparaveis, adicionar_rel_vizinhos
+from galaxies_tool.modelo import FEATURES_BASE, preparar_treino, treinar
+from galaxies_tool.sintetico import gerar_base
+
+
+def rel_vizinhos_sem_filtro_de_tempo(base: pd.DataFrame, k: int = 10) -> pd.Series:
+    """ERRADO de propósito: busca em toda a base, inclusive o futuro e o próprio post."""
+    indice = IndiceComparaveis(base)
+    saida = {}
+    for setor, (idx, posts) in indice._por_setor.items():
+        X = np.vstack(posts["emb"].to_numpy()).astype("float32")
+        faiss.normalize_L2(X)
+        _, ids = idx.search(X, k)
+        saida |= dict(zip(posts["post_id"], np.median(posts["rel"].to_numpy()[ids], axis=1)))
+    return base["post_id"].map(saida)
+
+
+base = adicionar_rel_vizinhos(gerar_base())  # honesto: passado maduro do mesmo setor
+vazada = base.assign(rel_vizinhos=rel_vizinhos_sem_filtro_de_tempo(base))
+for nome, b in [("honesta (passado maduro)", base), ("vazada (sem filtro de tempo)", vazada)]:
+    m = treinar(preparar_treino(b), FEATURES_BASE + ["rel_vizinhos"]).metricas
+    print(f"{nome:<30} spearman={m['spearman']:.3f} "
+          f"par-a-par={m['par_a_par_intra_canal']:.3f} cobertura={m['cobertura_80']:.3f}")
+```
+
+```text
+honesta (passado maduro)       spearman=0.910 par-a-par=0.672 cobertura=0.830
+vazada (sem filtro de tempo)   spearman=0.924 par-a-par=0.713 cobertura=0.835
+```
+
+O par-a-par salta para 71,3%. Nenhum desses quatro pontos a mais vai existir em produção, porque lá o futuro não está no índice. O pior é que a versão vazada **parece melhor** em todas as métricas, e é exatamente por isso que o vazamento sobrevive em tantos projetos. O primeiro vizinho de cada post, na versão errada, é ele mesmo, com o próprio alvo.
+
+---
+
+## Comparáveis como evidência
+
+Na resposta, os comparáveis servem para quem lê. Um exemplo real da tool para o Short B:
+
+```json
+{"post_id": "UC_beleza_07_011", "channel_id": "UC_beleza_07",
+ "published_at": "2026-06-05T23:00:00-03:00",
+ "titulo": "Short 11 de beleza #shorts #shorts #shorts #shorts #shorts",
+ "curtidas": 2822, "relativo_canal": 1.96, "similaridade": 0.982}
+```
+
+Três regras de apresentação:
+
+- **Mostre o relativo, não o absoluto.** 2.822 curtidas não dizem nada sem o tamanho do canal; "1,96 vez a mediana do próprio canal" diz.
+- **Mostre a dispersão.** Os cinco comparáveis de B vão de 0,96 a 4,29 vezes a mediana dos seus canais. Uma mediana sem a dispersão engana.
+- **Não confunda evidência com causa.** "Shorts parecidos foram bem" não significa que B vai bem *por isso*. É uma pista, e o texto precisa dizer isso.
+
+Uma alternativa sem FAISS: o `NearestNeighbors` do scikit-learn, com `metric="cosine"`, filtrando os posts elegíveis **antes** da busca. Para alguns milhares de posts, funciona igualmente bem; o exercício desta aula pede que você prove que os dois devolvem os mesmos vizinhos.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Para o **Short B**, os dez vizinhos mais próximos (setor beleza, publicados até 01/09/2026) têm similaridade de até 0,982, e a mediana do alvo relativo deles é 0,51 em log, ou seja, cerca de **1,66 vez** a mediana dos próprios canais. Para o **Short A**, a mesma mediana é −0,39, cerca de **0,68 vez**. Os vizinhos de B são antes/depois energéticos que foram bem; os de A, tutoriais calmos que ficaram abaixo da média.
+
+Isso reforça a leitura de B > A, mas com uma ressalva que precisa aparecer na resposta: os comparáveis e os atributos **não são evidências independentes**. Os dois vêm do mesmo vídeo. Somar "o gancho é forte" e "os parecidos foram bem" como se fossem duas provas é contar a mesma pista duas vezes.
+
+No setor automotivo, o **Garagem 22** mostra o outro lado: se o canal quiser testar um formato que ninguém no setor fez (um *review* com animação 3D, por exemplo), o vizinho mais próximo terá similaridade baixa, a regra `fora_da_distribuicao` vai disparar e o `confidence_flag` vai avisar. É o comportamento correto para um criativo que o modelo nunca viu.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Vizinhos do futuro.** Buscar na base inteira no treino infla todas as métricas. Filtre pela data do post que está sendo previsto.
+2. **Vizinhos imaturos.** Um post de três dias com o valor final de curtidas é vazamento disfarçado. Use uma janela de maturidade (30 dias aqui).
+3. **O próprio post como vizinho.** Acontece quando o filtro usa "menor ou igual" ou quando não há filtro. O primeiro vizinho vira o próprio alvo.
+4. **Misturar setores.** Um vizinho de outro setor pode ser visualmente parecido e irrelevante para curtidas. Um índice por setor resolve.
+5. ***Embeddings* de versões diferentes.** A base indexada com um modelo e a consulta com outro produzem similaridades sem sentido. Versione o *encoder* junto com o índice.
+6. **Cosseno sem normalizar.** O `IndexFlatIP` calcula produto interno; sem `normalize_L2`, vetores de norma maior "ganham" a busca.
+:::
+
+<Quiz
+  id="m6-a4"
+  perguntas={[
+    {
+      pergunta: 'A data planejada do Short B é 01/10/2026. Qual destes posts de beleza pode entrar como comparável?',
+      opcoes: [
+        {texto: 'Um post de 25/09/2026, muito parecido, que já tem 5 mil curtidas.', explicacao: 'Publicado há menos de 30 dias da data planejada: as curtidas ainda estão subindo e o valor final não existia no momento da previsão.'},
+        {texto: 'Um post de 05/06/2026, com similaridade 0,98.', correta: true, explicacao: 'Mesmo setor, anterior e maduro. É um comparável válido.'},
+        {texto: 'Um post de 15/10/2026 que ainda nem foi coletado.', explicacao: 'Futuro. Nunca pode entrar, nem no treino nem em produção.'},
+      ],
+    },
+    {
+      pergunta: 'Por que o índice guarda os posts de cada setor em ordem cronológica?',
+      opcoes: [
+        {texto: 'Porque o FAISS exige vetores ordenados para funcionar.', explicacao: 'O FAISS aceita qualquer ordem; a ordenação é um truque nosso.'},
+        {texto: 'Porque assim "publicado antes da data limite" vira um intervalo de ids [0, n), e o IDSelectorRange filtra durante a busca.', correta: true, explicacao: 'Exato: o filtro de tempo fica barato e não exige remontar o índice.'},
+        {texto: 'Para que os vizinhos mais recentes apareçam primeiro.', explicacao: 'A ordem dos vizinhos é por similaridade, não por data.'},
+      ],
+    },
+    {
+      pergunta: 'Com a feature rel_vizinhos calculada sem filtro de tempo, o par-a-par no teste sobe de 67% para 71%. Qual é a leitura certa?',
+      opcoes: [
+        {texto: 'A versão sem filtro é melhor e deve ir para produção.', explicacao: 'Em produção o futuro não está no índice; esse ganho não existe fora do teste.'},
+        {texto: 'É vazamento: o ganho vem de informação que não existe no momento da previsão, inclusive o próprio alvo do post.', correta: true, explicacao: 'Isso. Se uma feature melhora "demais", desconfie primeiro de vazamento.'},
+        {texto: 'O ganho é pequeno demais para importar.', explicacao: 'Quatro pontos de par-a-par é muito; e, mesmo se fosse pequeno, continuaria sendo falso.'},
+      ],
+    },
+    {
+      pergunta: 'Na base real do seu grupo, a ablação mostra que rel_vizinhos não muda o par-a-par. O que fazer com os comparáveis?',
+      opcoes: [
+        {texto: 'Remover tudo, porque não ajudam.', explicacao: 'Não ajudam como feature, mas continuam úteis como evidência para quem lê a resposta.'},
+        {texto: 'Tirar a feature do modelo e manter os comparáveis na resposta, como evidência.', correta: true, explicacao: 'Exato. Feature e evidência são papéis diferentes, avaliados de formas diferentes.'},
+        {texto: 'Aumentar k até a feature começar a ajudar.', explicacao: 'Procurar o k que "funciona" no teste é sobreajuste ao teste. Ajuste k na validação, não no teste.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: a mesma busca com scikit-learn]
+Implemente `buscar_sklearn(base, emb, setor, antes_de, k)` com `sklearn.neighbors.NearestNeighbors(metric="cosine")`, aplicando os dois filtros (setor e maturidade de 30 dias) **antes** da busca. Depois, para 50 posts sorteados da base, confira que ela devolve exatamente os mesmos vizinhos, na mesma ordem, que `IndiceComparaveis.buscar`.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.neighbors import NearestNeighbors
+
+from galaxies_tool.comparaveis import MATURIDADE, IndiceComparaveis
+
+
+def buscar_sklearn(base, emb, setor, antes_de, k=10):
+    """Mesma busca, com scikit-learn: filtra ANTES e busca por cosseno."""
+    elegiveis = base[(base["sector"] == setor) & base["rel"].notna()
+                     & (base["published_at"] < pd.Timestamp(antes_de) - MATURIDADE)]
+    if elegiveis.empty:
+        return elegiveis.assign(similarity=[])
+    X = np.vstack(elegiveis["emb"].to_numpy())
+    nn = NearestNeighbors(n_neighbors=min(k, len(X)), metric="cosine").fit(X)
+    dist, idx = nn.kneighbors([emb])
+    return elegiveis.iloc[idx[0]].assign(similarity=1 - dist[0])
+
+
+base = pd.read_parquet("artefatos/base.parquet")
+indice = IndiceComparaveis(base)
+amostra = base.dropna(subset=["rel"]).sample(50, random_state=1)
+iguais = [list(indice.buscar(p.emb, p.sector, p.published_at, 10)["post_id"])
+          == list(buscar_sklearn(base, p.emb, p.sector, p.published_at, 10)["post_id"])
+          for p in amostra.itertuples()]
+print(f"mesmos vizinhos, na mesma ordem: {sum(iguais)}/{len(iguais)}")
+```
+
+```text
+mesmos vizinhos, na mesma ordem: 50/50
+```
+
+A versão do scikit-learn refaz o `fit` a cada consulta, o que é aceitável para uma demonstração e caro para uma base grande. A do FAISS monta o índice uma vez e filtra na busca. Os posts antigos da amostra, sem nenhum vizinho elegível, também precisam dar resultado vazio nas duas versões: é o caso de borda que o `if elegiveis.empty` trata.
+
+</details>
+
+---
+
+## Resumo
+
+- **Comparáveis** são os *k* vizinhos mais próximos no espaço de *embeddings*, por **cosseno** em vetores normalizados (`IndexFlatIP`).
+- Dois filtros obrigatórios: **mesmo setor** (um índice por setor) e **passado maduro** (publicado pelo menos 30 dias antes), aplicados com `IDSelectorRange` sobre ids em ordem cronológica.
+- Eles entram como **evidência** (lista com relativo ao canal e similaridade) e como **feature** (`rel_vizinhos`, a ideia do **MMRA**), calculada **point-in-time** no treino.
+- A versão sem filtro de tempo **parece melhor** em todas as métricas, e é vazamento.
+- Meça o ganho com **ablação**; se não houver, mantenha só a evidência. No macOS, fixe `OMP_NUM_THREADS=1` antes de importar FAISS e LightGBM.
+
+## Referências
+
+- Zhong, Lang, Zhang, Cheng, Zhang e Zhou. [*Predicting Micro-video Popularity via Multi-modal Retrieval Augmentation*](https://doi.org/10.1145/3626772.3657929). SIGIR, 2024. Código: [ICDM-UESTC/MMRA](https://github.com/ICDM-UESTC/MMRA).
+- FAISS. [Getting started](https://github.com/facebookresearch/faiss/wiki/Getting-started) e [documentação](https://faiss.ai).
+- scikit-learn. [Nearest Neighbors](https://scikit-learn.org/stable/modules/neighbors.html).
+- Aulas relacionadas: [Embeddings](/aulas/rag-e-rerankers/embeddings), [Vector databases](/aulas/rag-e-rerankers/vector-databases) e [Retrieval](/aulas/rag-e-rerankers/retrieval).
+
+**Próxima aula:** [MCP do zero](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero): expor a tool num servidor MCP para a persona da Galaxies consumir.

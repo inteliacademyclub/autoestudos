@@ -1,0 +1,116 @@
+---
+sidebar_position: 7
+sidebar_label: 'Autoavaliação'
+title: 'Autoavaliação dos entregáveis'
+description: 'Checklist interativo dos entregáveis do case Galaxies, com níveis de ambição, para conferir antes da entrega de 23/10/2026.'
+---
+
+# Autoavaliação dos Entregáveis
+
+Use esta página para conferir o projeto antes de entregar. Os itens seguem os entregáveis do briefing e estão divididos em **núcleo** (obrigatório) e **ir além**. O progresso fica salvo no seu navegador.
+
+:::info[Três camadas de ambição do multimodal]
+| Camada | O que inclui | Custo |
+| :--- | :--- | :--- |
+| **1 · Mínima (obrigatória)** | Frames + SigLIP/CLIP + faster-whisper + OCR/rosto/objetos + métricas OpenCV + PySceneDetect, tudo concatenado a metadados e histórico no GBM | Zero, 100% offline (Colab grátis) |
+| **2 · Recomendada** | Camada 1 + VLM respondendo a rubrica em JSON + clusterização dos descritores | Zero no free tier; fallback em modelo local |
+| **3 · Ambiciosa** | Camada 2 + X-CLIP/VideoMAE, fusão thumbnail + gancho, retrieval com FAISS, ensemble | Tempo de GPU (Kaggle) |
+:::
+
+---
+
+## 1 · Agente em funcionamento
+
+<Checklist
+  id="aval-agente"
+  itens={[
+    'Recebe criativo + contexto e devolve previsão, intervalo, ranking e justificativa',
+    {texto: 'Função Python documentada com contrato Pydantic (entrada e saída do briefing)', detalhe: 'predicted_metric, interval_low/high, confidence_flag, relative_to_channel, top_drivers, explanation, comparables'},
+    'Servidor MCP funcionando (testado no MCP Inspector ou num cliente)',
+    'Agente LangGraph com tools de extração, histórico/comparáveis, predição, explicabilidade e ordenação',
+    {texto: 'O número vem sempre do modelo', detalhe: 'Há um teste que prova isso.'},
+    'Explicação validada: só cita números e fatores presentes na saída do modelo',
+  ]}
+/>
+
+## 2 · Modelo preditivo treinado
+
+<Checklist
+  id="aval-modelo"
+  itens={[
+    'Base documentada (data card): origem, período, volume, termos, setores e o que não representa',
+    'Features declaradas por bloco, com a garantia de que existem antes da publicação',
+    'Baseline mínimo (média/mediana histórica do canal) implementado e reportado',
+    'GBM batendo o baseline em validação temporal',
+    'Artefatos versionados (MLflow ou equivalente), com a data de corte e a versão da base',
+  ]}
+/>
+
+## 3 · Experimento
+
+<Checklist
+  id="aval-experimento"
+  itens={[
+    'Hipótese escrita antes de rodar',
+    'Validação temporal (principal) e por canal (canais não vistos)',
+    'Métricas de erro: MAE em log e MAPE, com a interpretação correta',
+    'Métricas de ordenação: Spearman global e intra-canal, e acurácia par-a-par',
+    'Cobertura do intervalo medida no teste (geral e por setor)',
+    'Ganho da camada multimodal medido por ablação, com intervalo de confiança',
+    'Análise de onde o modelo erra',
+  ]}
+/>
+
+## 4 · Demonstração
+
+<Checklist
+  id="aval-demo"
+  itens={[
+    'Executável sobre um conjunto de criativos',
+    'Criativos de canais fora do treino, com métrica real conhecida ("de-para")',
+    'Mostra previsão, evidências (comparáveis, top_drivers) e explicação',
+    'Plano B: gravação e respostas salvas',
+  ]}
+/>
+
+## 5 · README
+
+<Checklist
+  id="aval-readme"
+  itens={[
+    'Problema e recorte',
+    'Base: origem, período, termos, limites',
+    'Arquitetura',
+    'Instalação e execução (reprodutível do zero)',
+    'Modelos e configurações (versões fixadas)',
+    'Metodologia',
+    'Resultados (tabela com baseline e ablação)',
+    'Limitações',
+    'Evolução',
+  ]}
+/>
+
+---
+
+## Ir além (opcional)
+
+<Checklist
+  id="aval-extensoes"
+  titulo="Extensões do briefing"
+  itens={[
+    {texto: 'Treinamento dinâmico: tool que treina e avalia com a base de um cliente', detalhe: 'Aula 7.1'},
+    {texto: 'Intervalos calibrados por predição conformal (CQR ou adaptativo)', detalhe: 'Aulas 5.3 e 7.5'},
+    {texto: 'RAG sobre criativos comparáveis de alto desempenho', detalhe: 'Aula 6.4'},
+    {texto: 'Loop de otimização what-if', detalhe: 'Aula 7.2'},
+    {texto: 'Comparação LLM zero-shot vs. modelo treinado', detalhe: 'Aula 7.3'},
+    {texto: 'Embeddings de vídeo completo (X-CLIP/VideoMAE) e de áudio (CLAP)', detalhe: 'Aula 7.4'},
+  ]}
+/>
+
+:::tip[O que costuma diferenciar os melhores projetos]
+- **Avaliação honesta:** split temporal, sem vazamento, com o otimismo do CV aleatório medido e explicado.
+- **Resultados com intervalo de confiança** em vez de um número solto.
+- **Uma análise de erros com exemplos concretos** ("o modelo superestima vídeos longos de canais pequenos").
+- **Explicação que não inventa:** validada contra o JSON do modelo.
+- **README que qualquer pessoa consegue rodar do zero.**
+:::

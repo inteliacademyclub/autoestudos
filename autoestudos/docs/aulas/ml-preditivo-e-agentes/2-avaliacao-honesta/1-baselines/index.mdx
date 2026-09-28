@@ -1,0 +1,482 @@
+---
+sidebar_position: 1
+sidebar_label: 'Baselines: o modelo burro que você precisa vencer'
+title: 'Baselines: o modelo burro que você precisa vencer'
+description: 'Por que medir baselines antes de qualquer modelo, quais baselines usar no case Galaxies (mediana do canal, últimos k posts, regressão em log de inscritos, alvo relativo) e como reportar o ganho sobre eles.'
+tags: [ml-preditivo, avaliacao, baselines]
+---
+
+# Baselines: O Modelo Burro que Você Precisa Vencer
+
+<LessonMeta
+  tempo="45 min"
+  semana={1}
+  etapa="avaliacao"
+  objetivos={[
+    'Explicar por que o baseline vem antes do modelo e o que ele revela sobre a base',
+    'Implementar em pandas os baselines do briefing usando só posts anteriores (groupby + shift + expanding/rolling)',
+    'Montar uma cadeia de fallback para canais sem histórico (cold start)',
+    'Reconhecer o baseline natural do alvo relativo e o que ele significa para a ordenação',
+    'Reportar o ganho sobre o baseline mais forte, na mesma base de teste',
+  ]}
+  prerequisitos={[
+    {label: 'Engajamento é cauda longa', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+  ]}
+/>
+
+:::info[Ambiente deste módulo]
+Todos os trechos do módulo 2 foram executados com Python 3.12 e estas versões:
+
+```bash
+uv init galaxies-previsor --python 3.12 && cd galaxies-previsor
+uv add pandas==3.0.6 numpy==2.5.3 scipy==1.18.1 scikit-learn==1.9.1 lightgbm==4.7.0 mlflow==3.16.1 pyyaml==6.0.3
+uv add --dev pytest==9.1.1
+```
+
+Rode cada trecho com `uv run python arquivo.py`. As saídas mostradas nas aulas são as que obtivemos com essa combinação. A [documentação do LightGBM](https://lightgbm.readthedocs.io/en/latest/Parameters.html) avisa que sistemas e compiladores diferentes podem dar resultados ligeiramente diferentes, então não se assuste com variações na terceira casa decimal.
+:::
+
+Você treina seu primeiro LightGBM na base de Shorts, com split temporal e tudo, e o teste devolve **MAE de 0,72 em log e Spearman de 0,86**. Parece ótimo: a literatura fala em Spearman entre 0,55 e 0,85 antes da publicação, e você está no topo da faixa.
+
+Aí alguém pergunta: *"e se você só repetisse a média de curtidas dos últimos 5 posts do canal?"*. Você roda. **MAE de 0,73 e Spearman de 0,86.** Uma linha de pandas, sem treino, sem features de vídeo, e praticamente o mesmo número. O seu modelo, até aqui, é a média dos últimos 5 posts com passos extras.
+
+Essa cena resume a aula. Um número de métrica sozinho não diz nada: 0,86 pode ser excelente ou pode ser o que qualquer planilha já entrega. Quem dá sentido ao número é o <Termo id="baseline">baseline</Termo>, e por isso ele é a **primeira** coisa que você mede, antes de qualquer modelo.
+
+:::info[Ideia central]
+Um *baseline* (linha de base) é a previsão mais simples e defensável que usa **só informação disponível no momento da previsão**. Ele é a régua do projeto: o único número que importa no relatório é o **ganho do seu modelo sobre o baseline mais forte**, medido na mesma base de teste.
+:::
+
+---
+
+## Por que o baseline vem primeiro
+
+Medir o baseline antes do modelo parece burocracia. Não é, por quatro motivos.
+
+1. **Ele calibra o que é "bom" na sua base.** Nos dados sintéticos desta aula, saber só o canal já dá Spearman global de 0,84. Isso muda completamente a leitura de um modelo com 0,86. Numa base em que os canais têm tamanhos parecidos, o mesmo baseline ficaria bem mais baixo. Sem medir, você não sabe onde está o chão.
+2. **Ele detecta bugs.** Se o modelo fica **abaixo** do baseline, há um erro no pipeline (features desalinhadas, alvo errado, split trocado). Se fica **absurdamente acima**, desconfie de [vazamento](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados).
+3. **Ele define o valor mínimo do produto.** O agente da Galaxies só se justifica se fizer melhor do que "repita a mediana do canal". Essa é a resposta que qualquer analista de marketing daria de cabeça.
+4. **Ele vira fallback em produção.** Quando o modelo não tem o que dizer (canal novo, feature faltando, serviço fora do ar), o agente precisa de uma resposta simples e honesta. O baseline é essa resposta.
+
+---
+
+## Os baselines do briefing
+
+Seja $$y = \log(1 + \text{curtidas})$$ o alvo, $$c$$ o canal e $$t$$ o instante da publicação. Todos os baselines abaixo usam **apenas posts do mesmo canal publicados antes de** $$t$$.
+
+**Mediana (ou média) histórica do canal.** Todos os posts anteriores entram na conta:
+
+$$
+\hat{y}_{c,t} = \operatorname{mediana}\{\, y_{c,s} : s < t \,\}
+$$
+
+**Média dos últimos** $$k$$ **posts.** Só a história recente, para acompanhar a fase do canal:
+
+$$
+\hat{y}_{c,t} = \frac{1}{k} \sum_{j=1}^{k} y_{c,\,t-j}
+$$
+
+**Regressão linear em log(inscritos).** Um único ajuste para a base inteira, útil quando o canal não tem histórico:
+
+$$
+\hat{y} = a + b \cdot \log(\text{inscritos})
+$$
+
+**Mediana global.** A mediana de $$y$$ no treino, igual para todo mundo. É o piso absoluto: qualquer coisa que não vença isso está quebrada.
+
+<Sketch name="m2/mediana-expansiva" alt="Linha do tempo de um canal com dez posts. Os seis primeiros, em ciano, entram no baseline; o sétimo, em verde, é o post a prever; os três últimos, em vermelho, são futuros e nunca entram. A caixa de cima mostra a mediana expansiva de todos os anteriores (groupby, shift(1), expanding().median()); a de baixo, a média dos últimos três (shift(1), rolling(3).mean()). Notas: groupby dá a cada canal a sua régua; shift(1) tira o post atual; canal com menos de três posts cai no cold start." caption="O baseline do canal olha só para trás. O shift(1) é o que impede o próprio post de entrar na conta." />
+
+Três decisões de desenho merecem atenção.
+
+**Mediana ou média?** Em log, a média já é bem mais robusta do que em escala linear, mas um viral num canal pequeno ainda a puxa; a mediana o ignora. Na prática ficam próximas: meça as duas.
+
+**Janela expansiva ou últimos** $$k$$ **posts?** É o velho dilema entre viés e variância. A janela expansiva tem pouca variância, mas demora a reagir quando o canal muda de fase (e canais mudam: veja [O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente)). A janela curta reage rápido, mas oscila com cada post. O $$k$$ é um hiperparâmetro e, como todo hiperparâmetro, se escolhe numa **janela de validação** anterior ao teste, nunca olhando o teste.
+
+**Por que escala log?** Porque curtidas são <Termo id="cauda-longa">cauda longa</Termo>. Em escala linear, a média de um canal com um viral de 500 mil curtidas não descreve nenhum post típico. Em log, diferenças viram razões: errar por 0,69 é errar por um fator de 2, seja o canal pequeno ou grande.
+
+---
+
+## Cold start: o canal sem histórico
+
+A mediana do canal não existe para o primeiro post, e é instável com 1 ou 2 posts anteriores. Esse é o problema de *cold start* (partida a frio), e ele é real no case: a Galaxies vai pedir previsões para marcas que talvez tenham poucos Shorts publicados.
+
+A solução é uma **cadeia de fallback**, do baseline mais informado para o menos informado:
+
+1. o canal tem **pelo menos 3 posts anteriores**: use a mediana (ou a média dos últimos $$k$$) do canal;
+2. não tem, mas você sabe o número de inscritos: use a **regressão em log(inscritos)**, ajustada só no treino;
+3. não sabe nem isso: use a **mediana global** do treino.
+
+O mínimo de 3 posts é uma escolha, não uma lei. Com dados reais, teste 3, 5 e 10 na validação. Registre a escolha e, no relatório, diga **quantos posts do teste caíram em cada degrau**: um baseline que só é bom porque 40% do teste caiu no cold start conta uma história diferente.
+
+:::warning[Inscritos têm uma armadilha temporal]
+A YouTube Data API devolve o número de inscritos **de hoje**, não o do dia em que cada post saiu. Para um post de 2024, o valor de hoje inclui o crescimento que veio depois, em parte causado pelos próprios posts. Isso é uma forma branda de vazamento temporal, discutida na [próxima aula](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados).
+:::
+
+---
+
+## O baseline do alvo relativo
+
+Na aula de [cauda longa](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/engajamento-e-cauda-longa), você viu o <Termo id="alvo-relativo">alvo relativo ao canal</Termo>:
+
+$$
+r_{c,t} = y_{c,t} - \operatorname{mediana}\{\, y_{c,s} : s < t \,\}
+$$
+
+Qual é o baseline natural para $$r$$? **Prever zero**: "este post vai ser igual à mediana do canal". Repare que isso é exatamente o mesmo que prever a mediana do canal para $$y$$. Os dois baselines têm o mesmo erro (o código abaixo confirma: 0,775 e 0,775). Trocar o alvo não torna o problema mais fácil; só muda o que o modelo precisa aprender.
+
+A consequência importante está na **ordenação**. Um baseline que prevê $$\hat{r} = 0$$ para todo mundo dá **empate** em todos os pares. Na acurácia par-a-par (aula [2.4](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao)), empate vale meio acerto. Então, para o alvo relativo, **o baseline de ordenação é a moeda: 50%**. É contra essa moeda que a Galaxies compara os "cerca de 60% par-a-par" que ela considera prova de conceito.
+
+---
+
+## Como reportar o ganho
+
+Cinco regras evitam os relatórios enganosos mais comuns.
+
+1. **Compare com o baseline mais forte, não com o mais fraco.** Vencer a mediana global é obrigação. O relatório compara com o melhor baseline que você conseguiu construir.
+2. **Mesma base de teste, mesmas linhas.** Se o modelo não prevê o cold start e o baseline prevê, as métricas não são comparáveis. Avalie os dois nas mesmas linhas e diga quantas são.
+3. **Absoluto e relativo.** Diga o $$\Delta$$ (por exemplo, "MAE 0,728 para 0,722") e a redução relativa, às vezes chamada de *skill score*:
+
+$$
+\text{ganho} = 1 - \frac{\text{MAE}_{\text{modelo}}}{\text{MAE}_{\text{baseline}}}
+$$
+
+4. **Várias métricas.** Erro (MAE em log) e ordenação (Spearman global, Spearman intra-canal, par-a-par). Como você vai ver a seguir, o ganho aparece em umas e some em outras.
+5. **Com intervalo de confiança.** Uma diferença de 0,006 no MAE pode ser ruído. As aulas [2.4](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao) e [2.6](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao) mostram como calcular o IC por bootstrap.
+
+<Sketch name="m2/escada-de-baselines" alt="Escada com cinco degraus e o MAE em log de cada um nos dados sintéticos da aula: mediana global 1,54; regressão em log de inscritos 1,24; mediana do canal com posts anteriores 0,79; média dos últimos 5 posts 0,73; seu modelo 0,72. Notas: para canal sem histórico, o degrau 2 é o melhor possível; o maior salto vem de conhecer o canal; contra o melhor baseline, o MAE cai só 0,8%, mas o Spearman intra-canal vai de −0,13 para +0,16." caption="Cada degrau é um baseline. O que importa é a distância entre o seu modelo e o degrau mais alto." />
+
+---
+
+## Na prática (código)
+
+Como cada aluno monta a própria base, os trechos do módulo usam uma **base sintética** com a mesma estrutura de canais e tempo que a sua: cada canal tem um nível próprio (ligado ao número de inscritos), uma tendência que muda devagar mês a mês e ruído de post a post, com virais ocasionais. Os efeitos do conteúdo (gancho, rosto, texto na tela, duração, horário) são **conhecidos**, o que permite checar se os métodos de avaliação contam a verdade. Troque `gerar_base()` pelo loader da sua base quando for aplicar.
+
+<details>
+<summary>Passo 1: o gerador da base sintética (o mesmo em todo o módulo)</summary>
+
+```python
+import numpy as np
+import pandas as pd
+
+
+def gerar_base(n_canais=60, seed=42):
+    """Shorts sintéticos: nível próprio por canal + tendência lenta + ruído."""
+    rng = np.random.default_rng(seed)
+    efeito_rosto = {"moda": 0.15, "beleza": 0.35, "automotivo": 0.05}
+    partes = []
+    for c in range(n_canais):
+        setor = ["moda", "beleza", "automotivo"][c % 3]
+        inscritos = int(np.exp(np.clip(rng.normal(11.3, 1.3), 8, 15.5)))
+        nivel = 0.85 * np.log(inscritos) - 4.2 + rng.normal(0, 0.55)
+        tendencia = np.cumsum(rng.normal(rng.normal(0, 0.03), 0.09, 32))  # por mês
+        inicio = rng.integers(0, 400) if rng.random() < 0.85 else rng.integers(700, 900)
+        n = max(8, int((960 - inicio) / rng.uniform(6, 20)))  # 1 post a cada 6-20 dias
+        dia = np.sort(rng.integers(inicio, 960, n))
+        hora = np.where(rng.random(n) < 0.4, rng.integers(18, 23, n), rng.integers(7, 24, n))
+        duracao = np.clip(rng.normal(38 if setor == "automotivo" else 28, 12, n), 8, 90).round()
+        rosto = rng.random(n) < (0.35 if setor == "automotivo" else 0.7)
+        texto_tela = rng.random(n) < 0.5
+        cortes_10s = np.clip(rng.normal(2.5, 1.0, n), 0, 6).round(1)
+        pergunta = rng.random(n) < 0.3
+        gancho = np.clip(rng.normal(5, 2, n), 0, 10).round()  # nota do VLM, 0-10
+        conteudo = (0.09 * (gancho - 5) + efeito_rosto[setor] * rosto + 0.15 * texto_tela
+                    + 0.05 * (cortes_10s - 2.5) - 0.05 * (duracao - 30) / 10
+                    + 0.06 * pergunta + 0.12 * ((hora >= 18) & (hora <= 22)))
+        viral = rng.random(n) < 0.03
+        y = (nivel + tendencia[dia // 30] + conteudo + rng.normal(0, 0.7, n)
+             + viral * rng.normal(1.5, 0.4, n))
+        curtidas = np.maximum(0, np.round(np.expm1(y)))
+        regime = np.where(dia >= 455, 1.7, 1.0)  # replays contam desde 31/03/2025
+        views = np.round((curtidas + 1) * np.exp(rng.normal(np.log(35), 0.35, n)) * regime)
+        partes.append(pd.DataFrame({
+            "canal": f"c{c:02d}", "setor": setor, "inscritos": inscritos,
+            "data_pub": pd.Timestamp("2024-01-01") + pd.to_timedelta(dia, "D")
+                        + pd.to_timedelta(hora, "h"),
+            "hora": hora, "duracao_s": duracao, "rosto": rosto, "texto_tela": texto_tela,
+            "cortes_10s": cortes_10s, "titulo_pergunta": pergunta,
+            "legenda_chars": np.clip(rng.normal(90, 45, n), 0, None).round(),
+            "gancho_vlm": gancho, "curtidas": curtidas, "views": views,
+            "comentarios": rng.poisson(curtidas * 0.02),
+        }))
+    df = pd.concat(partes, ignore_index=True)
+    df["y"] = np.log1p(df["curtidas"])
+    return df.sort_values(["data_pub", "canal"]).reset_index(drop=True)
+```
+
+São 60 canais e cerca de 3.500 posts entre jan/2024 e ago/2026. O último mês antes de hoje (27/09/2026) fica de fora de propósito: o alvo desses posts ainda não amadureceu.
+
+</details>
+
+**Passo 2: os baselines do canal, só com posts anteriores.** O `sort_values` garante a ordem temporal dentro de cada canal; o `shift(1)` tira o post atual; `expanding` acumula tudo o que veio antes e `rolling(5)` fica com os últimos 5.
+
+```python
+df = gerar_base()
+df = df.sort_values(["canal", "data_pub"]).reset_index(drop=True)
+g = df.groupby("canal")["y"]
+
+# shift(1): o post atual e os futuros nunca entram na conta
+df["n_anteriores"] = df.groupby("canal").cumcount()
+df["media_canal"] = g.transform(lambda s: s.shift(1).expanding().mean())
+df["mediana_canal"] = g.transform(lambda s: s.shift(1).expanding().median())
+df["media_ult5"] = g.transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+df["log_inscritos"] = np.log(df["inscritos"])
+
+cols = ["y", "n_anteriores", "mediana_canal", "media_ult5"]
+print(df.loc[df["canal"] == "c00", ["data_pub"] + cols].head(6)
+        .assign(data_pub=lambda d: d["data_pub"].dt.date).round(2).to_string(index=False))
+```
+
+```text
+  data_pub    y  n_anteriores  mediana_canal  media_ult5
+2024-07-09 6.07             0            NaN         NaN
+2024-08-01 5.68             1           6.07        6.07
+2024-09-03 5.76             2           5.88        5.88
+2024-09-12 4.49             3           5.76        5.84
+2024-09-17 6.01             4           5.72        5.50
+2024-09-30 4.80             5           5.76        5.60
+```
+
+Confira a linha de 12/09: o post teve $$y = 4{,}49$$, mas a mediana do canal ao lado dele (5,76) não mudou por causa disso. O efeito dele só aparece na linha seguinte. É assim que deve ser.
+
+**Passo 3: split temporal, cold start e a tabela de baselines.** O corte é 01/03/2026: tudo antes é treino, tudo depois é teste (a aula [2.3](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal) refina isso com gap e walk-forward). As funções de Spearman seguem a mesma convenção dos componentes do site: se uma das séries for constante, a correlação vale 0.
+
+```python
+from sklearn.linear_model import LinearRegression
+
+def spearman(a, b):
+    """Correlação entre os ranks; 0 se uma das séries for constante (como no site)."""
+    ra, rb = pd.Series(a).rank().to_numpy(), pd.Series(b).rank().to_numpy()
+    return 0.0 if ra.std() == 0 or rb.std() == 0 else float(np.corrcoef(ra, rb)[0, 1])
+
+def spearman_intra(d, col, min_posts=3):
+    """Spearman dentro de cada canal, média ponderada pelo nº de posts."""
+    partes = [(spearman(x["y"], x[col]), len(x)) for _, x in d.groupby("canal")
+              if len(x) >= min_posts]
+    return sum(r * n for r, n in partes) / sum(n for _, n in partes)
+
+corte = pd.Timestamp("2026-03-01")
+treino, teste = df[df["data_pub"] < corte], df[df["data_pub"] >= corte].copy()
+
+# cold start: regressão linear y ~ log(inscritos), ajustada só no treino
+reg = LinearRegression().fit(treino[["log_inscritos"]], treino["y"])
+teste["b_global"] = treino["y"].median()
+teste["b_inscritos"] = reg.predict(teste[["log_inscritos"]])
+poucos = teste["n_anteriores"] < 3  # histórico curto demais: cai no cold start
+for col in ["media_canal", "mediana_canal", "media_ult5"]:
+    teste["b_" + col] = teste[col].where(~poucos, teste["b_inscritos"])
+
+linhas = [{"baseline": col[2:],
+           "MAE_log": (teste["y"] - teste[col]).abs().mean(),
+           "spearman_global": spearman(teste["y"], teste[col]),
+           "spearman_intra": spearman_intra(teste, col)}
+          for col in teste.columns if col.startswith("b_")]
+print(f"treino={len(treino)}  teste={len(teste)}  cold start no teste={poucos.sum()}")
+print(pd.DataFrame(linhas).round(3).to_string(index=False))
+```
+
+```text
+treino=2671  teste=862  cold start no teste=24
+     baseline  MAE_log  spearman_global  spearman_intra
+       global    1.539            0.000           0.000
+    inscritos    1.241            0.537           0.000
+  media_canal    0.781            0.841          -0.198
+mediana_canal    0.792            0.840          -0.197
+   media_ult5    0.728            0.859          -0.126
+```
+
+Três leituras dessa tabela:
+
+- **O canal explica quase tudo do nível.** Passar da mediana global (MAE 1,54) para a mediana do canal (0,79) corta o erro pela metade. Nenhuma feature de conteúdo vai chegar perto disso.
+- **O Spearman global de 0,84 vem de graça.** Ele só mede se o modelo sabe que canal grande tem mais curtidas que canal pequeno.
+- **Dentro do canal, os baselines não ordenam nada, e ficam até negativos.** A regressão em inscritos dá exatamente 0: ela prevê o mesmo número para todos os posts do canal. Os baselines de histórico ficam abaixo de zero por **regressão à média**: um post acima do normal empurra para cima a previsão dos posts seguintes, que em geral voltam ao normal.
+
+**Passo 4: o modelo e o ganho sobre o melhor baseline.** O LightGBM aqui é uma caixa-preta; você vai abri-la no [módulo 3](/aulas/ml-preditivo-e-agentes/gradient-boosting/arvores-de-decisao).
+
+```python
+import lightgbm as lgb
+
+features = ["log_inscritos", "mediana_canal", "media_ult5", "n_anteriores", "hora",
+            "duracao_s", "rosto", "texto_tela", "cortes_10s", "titulo_pergunta", "gancho_vlm"]
+modelo = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15,
+                           random_state=0, verbose=-1)
+modelo.fit(treino[features].astype(float), treino["y"])
+teste["modelo"] = modelo.predict(teste[features].astype(float))
+
+def resumo(col):
+    return {"MAE_log": (teste["y"] - teste[col]).abs().mean(),
+            "spearman_global": spearman(teste["y"], teste[col]),
+            "spearman_intra": spearman_intra(teste, col)}
+
+comp = pd.DataFrame({c: resumo(c) for c in ["b_mediana_canal", "b_media_ult5", "modelo"]}).T
+print(comp.round(3))
+melhor = comp.drop(index="modelo")["MAE_log"].idxmin()
+ganho = 1 - comp.loc["modelo", "MAE_log"] / comp.loc[melhor, "MAE_log"]
+print(f"redução do MAE sobre o MELHOR baseline ({melhor}): {ganho:.1%}")
+```
+
+```text
+                 MAE_log  spearman_global  spearman_intra
+b_mediana_canal    0.792            0.840          -0.197
+b_media_ult5       0.728            0.859          -0.126
+modelo             0.722            0.864           0.157
+redução do MAE sobre o MELHOR baseline (b_media_ult5): 0.8%
+```
+
+Contra a mediana do canal, o modelo parece ter cortado 9% do erro. Contra o baseline mais forte (média dos últimos 5), o corte é de **0,8%**, e o Spearman global sobe só 0,005. O que muda de verdade é o **Spearman intra-canal**, de −0,13 para +0,16: o modelo começou a saber qual post do mesmo canal rende mais. É exatamente o que a Lumina precisa, e é por isso que o relatório nunca pode ter só uma métrica.
+
+**Passo 5: o baseline do alvo relativo.** Nas linhas com histórico, prever $$r = 0$$ e prever a mediana do canal para $$y$$ são a mesma coisa:
+
+```python
+com_hist = teste[teste["n_anteriores"] >= 3]
+r = com_hist["y"] - com_hist["mediana_canal"]  # alvo relativo ao canal
+print(f"MAE do baseline 'r = 0'       : {r.abs().mean():.3f}")
+print(f"MAE da mediana do canal em y  : {(com_hist['y'] - com_hist['b_mediana_canal']).abs().mean():.3f}")
+```
+
+```text
+MAE do baseline 'r = 0'       : 0.775
+MAE da mediana do canal em y  : 0.775
+```
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A Lumina tem mediana de cerca de **2.300 curtidas** nos últimos 90 dias. Esse número **já é um baseline**: uma mediana com janela de tempo. Em escala log, ele vale $$\log(1 + 2300) \approx 7{,}74$$.
+
+O que o baseline diz sobre A e B? **Exatamente a mesma coisa para os dois**: cerca de 2.300 curtidas. Ele não sabe que A abre com o logo e B abre com metade do rosto sem maquiagem. Para a decisão "A ou B", o baseline empata, ou seja, acerta 50% dos pares.
+
+Isso define as duas barras que o seu agente precisa passar:
+
+- **no número**, errar menos do que "2.300 para qualquer Short da Lumina";
+- **na decisão**, acertar mais do que 50% dos pares A vs. B do mesmo canal.
+
+Se o seu modelo disser que B rende 3.900 e A rende 1.800, a primeira pergunta de um avaliador vai ser: *"quanto isso é melhor do que dizer 2.300 para os dois?"*. Tenha a resposta pronta, com a tabela do passo 4 feita na sua base.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas com baselines]
+1. **Calcular a média do canal com todos os posts.** `groupby("canal")["y"].transform("median")` usa o futuro e o próprio post. O baseline fica bom demais e o modelo que o usa como feature, também. Sempre `shift(1)` antes de `expanding` ou `rolling`.
+2. **Comparar com o baseline mais fraco.** "Reduzi o MAE em 50%" contra a mediana global não diz nada. Compare com o melhor baseline que você conseguiu.
+3. **Avaliar baseline e modelo em linhas diferentes.** Descartar o cold start só no modelo (porque ele deu NaN, por exemplo) melhora a métrica dele artificialmente.
+4. **Escolher o** $$k$$ **olhando o teste.** Escolha na validação, antes do corte, e avalie uma vez no teste.
+5. **Baseline em escala linear.** A média de curtidas cruas é dominada por virais e não descreve o post típico.
+6. **Reportar só MAE ou só Spearman global.** Os dois podem ficar quase iguais ao baseline enquanto a ordenação dentro do canal, que é o que decide A vs. B, melhora muito (ou o contrário).
+:::
+
+<Quiz
+  id="m2-a1"
+  perguntas={[
+    {
+      pergunta: 'Seu modelo tem Spearman global de 0,86 no teste temporal. O que falta para dizer se ele é bom?',
+      opcoes: [
+        {texto: 'Nada: 0,86 está no topo da faixa da literatura (0,55–0,85).', explicacao: 'A faixa da literatura não é a régua da sua base. Nos dados da aula, só conhecer o canal já dá 0,84.'},
+        {texto: 'O Spearman do melhor baseline no mesmo teste, e as métricas intra-canal.', correta: true, explicacao: 'Exato. O número só ganha sentido comparado ao baseline mais forte, nas mesmas linhas, e olhando também a ordenação dentro do canal.'},
+        {texto: 'O Spearman no conjunto de treino.', explicacao: 'O desempenho no treino mede memorização, não generalização. Ele não diz se o modelo supera uma regra simples.'},
+      ],
+    },
+    {
+      pergunta: 'Qual linha calcula corretamente a mediana histórica do canal como baseline?',
+      opcoes: [
+        {texto: '`g.transform("median")`', explicacao: 'Usa todos os posts do canal, inclusive o próprio post e os futuros: é vazamento.'},
+        {texto: '`g.transform(lambda s: s.expanding().median())`', explicacao: 'Sem o `shift(1)`, a janela inclui o próprio post. A feature passa a conter parte do alvo.'},
+        {texto: '`g.transform(lambda s: s.shift(1).expanding().median())`', correta: true, explicacao: 'O `shift(1)` desloca a série e o `expanding` acumula só o que veio antes (com o DataFrame ordenado por canal e data).'},
+        {texto: '`g.transform(lambda s: s.rolling(5, center=True).median())`', explicacao: 'Uma janela centrada olha dois posts para trás e dois para a frente: usa o futuro.'},
+      ],
+    },
+    {
+      pergunta: 'Você passou a usar o alvo relativo r = y − mediana do canal. Qual é o baseline natural e quanto ele acerta no par-a-par intra-canal?',
+      opcoes: [
+        {texto: 'Prever r = 0; acerta 50% dos pares, porque empata em todos.', correta: true, explicacao: 'Prever 0 dá a mesma previsão para todos os posts, e empate vale meio acerto. É a moeda contra a qual os 60% da Galaxies são medidos.'},
+        {texto: 'Prever a média de r no treino; acerta 60%.', explicacao: 'Uma constante qualquer também empata em todos os pares: 50%, não 60%.'},
+        {texto: 'Não existe baseline para o alvo relativo.', explicacao: 'Existe, e é o mais importante: prever que o post vai ser igual à mediana do canal.'},
+      ],
+    },
+    {
+      pergunta: 'Um canal tem apenas 1 post publicado antes do post que você quer prever. O que a cadeia de fallback deve fazer?',
+      opcoes: [
+        {texto: 'Usar a curtida desse único post como previsão.', explicacao: 'Com 1 post, a "mediana" é esse post, com toda a variância de um único Short. É instável demais.'},
+        {texto: 'Descartar o post do teste.', explicacao: 'Descartar esconde exatamente o caso difícil que a Galaxies vai encontrar com marcas novas.'},
+        {texto: 'Cair na regressão em log(inscritos), ajustada só no treino, e registrar quantos posts do teste usaram esse degrau.', correta: true, explicacao: 'É o baseline mais informado disponível sem histórico. Reportar a cobertura de cada degrau deixa a comparação honesta.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: um baseline mais forte]
+Na sua base (ou na sintética):
+
+1. Crie o baseline **mediana dos últimos 90 dias** do canal, excluindo o post atual. Dica: `rolling("90D", closed="left")` sobre uma série indexada por `data_pub`, canal a canal.
+2. Escolha o $$k$$ da média dos últimos $$k$$ posts entre 3, 5, 10 e 20 usando uma **janela de validação** (por exemplo, set/2025 a fev/2026), sem tocar no teste.
+3. Avalie os três baselines no teste, **nas mesmas linhas**, e atualize a redução do MAE do seu modelo sobre o melhor deles.
+:::
+
+<details>
+<summary>Ver uma solução (continua o código do passo 3)</summary>
+
+```python
+def mediana_90d(grupo):
+    """Mediana dos posts do canal nos 90 dias anteriores (closed='left' exclui o atual)."""
+    s = grupo.set_index("data_pub")["y"]
+    return pd.Series(s.rolling("90D", closed="left").median().to_numpy(), index=grupo.index)
+
+df["mediana_90d"] = df.groupby("canal", group_keys=False)[["data_pub", "y"]].apply(mediana_90d)
+
+def media_ult(k):
+    return df.groupby("canal")["y"].transform(lambda s: s.shift(1).rolling(k, min_periods=1).mean())
+
+# 1) escolha de k numa janela de VALIDAÇÃO, antes do corte do teste
+val = df[(df["data_pub"] >= "2025-09-01") & (df["data_pub"] < corte) & (df["n_anteriores"] >= 3)]
+for k in [3, 5, 10, 20]:
+    print(f"k={k:2d}  MAE na validação = {(val['y'] - media_ult(k)[val.index]).abs().mean():.3f}")
+
+# 2) só depois, uma única avaliação no teste, nas MESMAS linhas para todos
+df["media_ult10"] = media_ult(10)
+linhas = teste.index[(teste["n_anteriores"] >= 3) & df.loc[teste.index, "mediana_90d"].notna()]
+for col in ["media_ult5", "media_ult10", "mediana_90d"]:
+    print(f"{col:12s} MAE no teste = {(df.loc[linhas, 'y'] - df.loc[linhas, col]).abs().mean():.3f}")
+```
+
+```text
+k= 3  MAE na validação = 0.729
+k= 5  MAE na validação = 0.698
+k=10  MAE na validação = 0.662
+k=20  MAE na validação = 0.665
+media_ult5   MAE no teste = 0.709
+media_ult10  MAE no teste = 0.686
+mediana_90d  MAE no teste = 0.712
+```
+
+A validação escolhe $$k = 10$$, e esse baseline também é o melhor no teste. Repare no que isso faz com o passo 4: com um baseline de MAE 0,686, o modelo da aula (0,722 no teste inteiro) precisa ser reavaliado nas mesmas linhas, e pode perder no MAE. Baselines bem ajustados são adversários sérios, e é bom descobrir isso na semana 1.
+
+</details>
+
+---
+
+## Resumo
+
+- Um **baseline** é a previsão mais simples e defensável com o que se sabe no momento da previsão. Meça antes de qualquer modelo.
+- Os baselines do case são a **mediana/média histórica do canal**, a **média dos últimos k posts**, a **regressão em log(inscritos)** e a **mediana global**, sempre com `shift(1)` e dentro de cada canal.
+- O **cold start** se resolve com uma cadeia de fallback, reportando quantos casos caíram em cada degrau.
+- Para o **alvo relativo**, o baseline é prever 0; na ordenação, ele equivale à moeda (**50% par-a-par**).
+- Reporte o **ganho sobre o baseline mais forte**, nas mesmas linhas, com várias métricas e intervalo de confiança.
+
+## Referências
+
+- Hyndman e Athanasopoulos. [*Forecasting: Principles and Practice*, 3ª ed., seção "Some simple forecasting methods"](https://otexts.com/fpp3/simple-methods.html). Métodos ingênuos (média, último valor) como régua obrigatória.
+- Hyndman e Athanasopoulos. [*Forecasting: Principles and Practice*, seção "Evaluating point forecast accuracy"](https://otexts.com/fpp3/accuracy.html). Erros escalados pelo baseline ingênuo.
+- scikit-learn. [`DummyRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.dummy.DummyRegressor.html): baselines constantes (média, mediana, quantil) com a API de estimador.
+- pandas. [Windowing operations](https://pandas.pydata.org/docs/user_guide/window.html): `rolling`, `expanding` e janelas por tempo (`"90D"`, `closed="left"`).
+- Gupta et al. [*Understanding Virality*](https://arxiv.org/abs/2512.21402) (arXiv:2512.21402): Spearman 0,71 e 76,3% par-a-par, com split aleatório. Um exemplo de por que o número precisa vir acompanhado do baseline e do tipo de split.
+
+**Próxima aula:** [Vazamento de dados](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados): as cinco formas de o futuro entrar no seu treino, e como pegar cada uma antes que ela infle a sua métrica.

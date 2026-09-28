@@ -1,0 +1,361 @@
+---
+sidebar_position: 6
+sidebar_label: 'Engajamento é cauda longa'
+title: 'Engajamento é cauda longa'
+description: 'Por que curtidas seguem uma distribuição de cauda longa, por que a média engana, o que o log1p muda na perda e como construir o alvo relativo ao canal e as faixas sem vazar o futuro.'
+tags: [ml-preditivo, dados, alvo, cauda-longa]
+---
+
+import LongTailExplorer from '@site/src/components/interativos/LongTailExplorer';
+
+# Engajamento É Cauda Longa: Log, Mediana e o Alvo Relativo ao Canal
+
+<LessonMeta
+  tempo="45 min"
+  semana={1}
+  etapa="dados"
+  objetivos={[
+    'Reconhecer uma distribuição de cauda longa e explicar por que a média engana nela',
+    'Aplicar log1p ao alvo e interpretar erros em escala log como erros relativos',
+    'Construir o alvo relativo ao canal usando só posts anteriores, sem vazamento',
+    'Derivar faixas (abaixo, na média, acima, viral) a partir dos quantis do histórico do canal',
+  ]}
+  prerequisitos={[
+    {label: 'Anatomia de um problema supervisionado', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/anatomia-de-um-problema-supervisionado'},
+    {label: 'Construindo o coletor', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor'},
+  ]}
+/>
+
+Você termina a primeira coleta e calcula a média de curtidas dos Shorts: 6.232. Parece um bom número de referência para dizer se um Short "foi bem". Aí você conta quantos Shorts chegaram a essa média: **32%**. Dois em cada três ficaram abaixo da "média". O Short mais curtido tem 80 mil curtidas, treze vezes a média, e sozinho move esse número mais do que dezenas de Shorts comuns.
+
+Nada está errado com os seus dados. É assim que engajamento se distribui: muitos valores pequenos, alguns médios e poucos gigantes. Essa forma tem nome, **cauda longa**, e ela muda quase tudo: qual estatística resume a base, qual escala o modelo deve usar, qual perda faz sentido e, principalmente, como comparar dois Shorts de canais de tamanhos diferentes.
+
+:::info[A ideia central]
+Curtidas têm distribuição de <Termo id="cauda-longa">cauda longa</Termo>, aproximadamente log-normal. Por isso: resuma com a **mediana**, modele em escala <Termo id="log1p">log1p</Termo> (onde erros viram **razões**) e, para comparar criativos, use o <Termo id="alvo-relativo">alvo relativo ao canal</Termo>: o log da razão entre as curtidas do post e a mediana dos posts **anteriores** do mesmo canal. As faixas de comunicação saem dos quantis desse mesmo histórico.
+:::
+
+---
+
+## Como é uma cauda longa
+
+Uma variável é **log-normal** quando o seu logaritmo tem distribuição normal. Isso acontece naturalmente quando o valor final é o resultado de muitos **fatores multiplicativos**: um Short é recomendado para um grupo, uma fração assiste, uma fração dessa fração curte, parte compartilha e o ciclo recomeça com um público maior ou menor. Pequenas diferenças em cada etapa se multiplicam. Szabo e Huberman descreveram exatamente esse mecanismo, crescimento com ruído multiplicativo, ao modelar a popularidade de vídeos do YouTube e de histórias do Digg, com popularidades que se espalhavam por três ordens de grandeza.
+
+O trecho abaixo gera uma base **sintética** com três canais de tamanhos muito diferentes e mede o que acontece com as estatísticas de resumo:
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+
+# Base sintética: 3 canais de tamanhos muito diferentes (NÃO são dados reais)
+niveis = {"garagem22": 5.5, "lumina": 7.7, "megamoda": 9.5}   # log das curtidas "típicas"
+linhas = []
+for canal, nivel in niveis.items():
+    datas = pd.date_range("2026-01-05", periods=40, freq="4D", tz="UTC")
+    curtidas = np.round(np.exp(nivel + rng.normal(0, 0.8, len(datas))))   # log-normal
+    linhas += [{"channel_id": canal, "published_at": d, "likes": c} for d, c in zip(datas, curtidas)]
+df = pd.DataFrame(linhas)
+
+print(df["likes"].agg(["mean", "median", "max"]).round(0))
+print("fração dos posts abaixo da média:", round((df["likes"] < df["likes"].mean()).mean(), 2))
+print("assimetria bruta: %.2f | após log1p: %.2f" % (df["likes"].skew(), np.log1p(df["likes"]).skew()))
+```
+
+```text
+mean       6232.0
+median     2334.0
+max       80483.0
+Name: likes, dtype: float64
+fração dos posts abaixo da média: 0.68
+assimetria bruta: 4.02 | após log1p: -0.19
+```
+
+Três leituras:
+
+- **A média é quase três vezes a mediana.** Ela é puxada pelos maiores valores e não descreve o Short típico.
+- **68% dos Shorts ficam abaixo da média.** Numa distribuição simétrica, seriam cerca de 50%.
+- **A assimetria cai de 4,02 para perto de zero depois do `log1p`.** Na escala log, a distribuição fica aproximadamente simétrica, e é nessa escala que médias, desvios e perdas quadráticas voltam a fazer sentido.
+
+Explore a mesma ideia no componente abaixo, que mostra o histograma bruto, depois do `log1p` e relativo ao canal, por setor. Os dados do componente são **simulados**, com efeitos conhecidos, e não representam canais reais:
+
+<LongTailExplorer />
+
+---
+
+## log1p: por que o +1 e o que muda na perda
+
+A transformação usada na trilha é $$y = \log(1 + \text{curtidas})$$, que o NumPy chama de `np.log1p`. O +1 existe por um motivo prático: Shorts com **zero** curtidas existem, e $$\log(0)$$ não. Para valores grandes, o +1 é irrelevante.
+
+A consequência mais importante está na perda. Em escala log, **diferenças viram razões**:
+
+$$
+\log(1 + a) - \log(1 + b) = \log\frac{1 + a}{1 + b}
+$$
+
+Um resíduo de 0,1 significa errar por cerca de 10% ($$e^{0{,}1} \approx 1{,}105$$); 0,3 significa cerca de 35%; 0,69 significa o **dobro** ou a **metade**. Isso vale igualmente para um canal com mediana de 200 curtidas e para um com 20 mil. Em escala bruta, uma MSE seria dominada pelos canais grandes: errar por 5 mil curtidas num canal gigante pesaria 2.500 vezes mais do que errar por 100 num canal pequeno, mesmo que os dois erros fossem de 50%. Em log, os dois pesam igual.
+
+Um cuidado ao voltar para curtidas: $$e^{\hat y} - 1$$ estima algo próximo da **mediana** condicional, não da média. Se um relatório precisar da média em curtidas, a transformação inversa direta tende a subestimá-la (o chamado viés de retransformação). Para **ordenar** criativos, que é o que a Galaxies quer, isso não importa: a transformação é monotônica e preserva a ordem.
+
+---
+
+## O alvo relativo ao canal
+
+Mesmo em log, o maior determinante das curtidas de um Short é **o canal**: um canal com 2 milhões de inscritos e um com 20 mil vivem em escalas diferentes, e o conteúdo mexe relativamente pouco nisso. Quando a pergunta é "qual de dois criativos **do mesmo canal** rende mais?", o nível do canal é ruído. O alvo relativo tira esse nível:
+
+$$
+y^{\text{rel}}_t = \log\frac{\text{curtidas}_t + 1}{\text{mediana}(\text{curtidas dos posts anteriores a } t) + 1}
+$$
+
+Zero significa "na mediana do canal"; +0,69, o dobro; −0,69, a metade. A palavra que mais importa na fórmula é **anteriores**.
+
+<Sketch name="m1/alvo-relativo" alt="Linha do tempo com os posts de um canal como barras. As barras antes do post t (em ciano) entram no cálculo da mediana, desenhada como linha tracejada; o post t (em amarelo) é o alvo; as barras depois de t (em vermelho, tracejadas) não entram. Abaixo, a fórmula y_rel(t) = log((curtidas_t + 1) / (mediana_anteriores_t + 1)), com 0 = na mediana, +0,69 ≈ 2× e −0,69 ≈ metade; e uma barra de faixas: abaixo até o p25, na média entre p25 e p75, acima até o p95 e viral acima do p95, calculadas sobre as curtidas dos posts anteriores do canal." caption="O post t só pode ser comparado com o que já existia antes dele." />
+
+Por que não usar a mediana do canal inteiro, que é mais simples de calcular? Porque ela inclui posts **publicados depois** de $$t$$, e isso é <Termo id="leakage">vazamento</Termo>. No momento da previsão, o futuro do canal não existe. O efeito é concreto: num canal que está **crescendo**, a mediana de todos os posts é maior do que a mediana dos anteriores, então os posts antigos parecem piores do que foram e os recentes, melhores. O modelo aprende uma tendência que é artefato do cálculo. O código a seguir mede isso.
+
+Dois detalhes de implementação:
+
+- **Histórico mínimo.** Com dois ou três posts anteriores, a mediana é instável. A trilha usa pelo menos 10; os primeiros posts de cada canal ficam sem alvo relativo ("sem histórico") e podem ser usados só com o alvo em `log1p`, ou descartados.
+- **Janela.** A mediana pode ser de **todos** os anteriores (janela expansiva) ou dos **últimos 90 dias** (janela móvel). A expansiva é mais estável; a móvel acompanha canais que crescem ou encolhem. A mediana de 2.300 curtidas da Lumina é de uma janela de 90 dias. O exercício compara as duas.
+
+---
+
+## Faixas: comunicar em vez de decimais
+
+"+0,38 em escala log" não é uma frase que se diz para o time de marketing. As faixas traduzem o alvo em categorias, usando os **quantis das curtidas dos posts anteriores** do próprio canal:
+
+| Faixa | Regra (quantis do histórico do canal) | Leitura |
+| :--- | :--- | :--- |
+| abaixo | menos que o p25 | pior que 3 em cada 4 posts anteriores |
+| na média | entre p25 e p75 | dentro do normal do canal |
+| acima | entre p75 e p95 | melhor que 3 em cada 4 |
+| viral | acima do p95 | fora da curva do próprio canal |
+
+Os cortes são uma **convenção**: escolha, justifique e documente. O ponto importante é que as faixas são relativas à **dispersão** do canal, não só à mediana. Num canal com muita variação, um post com o dobro da mediana ainda pode cair em "na média"; num canal muito regular, 30% acima da mediana já pode ser "acima". Como a [aula 1.1](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/do-llm-ao-modelo-preditivo) antecipou, você treina a regressão e **deriva** a faixa da previsão; não precisa de um segundo modelo.
+
+---
+
+## Na prática: o alvo relativo em pandas
+
+O trecho abaixo calcula o alvo em `log1p`, o alvo relativo e as faixas com `groupby` + `shift` + `expanding`, e compara com a versão vazada. A base é **sintética**; o canal `lumina` foi gerado crescendo ao longo do ano:
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+linhas = []  # base sintética: a Lumina CRESCE ao longo do ano (NÃO são dados reais)
+for canal, nivel, cresc in [("garagem22", 5.5, 0.0), ("lumina", 7.0, 0.03), ("megamoda", 9.5, 0.0)]:
+    datas = pd.date_range("2026-01-05", periods=40, freq="4D", tz="UTC")
+    log_c = nivel + cresc * np.arange(40) + rng.normal(0, 0.8, 40)
+    linhas += [{"video_id": f"{canal}-{i:02d}", "channel_id": canal, "published_at": d,
+                "likes": float(np.round(np.exp(v)))} for i, (d, v) in enumerate(zip(datas, log_c))]
+df = pd.DataFrame(linhas)
+
+MIN_HIST = 10  # posts anteriores necessários para existir "histórico do canal"
+
+def alvo_relativo(df: pd.DataFrame, min_hist: int = MIN_HIST) -> pd.DataFrame:
+    df = df.sort_values(["channel_id", "published_at", "video_id"]).copy()
+    anteriores = df.groupby("channel_id")["likes"].shift(1)       # só o passado de cada canal
+    exp = anteriores.groupby(df["channel_id"]).expanding(min_periods=min_hist)
+    df["mediana_ant"] = exp.median().droplevel(0)
+    df["p25"] = exp.quantile(0.25).droplevel(0)
+    df["p75"] = exp.quantile(0.75).droplevel(0)
+    df["p95"] = exp.quantile(0.95).droplevel(0)
+    df["y_log"] = np.log1p(df["likes"])
+    df["y_rel"] = np.log((df["likes"] + 1) / (df["mediana_ant"] + 1))
+    df["faixa"] = np.select(
+        [df["mediana_ant"].isna(), df["likes"] < df["p25"], df["likes"] <= df["p75"],
+         df["likes"] <= df["p95"]],
+        ["sem histórico", "abaixo", "na média", "acima"], default="viral")
+    return df
+
+out = alvo_relativo(df)
+cols = ["published_at", "likes", "mediana_ant", "y_rel", "faixa"]
+print(out.loc[out["channel_id"] == "lumina", cols].iloc[8:14].round({"y_rel": 2}).to_string(index=False))
+print(out.groupby("channel_id")[["y_log", "y_rel"]].mean().round(2))
+print(out["faixa"].value_counts())
+
+# O erro clássico: mediana do canal inteiro (inclui posts FUTUROS)
+vazado = np.log((out["likes"] + 1) / (out.groupby("channel_id")["likes"].transform("median") + 1))
+lum = out["channel_id"] == "lumina"
+metade = out["published_at"] < "2026-04-15"
+print("Lumina, 1ª metade do ano -> honesto: %.2f | vazado: %.2f"
+      % (out.loc[lum & metade, "y_rel"].mean(), vazado[lum & metade].mean()))
+```
+
+```text
+             published_at  likes  mediana_ant  y_rel         faixa
+2026-02-06 00:00:00+00:00  834.0          NaN    NaN sem histórico
+2026-02-10 00:00:00+00:00 7118.0          NaN    NaN sem histórico
+2026-02-14 00:00:00+00:00 2724.0       1236.5   0.79         acima
+2026-02-18 00:00:00+00:00  584.0       1275.0  -0.78        abaixo
+2026-02-22 00:00:00+00:00 1668.0       1236.5   0.30      na média
+2026-02-26 00:00:00+00:00 2569.0       1275.0   0.70      na média
+            y_log  y_rel
+channel_id
+garagem22    5.19  -0.13
+lumina       7.62   0.38
+megamoda     9.43  -0.01
+faixa
+na média         39
+sem histórico    30
+abaixo           24
+acima            19
+viral             8
+Name: count, dtype: int64
+Lumina, 1ª metade do ano -> honesto: 0.23 | vazado: -0.28
+```
+
+O que observar:
+
+- **`shift(1)` é o que garante "anteriores".** Sem ele, a mediana do post $$t$$ incluiria o próprio post $$t$$, um vazamento pequeno mas real.
+- **O post de 26/02 teve o dobro da mediana ($$y^{\text{rel}} = 0{,}70$$) e ficou "na média"**, porque o histórico desse canal é muito disperso.
+- **No canal que cresce, a média do alvo relativo é positiva (0,38)**: cada post tende a superar o passado. Isso é informação real sobre o canal, não um erro.
+- **A versão vazada inverte o sinal**: na primeira metade do ano, os posts da Lumina parecem ruins (−0,28), quando na verdade estavam acima do próprio histórico (+0,23).
+
+Se a sua base tiver dois posts do mesmo canal com o mesmo `published_at`, a ordenação por `video_id` desempata, mas um deles "verá" o outro como anterior. É raro; se acontecer muito, trate os empates explicitamente.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Com o alvo relativo, a pergunta da Lumina fica bem posta: **qual criativo supera mais a mediana recente do canal?** O histórico (mediana de cerca de 2.300 curtidas em 90 dias) é o mesmo para A e B, então toda a diferença entre as duas previsões vem do conteúdo e do contexto de publicação.
+
+Um exemplo **ilustrativo** de como o agente vai traduzir a saída do modelo:
+
+- Short B: $$\hat y^{\text{rel}} = +0{,}40$$ → cerca de $$2.301 \times e^{0{,}40} - 1 \approx 3.430$$ curtidas, faixa "acima" se isso passar do p75 do histórico da Lumina.
+- Short A: $$\hat y^{\text{rel}} = -0{,}10$$ → cerca de 2.080 curtidas, faixa "na média".
+
+Os números são inventados para mostrar a conta; os de verdade saem do seu modelo no módulo 3. E a resposta completa não para aí: no módulo 5, cada previsão ganha um intervalo, e é bem possível que os intervalos de A e B se sobreponham. A faixa ajuda a comunicar, mas não substitui a incerteza.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Resumir curtidas pela média.** Em cauda longa, a média descreve os virais, não o Short típico. Use mediana e quantis.
+2. **Treinar em curtidas brutas com MSE.** O modelo passa a otimizar os canais grandes e os virais. Use `log1p` ou o alvo relativo.
+3. **Calcular a mediana do canal com a base inteira.** Inclui posts futuros: é vazamento, e distorce o alvo em canais que crescem ou encolhem.
+4. **Esquecer o `shift(1)`.** A mediana "até agora" que inclui o próprio post é um vazamento discreto.
+5. **Tratar a faixa "viral" como um número absoluto.** Viral é relativo ao canal; 5 mil curtidas podem ser viral para um canal e um dia ruim para outro.
+:::
+
+<Quiz
+  id="m1-a6"
+  perguntas={[
+    {
+      pergunta: 'Numa base de Shorts, a média de curtidas é 6.232 e a mediana é 2.334. O que isso indica?',
+      opcoes: [
+        {texto: 'Que houve erro na coleta, porque média e mediana deveriam ser parecidas.', explicacao: 'Em distribuições assimétricas, como a de curtidas, a diferença é esperada.'},
+        {texto: 'Uma distribuição assimétrica à direita (cauda longa), em que poucos valores grandes puxam a média.', correta: true, explicacao: 'É o padrão de engajamento: por isso a mediana descreve melhor o Short típico.'},
+        {texto: 'Que a maioria dos Shorts tem mais de 6 mil curtidas.', explicacao: 'É o contrário: com mediana de 2.334, metade dos Shorts tem menos que isso.'},
+      ],
+    },
+    {
+      pergunta: 'O modelo prevê 7,20 em log1p e o valor real foi 7,50. Como interpretar esse erro?',
+      opcoes: [
+        {texto: 'Errou por 0,30 curtida.', explicacao: 'A diferença está em escala log; ela corresponde a uma razão, não a curtidas.'},
+        {texto: 'Subestimou por um fator de cerca de 1,35, ou seja, uns 35%.', correta: true, explicacao: 'e^0,30 ≈ 1,35: em log, diferenças são razões.'},
+        {texto: 'Não dá para interpretar sem saber o tamanho do canal.', explicacao: 'Essa é justamente a vantagem da escala log: o erro relativo é o mesmo para qualquer canal.'},
+      ],
+    },
+    {
+      pergunta: 'Para o alvo relativo do post publicado em 10/05, qual mediana você deve usar?',
+      opcoes: [
+        {texto: 'A mediana de todos os posts do canal na base.', explicacao: 'Inclui posts publicados depois de 10/05: é vazamento.'},
+        {texto: 'A mediana dos posts do canal publicados antes de 10/05.', correta: true, explicacao: 'É a única informação que existiria no momento da previsão.'},
+        {texto: 'A mediana dos posts do canal publicados até 10/05, inclusive o próprio.', explicacao: 'Incluir o próprio post deixa o alvo parcialmente conhecido; por isso o shift(1).'},
+      ],
+    },
+    {
+      pergunta: 'Um canal está crescendo rápido. O que acontece se você calcular o alvo relativo com a mediana do canal inteiro? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Os posts antigos parecem piores do que foram em relação ao próprio passado.', correta: true, explicacao: 'A mediana global inclui o período de maior audiência, que ainda não existia.'},
+        {texto: 'O modelo pode aprender uma tendência temporal que é artefato do cálculo.', correta: true, explicacao: 'O sinal do alvo passa a depender da posição do post no tempo, não do conteúdo.'},
+        {texto: 'Nada muda, porque a mediana é robusta.', explicacao: 'A mediana é robusta a outliers, não a informação do futuro.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: janela expansiva vs. janela de 90 dias]
+Na mesma base sintética, calcule o alvo relativo de duas formas:
+
+1. mediana de **todos** os posts anteriores (como na aula);
+2. mediana dos posts dos **90 dias anteriores**, excluindo o próprio post, com pelo menos 10 posts na janela.
+
+Compare a média do alvo relativo por canal nas duas versões. Qual delas reduz o viés positivo no canal que cresce? Em qual situação real você preferiria a outra?
+
+Dica: com um índice de datas, `Series.rolling("90D", closed="left")` cria uma janela de tempo que exclui o instante atual.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+linhas = []  # mesma base sintética da aula (NÃO são dados reais)
+for canal, nivel, cresc in [("garagem22", 5.5, 0.0), ("lumina", 7.0, 0.03), ("megamoda", 9.5, 0.0)]:
+    datas = pd.date_range("2026-01-05", periods=40, freq="4D", tz="UTC")
+    log_c = nivel + cresc * np.arange(40) + rng.normal(0, 0.8, 40)
+    linhas += [{"video_id": f"{canal}-{i:02d}", "channel_id": canal, "published_at": d,
+                "likes": float(np.round(np.exp(v)))} for i, (d, v) in enumerate(zip(datas, log_c))]
+df = pd.DataFrame(linhas).sort_values(["channel_id", "published_at", "video_id"])
+
+def mediana_90d(g: pd.DataFrame) -> pd.Series:
+    """Mediana das curtidas dos posts dos 90 dias ANTERIORES (o próprio post fica de fora)."""
+    s = g.set_index("published_at")["likes"]
+    med = s.rolling("90D", closed="left", min_periods=10).median()
+    return pd.Series(med.to_numpy(), index=g.index)
+
+df["med_90d"] = df.groupby("channel_id", group_keys=False)[["published_at", "likes"]].apply(mediana_90d)
+df["med_exp"] = df.groupby("channel_id")["likes"].transform(
+    lambda s: s.shift(1).expanding(min_periods=10).median())
+for col in ["med_90d", "med_exp"]:
+    df[f"y_{col}"] = np.log((df["likes"] + 1) / (df[col] + 1))
+print(df.groupby("channel_id")[["y_med_90d", "y_med_exp"]].mean().round(2))
+```
+
+```text
+            y_med_90d  y_med_exp
+channel_id
+garagem22       -0.10      -0.13
+lumina           0.30       0.38
+megamoda        -0.02      -0.01
+```
+
+A janela de 90 dias reduz o viés positivo do canal que cresce (de 0,38 para 0,30), porque a referência acompanha o novo patamar do canal. Nos canais estáveis, as duas versões praticamente coincidem. A janela expansiva é preferível quando o canal publica pouco (90 dias podem ter menos de 10 posts) ou quando você quer uma referência mais estável; a móvel, quando o canal muda de patamar, como depois de um viral que trouxe muitos inscritos.
+
+</details>
+
+---
+
+## Resumo
+
+- Curtidas têm **cauda longa**, aproximadamente **log-normal**, resultado de efeitos multiplicativos.
+- A **mediana** resume o Short típico; a média é puxada pelos virais.
+- Em **`log1p`**, erros viram **razões** (0,69 ≈ 2×), e a perda trata canais pequenos e grandes da mesma forma.
+- O **alvo relativo** compara o post com a mediana dos posts **anteriores** do canal (`groupby` + `shift(1)` + `expanding`); usar o canal inteiro é **vazamento**.
+- As **faixas** saem dos quantis do histórico do canal e servem para comunicar, não para substituir o intervalo de predição.
+
+## Referências
+
+- Szabo e Huberman. [*Predicting the popularity of online content*](https://arxiv.org/abs/0811.0405). Communications of the ACM, 2010 (arXiv:0811.0405). Crescimento com ruído multiplicativo e trabalho em escala log com dados do YouTube e do Digg.
+- Mitzenmacher. [*A Brief History of Generative Models for Power Law and Lognormal Distributions*](https://doi.org/10.1080/15427951.2004.10129088). Internet Mathematics, 2004. Por que processos multiplicativos geram distribuições log-normais.
+- pandas. [Referência de janelas (`rolling`, `expanding`)](https://pandas.pydata.org/docs/reference/window.html) e NumPy [`log1p`](https://numpy.org/doc/stable/reference/generated/numpy.log1p.html).
+- Ye et al. [*MVP: Winning Solution to SMP Challenge 2025 Video Track*](https://arxiv.org/abs/2507.00950), 2025: alvo em escala logarítmica, `log2(views/dias) + 1`, e perda Huber.
+
+**Próxima aula:** [O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente): por que exigir 30 dias, como as mudanças de contagem criam quebras de regime e por que os inscritos da coleta são informação do futuro.

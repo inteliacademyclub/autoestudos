@@ -1,0 +1,140 @@
+---
+sidebar_position: 1
+sidebar_label: 'Visão geral do case'
+title: 'Case Galaxies: Agente Preditivo de Performance em Mídias Sociais'
+description: 'O que é o case Galaxies, o que precisa ser entregue até 23/10/2026 e como usar a trilha de estudos para chegar lá.'
+---
+
+# Case Galaxies: Agente Preditivo de Performance em Mídias Sociais
+
+:::info[Datas fixas]
+- **23/09/2026, 13h:** kickoff com a Galaxies
+- **23/10/2026:** entrega final
+:::
+
+## O problema em uma frase
+
+A Galaxies constrói **personas sintéticas**: modelos que simulam segmentos reais de consumidores e respondem no lugar deles em pesquisas de mercado. Hoje, quando um time de marketing envia cinco vídeos de campanha, as personas assistem, comentam e dão uma nota de 0 a 5. Esse feedback é **qualitativo e inferencial**: não tem componente estatístico nem um número real para comparar.
+
+Existe um caso em que o número real existe: **performance de conteúdo em plataforma**. A marca publica e a plataforma devolve curtidas e visualizações. Se um modelo estimar esse número **antes da publicação**, dá para medir o erro depois. Uma persona que acerta qual de dois criativos vai render mais muda a decisão de mídia **antes de qualquer verba ser gasta**.
+
+**Seu trabalho é construir essa peça estatística**: um modelo preditivo treinado em dados observados, embrulhado num agente que recebe o criativo, extrai atributos, consulta o modelo e devolve previsão, intervalo e explicação. A persona da Galaxies vai consumir o resultado **como tool, via MCP**. Você **não** precisa construir nem simular personas.
+
+<Sketch name="galaxies/arquitetura" alt="Arquitetura do agente: criativo e contexto entram no agente orquestrador, que chama cinco tools (extração de atributos, histórico e comparáveis, predição, explicabilidade, ordenação). A base e o pipeline de treino alimentam as tools; a saída é exposta como função e servidor MCP." caption="Arquitetura de referência. O número sempre sai da Tool 3." />
+
+---
+
+## Objetivo e pergunta norteadora
+
+Construir um agente que preveja, **antes da publicação**, uma métrica de performance (curtidas ou visualizações) de YouTube Shorts de **moda, beleza e automotivo** (cada aluno escolhe pelo menos dois setores). A previsão precisa estar apoiada num modelo preditivo treinado e avaliado **independentemente do LLM**, e vir com:
+
+- previsão;
+- intervalo de confiança;
+- ordenação entre criativos;
+- explicação dos fatores.
+
+> **Pergunta norteadora:** é possível prever, antes da publicação e a partir do conteúdo do criativo e do histórico do canal, como um público real vai reagir a ele — e com que margem de erro?
+
+:::warning[Mudança em relação ao briefing original]
+O briefing previa que a liga entregaria a base de dados no kickoff. **Isso mudou: cada aluno monta a própria base** pela YouTube Data API. O guia [Monte sua base](/projetos/galaxies/monte-sua-base) e o [módulo 1 da trilha](/aulas/ml-preditivo-e-agentes/formulacao-e-dados) cobrem isso. Como a cota da API é diária, **comece a coletar na primeira semana**.
+:::
+
+---
+
+## As decisões de escopo, explicadas
+
+| Tema | Decisão | Por quê |
+| :--- | :--- | :--- |
+| **Caso de uso** | Prever **antes** de publicar | É o fluxo da Galaxies: escolher entre criativos antes da verba. Com métricas das primeiras horas seria mais fácil, mas é outro problema. |
+| **Plataforma** | YouTube Shorts via YouTube Data API v3; SMTPD e MicroLens como referência | TikTok não tem API gratuita, e scraping é frágil e viola os termos. A Data API é oficial e gratuita (10.000 unidades/dia). |
+| **Setores** | Moda, beleza e automotivo, com **pelo menos dois** por aluno | São os clientes mais ativos da Galaxies. |
+| **Multimodal** | **Obrigatório em versão leve**: thumbnail/frames + transcrição + atributos por VLM | São setores visuais, e a Galaxies precisa ver o agente processando o vídeo. |
+| **Acurácia** | Sem meta mínima rígida | Bater o baseline e **acertar a ordenação** vale mais que o valor absoluto. Cerca de 60% par-a-par com a arquitetura certa já prova o conceito. |
+| **Interface** | Streamlit/Gradio opcional; **tool obrigatória** (função + MCP) | A persona consome via tool, não por front-end. |
+| **Explicabilidade** | **Obrigatória**: SHAP + subagente que explica em linguagem natural | Pedido explícito: "acho que vai viralizar por causa disso, disso e disso". |
+| **Agnosticismo** | Pipeline de treino reexecutável sobre qualquer base com esquema mínimo (opcional) | Quando um cliente liberar a base de ads, o mesmo fluxo treina um modelo especialista. |
+
+---
+
+## Escopo
+
+**Núcleo obrigatório**
+- **Base documentada:** origem, período, volume, termos de uso, setores e o que ela **não** representa.
+- **Modelo preditivo (Opção A):** metadados + texto, gradient boosting, baseline mínimo = média histórica do canal.
+- **Multimodal leve (Opção B reduzida):** embedding de frames/thumbnail, transcrição e 5 a 8 atributos por VLM. **Meça o ganho sobre a Opção A.**
+- **Experimento:** validação temporal e por canal, MAE em log, MAPE, Spearman, acurácia par-a-par, análise de erros.
+- **Intervalo e confiança:** intervalo de predição e sinal de baixa confiança.
+- **Agente em LangGraph:** tools de extração, histórico/comparáveis, predição, explicabilidade e ordenação.
+- **Integração:** função Python documentada + servidor MCP + demonstração executável.
+- **README e registro de experimentos** (MLflow ou equivalente).
+
+**Extensões ("ir além")**: veja o [módulo 7](/aulas/ml-preditivo-e-agentes/ir-alem).
+- treino dinâmico para a base de um cliente;
+- conformal;
+- RAG sobre comparáveis;
+- what-if;
+- LLM zero-shot vs. modelo;
+- embeddings de vídeo e áudio.
+
+**Fora do escopo**
+- Produto final ou front-end elaborado.
+- Integração real com a Galaxies ou com contas de anúncio.
+- Séries temporais de métricas do mesmo post.
+- Dados internos da Galaxies.
+- Construção ou avaliação de personas.
+
+---
+
+## O contrato da tool
+
+A tool é **agnóstica à base** e validada com Pydantic. A [aula 6.1](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/o-llm-orquestra-o-modelo-preve) implementa este contrato.
+
+| Entrada | | Saída | |
+| :--- | :--- | :--- | :--- |
+| `creative` | path/URL do vídeo ou imagem, ou texto | `predicted_metric` | valor previsto |
+| `caption` | legenda planejada | `interval_low` / `interval_high` | limites do intervalo |
+| `planned_datetime` | data e hora previstas | `confidence_flag` | baixa confiança quando a evidência é fraca |
+| `channel_id` ou `channel_stats` | inscritos e histórico | `relative_to_channel` | desempenho vs. histórico do canal |
+| `sector` | moda, beleza ou automotivo | `top_drivers` | atributos que mais pesaram e o sentido |
+| | | `explanation` | justificativa em linguagem natural |
+| | | `comparables` | criativos comparáveis usados como evidência |
+
+**Esquema mínimo da base para retreino:** `post_id`, `channel_id`, `published_at`, `caption`, `media_ref`, `metric_target`, `channel_stats_at_collection`, `sector`.
+
+---
+
+## Entregáveis
+
+1. **Agente em funcionamento.** Recebe criativo e contexto; devolve previsão, intervalo, ranking e justificativa; exposto como função e servidor MCP.
+2. **Modelo preditivo treinado.** Base documentada, features declaradas, comparação contra o baseline, artefatos versionados.
+3. **Experimento.**
+   - Hipótese e validação temporal.
+   - Erro absoluto e relativo, e métrica de ordenação.
+   - Cobertura do intervalo e ganho da camada multimodal.
+   - Análise de onde o modelo erra.
+4. **Demonstração.** Executável sobre um conjunto de criativos, com previsão, evidências e explicação. Use criativos de canais **fora do treino**, com métrica real conhecida, para o "previsto vs. real".
+5. **README.**
+   - Problema e recorte.
+   - Base: origem, período, termos, limites.
+   - Arquitetura.
+   - Instalação e execução.
+   - Modelos e configurações.
+   - Metodologia, resultados, limitações e evolução.
+
+Use a página de [autoavaliação](/projetos/galaxies/autoavaliacao) para acompanhar e os [templates](/projetos/galaxies/templates) para escrever.
+
+---
+
+## Como usar este material
+
+<CardGrid>
+  <ToolCard nome="Roadmap" papel="O que fazer em cada uma das 4 semanas, com checkpoints e a aula certa para cada etapa." link="/projetos/galaxies/roadmap" />
+  <ToolCard nome="Trilha de aulas" papel="47 aulas em 7 módulos, de 'o que é um problema supervisionado' até 'servidor MCP testado'." link="/aulas/ml-preditivo-e-agentes" />
+  <ToolCard nome="Monte sua base" papel="O passo a passo prático para coletar e documentar a sua base de Shorts." link="/projetos/galaxies/monte-sua-base" />
+  <ToolCard nome="Stack 2026" papel="Ferramentas, versões fixadas que funcionam juntas e o que mudou desde o briefing." link="/projetos/galaxies/stack-2026" />
+  <ToolCard nome="Leituras comentadas" papel="Os papers de referência: o que aproveitar e o que olhar com senso crítico." link="/projetos/galaxies/leituras" />
+  <ToolCard nome="Laboratório de interativos" papel="Todas as simulações num só lugar: splits, métricas, boosting, intervalos, SHAP, agente e MCP." link="/projetos/galaxies/laboratorio" />
+  <ToolCard nome="Troubleshooting" papel="Erros comuns de cota, yt-dlp, Colab, versões e MCP, e como sair deles." link="/projetos/galaxies/troubleshooting" />
+</CardGrid>
+
+Se você só tem tempo para uma aula hoje, leia [Do LLM ao modelo preditivo](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/do-llm-ao-modelo-preditivo). Ela apresenta a arquitetura e o caso **Lumina A vs. B**, que acompanha todas as outras aulas.

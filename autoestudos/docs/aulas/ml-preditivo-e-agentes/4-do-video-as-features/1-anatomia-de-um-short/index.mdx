@@ -1,0 +1,493 @@
+---
+sidebar_position: 1
+sidebar_label: 'Anatomia de um Short e o pipeline multimodal'
+title: 'Anatomia de um Short e o pipeline multimodal'
+description: 'O que existe dentro de um arquivo de vídeo, o que torna um Short diferente e como o pipeline de encoders congelados + GBM transforma cada vídeo em colunas, com cache por video_id.'
+tags: [ml-preditivo, multimodal, video]
+---
+
+import VideoToFeatures from '@site/src/components/interativos/VideoToFeatures';
+
+# Anatomia de um Short: do Arquivo de Vídeo às Colunas do Modelo
+
+<LessonMeta
+  tempo="45 min"
+  semana={2}
+  etapa="multimodal"
+  objetivos={[
+    'Descrever um vídeo digital em termos de frames, fps, resolução, proporção, codec, container e trilha de áudio',
+    'Explicar o que torna um Short diferente de um vídeo longo (gancho, loop, som) e que colunas isso sugere',
+    'Desenhar o pipeline multimodal de referência e justificar a receita "encoders congelados + GBM"',
+    'Implementar e testar um cache por video_id que impede reprocessar qualquer etapa',
+    'Escolher a camada de ambição (mínima, recomendada, ambiciosa) que cabe no seu prazo',
+  ]}
+  prerequisitos={[
+    {label: 'Construindo o coletor com a YouTube Data API', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor'},
+    {label: 'Features de texto', to: '/aulas/ml-preditivo-e-agentes/gradient-boosting/features-de-texto'},
+  ]}
+/>
+
+Coloque os Shorts A e B da Lumina no modelo que você treinou no módulo 3. As duas linhas da tabela saem quase idênticas: mesmo canal, mesmos 180 mil inscritos, mesma mediana de curtidas nos últimos 90 dias, mesmo setor. O que difere (duração, dia e hora planejados, tamanho da legenda) é real, mas pequeno perto do que qualquer pessoa percebe em cinco segundos de tela: **A abre com o logo da marca parado; B abre com metade de um rosto sem maquiagem e um texto enorme.**
+
+O seu modelo não percebe nada disso, porque ele não assiste a vídeos. Ele lê colunas. Tudo o que não estiver numa coluna simplesmente não existe para o gradient boosting.
+
+Este módulo resolve esse ponto cego: transformar o que se vê e o que se ouve num Short em <Termo id="feature">features</Termo> numéricas. A tentação natural, para quem vem de LLMs, é "treinar uma rede de vídeo ponta a ponta". Com alguns milhares de Shorts e uma GPU T4 gratuita, isso não funciona. A receita que venceu desafios recentes é mais modesta e mais robusta, e esta aula monta o esqueleto dela.
+
+:::info[A ideia central do módulo]
+Você **não treina nenhuma rede neural**. Usa **encoders congelados** (modelos pré-treinados, usados exatamente como foram publicados) e extratores baratos para transformar cada Short numa linha de colunas, e deixa o GBM do módulo 3 descobrir quais colunas importam. Cada etapa roda **uma vez por vídeo** e o resultado fica em cache no disco.
+:::
+
+:::info[Ambiente deste módulo]
+Versões usadas e testadas nas aulas deste módulo (Python 3.12). Elas foram resolvidas juntas no ambiente da trilha:
+
+```bash
+uv add torch==2.14.0 transformers==5.17.0 pillow==12.3.0 \
+  opencv-python-headless==5.0.0.93 scenedetect==0.7.1 \
+  faster-whisper==1.2.1 librosa==1.0.0 google-genai==2.25.0 \
+  "yt-dlp[default]==2026.8.19" httpx==0.28.1 tenacity==9.1.4 \
+  pandas==3.0.6 numpy==2.5.3 pyarrow==25.0.1 scikit-learn==1.9.1 \
+  sentence-transformers==6.1.0 lightgbm==4.7.0
+
+# aula 4.6 (detectores)
+uv add mediapipe==1.0.1                        # 1.0 removeu mp.solutions: use mp.tasks
+uv add paddleocr==3.7.0 paddlepaddle==3.3.1    # testado no macOS arm64 e no Linux
+
+# aula 4.5 (opcional: transcrição via API)
+uv add groq==1.7.0
+```
+
+- **MediaPipe no macOS arm64:** o `FaceDetector` 1.0.1 aborta no Mac com Apple Silicon, mesmo com delegate de CPU. Rode a etapa de rosto no **Colab** ou em Linux (num contêiner, instale `libegl1 libgles2 libgl1`).
+- **Segfault no macOS:** importe o `lightgbm` **antes** do `torch` no mesmo processo.
+
+- O **ffmpeg** precisa estar instalado no sistema (`ffmpeg -version`). No Colab ele já vem.
+- O **yt-dlp** de 2026 precisa de um runtime JavaScript. O padrão é o Deno ≥ 2.3; o extra `yt-dlp[default,deno]` instala o Deno pelo próprio PyPI. Detalhes na [aula 4.2](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia).
+- No Colab e no Kaggle, o `torch` já vem instalado com CUDA. Não o reinstale sem necessidade: instale só o resto com `pip install`, usando as mesmas versões.
+:::
+
+---
+
+## O que é um vídeo digital
+
+Um vídeo é uma sequência de imagens (os **frames**) exibidas numa taxa fixa, os **fps** (*frames per second*), acompanhada de uma ou mais trilhas de áudio. Quatro números descrevem a parte visual:
+
+- **Resolução**: largura × altura em pixels. Um Short típico é gravado em 1080 × 1920.
+- **Proporção** (*aspect ratio*): largura ÷ altura. Vertical 9:16 dá $$1080/1920 = 0{,}5625$$.
+- **fps**: 24, 25, 30 ou 60 no celular. A 30 fps, um Short de 22 s tem **660 frames**.
+- **Duração**: o que a API já lhe dá em `contentDetails.duration`.
+
+Se cada frame fosse guardado cru (3 bytes por pixel, RGB), esse Short de 22 s ocuparia cerca de 4,1 GB. Ninguém guarda assim. O **codec** (H.264/AVC, VP9, AV1) comprime o vídeo aproveitando que frames vizinhos são quase iguais: de tempos em tempos ele guarda um frame inteiro (o *keyframe*) e, entre eles, só as diferenças. Por isso "pular" para o segundo 12 exige decodificar a partir do keyframe anterior, e é por isso que extrair frames tem custo.
+
+O **container** (MP4, WebM, MOV) é a caixa que junta a trilha de vídeo, a trilha de áudio (AAC ou Opus, amostrada a 44,1 ou 48 kHz) e os metadados. Codec e container são coisas diferentes: um `.mp4` pode carregar H.264 ou AV1.
+
+O `ffprobe`, que vem com o ffmpeg, lê tudo isso sem decodificar o vídeo. Para testar sem baixar nada do YouTube, gere um "Short" sintético:
+
+```bash
+# 22 s, 1080x1920 (9:16), 30 fps, com um tom de 440 Hz como áudio
+ffmpeg -v error -y -f lavfi -i "testsrc2=size=1080x1920:rate=30:duration=22" \
+  -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=22" \
+  -c:v libx264 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest short_teste.mp4
+```
+
+Agora transforme a saída do `ffprobe` em colunas:
+
+```python
+import json
+import subprocess
+from fractions import Fraction
+
+
+def metadados_arquivo(caminho: str) -> dict:
+    """Lê container, trilhas e dimensões de um vídeo com ffprobe (vem com o ffmpeg)."""
+    saida = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", caminho],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    info = json.loads(saida)
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    audio = next((s for s in info["streams"] if s["codec_type"] == "audio"), None)
+    largura, altura = int(video["width"]), int(video["height"])
+    # vídeos de celular podem vir "deitados" com uma flag de rotação
+    rot = next((abs(int(sd.get("rotation", 0))) for sd in video.get("side_data_list", [])), 0)
+    if rot in (90, 270):
+        largura, altura = altura, largura
+    return {
+        "duracao_s": round(float(info["format"]["duration"]), 2),
+        "fps": round(float(Fraction(video["avg_frame_rate"])), 2),
+        "largura": largura,
+        "altura": altura,
+        "proporcao": round(largura / altura, 4),       # 9:16 = 0,5625
+        "vertical": altura > largura,
+        "codec_video": video["codec_name"],
+        "container": info["format"]["format_name"],
+        "tem_audio": audio is not None,
+        "codec_audio": audio["codec_name"] if audio else None,
+        "taxa_amostragem_hz": int(audio["sample_rate"]) if audio else None,
+        "bitrate_kbps": round(int(info["format"]["bit_rate"]) / 1000),
+    }
+
+
+meta = metadados_arquivo("short_teste.mp4")
+print(json.dumps(meta, indent=2, ensure_ascii=False))
+
+# quanto ocuparia sem compressão (RGB, 3 bytes por pixel)?
+bruto = meta["largura"] * meta["altura"] * 3 * meta["fps"] * meta["duracao_s"]
+print(f"sem compressão: {bruto / 1e9:.1f} GB")
+```
+
+```text
+{
+  "duracao_s": 22.0,
+  "fps": 30.0,
+  "largura": 1080,
+  "altura": 1920,
+  "proporcao": 0.5625,
+  "vertical": true,
+  "codec_video": "h264",
+  "container": "mov,mp4,m4a,3gp,3g2,mj2",
+  "tem_audio": true,
+  "codec_audio": "aac",
+  "taxa_amostragem_hz": 48000,
+  "bitrate_kbps": 6779
+}
+sem compressão: 4.1 GB
+```
+
+O arquivo real tem 18,6 MB. Reduzido para 360p (`ffmpeg -i short_teste.mp4 -vf scale=-2:640 ...`), cai para cerca de 0,7 MB, e a mesma função devolve 360 × 640 e 254 kbps. Guarde essa ordem de grandeza: é ela que torna viável processar alguns milhares de Shorts num notebook gratuito.
+
+Dois detalhes do teste valem ouro. O `container` aparece como `mov,mp4,m4a,...` porque MP4 e MOV compartilham o mesmo formato-base, então não se assuste. E a correção de **rotação** existe porque muitos celulares gravam o vídeo "deitado" e só marcam nos metadados que ele deve ser exibido em pé. Sem essa correção, a coluna `vertical` mente.
+
+---
+
+## O que torna um Short diferente
+
+Um <Termo id="shorts">Short</Termo> é um vídeo vertical de até 3 minutos (desde out/2024), consumido num feed em que o próximo vídeo está a um deslizar de distância. Três características decorrem disso e sugerem colunas específicas:
+
+1. **O gancho decide.** Diferente de um vídeo longo, que o usuário escolheu clicar, o Short começa a tocar sozinho. O que acontece nos primeiros ~3 segundos, o <Termo id="gancho">gancho</Termo>, decide se a pessoa fica ou desliza. Por isso o pipeline trata o gancho **separado** do resto: frames próprios, cortes próprios, embedding próprio.
+2. **O loop.** O vídeo recomeça sozinho ao terminar. Desde 31/03/2025, cada recomeço conta como view, o que é um dos motivos para a trilha preferir **curtidas** como alvo. Para as features, o loop sugere olhar a duração e se o final "emenda" no começo.
+3. **O som é parte do conteúdo.** Música em alta, voz explicando ou silêncio com texto na tela são estratégias diferentes. A [aula 4.5](/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala) transforma isso em colunas.
+
+Há evidência de que esses sinais importam. No *Understanding Virality* (Gupta et al., 2025), um XGBoost treinado em cerca de 11 mil Shorts educativos atribuiu, via SHAP, 12,4% da importância à energia do áudio, 10,7% ao movimento, 9,1% ao contraste entre texto e fala e 7,6% aos cortes. Leia os números com a crítica do quadro abaixo: é um nicho específico, com split aleatório, e a importância SHAP diz o que o modelo usou, não o que causa curtidas.
+
+| Dimensão | Pergunta | Exemplo de coluna | Aula |
+| :--- | :--- | :--- | :---: |
+| Arquivo | Que formato é? | `duracao_s`, `vertical`, `tem_audio` | 4.1 |
+| Ritmo | Quão rápido é editado? | `cortes_por_s`, `cortes_no_gancho` | 4.3 |
+| Aparência | Claro, colorido, contrastado? | `brilho_medio`, `colorfulness_gancho` | 4.3 |
+| Conteúdo visual | O que aparece? | `emb_video_pc00…`, `sonda_rosto_gancho` | 4.4 |
+| Áudio e fala | Música, voz, silêncio? | `energia_rms`, `palavras_por_s` | 4.5 |
+| Pessoas e texto | Tem rosto? Texto na tela? | `rosto_no_gancho`, `area_texto` | 4.6 |
+| Semântica | Que tipo de gancho? Tem CTA? | `tipo_gancho`, `tem_cta` | 4.7 |
+
+---
+
+## O pipeline multimodal de referência
+
+O desenho abaixo é o pipeline que o módulo inteiro constrói. Cada caixa laranja é uma aula e produz um punhado de colunas.
+
+<Sketch name="m4/a1-pipeline" alt="Pipeline multimodal: um Short (video_id ou MP4 da marca) passa pela etapa de mídia (MP4 em 360p e thumbnail, aula 4.2); os frames amostrados (3 no gancho e 5 uniformes, aula 4.3) alimentam embeddings visuais com SigLIP 2 (4.4), cortes, movimento e cor com OpenCV (4.3) e detectores leves de rosto e texto (4.6); a trilha de áudio alimenta áudio e fala com Whisper e librosa (4.5); o vídeo inteiro ou a URL alimenta um VLM com rubrica (4.7). Tudo converge para a fusão em colunas (4.8), junto com as features de canal, tempo e texto do módulo 3, e segue para o GBM. Uma nota lembra que cada etapa grava em cache por video_id e que os encoders são congelados." caption="O pipeline multimodal de referência. Cada etapa grava em cache e roda uma vez por vídeo." />
+
+Lendo da esquerda para a direita:
+
+1. **Mídia** ([4.2](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia)): a thumbnail vem da API; o vídeo, em 360p, quando for mesmo necessário. Na hora da previsão, a entrada é o MP4 que a marca entrega, porque o Short ainda não foi publicado.
+2. **Frames** ([4.3](/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais)): em vez de 660 frames, uns 8 bem escolhidos, com atenção especial ao gancho.
+3. **Sinais de baixo nível** (4.3): cortes, movimento, brilho, contraste e cor, com OpenCV e PySceneDetect. Baratos e surpreendentemente informativos.
+4. **Embeddings visuais** ([4.4](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais)): SigLIP 2 transforma cada frame num vetor, comprimido por PCA, e em "sondas" de texto interpretáveis.
+5. **Áudio e fala** ([4.5](/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala)): transcrição com faster-whisper, energia e ritmo com librosa.
+6. **Detectores leves** ([4.6](/aulas/ml-preditivo-e-agentes/do-video-as-features/detectores-leves)): rosto (MediaPipe) e texto na tela (OCR).
+7. **VLM** ([4.7](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado)): um <Termo id="vlm">VLM</Termo> responde uma rubrica fixa em JSON.
+8. **Fusão** ([4.8](/aulas/ml-preditivo-e-agentes/do-video-as-features/fusao-e-ablacao)): tudo vira uma linha por vídeo e entra no GBM junto com as features do canal. A <Termo id="ablacao">ablação</Termo> prova se valeu a pena.
+
+O componente abaixo mostra o mesmo caminho em um Short só. Arraste pela linha do tempo e veja quais frames são amostrados, onde estão os cortes, o que a transcrição e os detectores encontram e o JSON que o VLM devolve. **Os dados são ilustrativos**, gerados pelo simulador da trilha, e não saíram de um vídeo real.
+
+<VideoToFeatures />
+
+---
+
+## Encoders congelados + GBM: por que essa receita
+
+A alternativa óbvia seria treinar (ou fazer *fine-tuning* de) uma rede de vídeo para prever curtidas direto dos pixels. Três motivos tornam isso uma má ideia neste projeto:
+
+- **Dados.** Você terá alguns milhares de Shorts. Redes de vídeo têm dezenas ou centenas de milhões de parâmetros. Com essa proporção, o fine-tuning decora o treino (<Termo id="overfitting">overfitting</Termo>) e nenhuma validação temporal honesta vai aprová-lo.
+- **Custo.** Um fine-tuning de vídeo não cabe com folga numa T4 gratuita que desconecta. Um encoder congelado roda **uma vez por vídeo**, e o resultado vai para o cache.
+- **Explicação.** O GBM trabalha com colunas heterogêneas, lida com valores ausentes (vídeo sem áudio, VLM que falhou) e conversa com SHAP coluna a coluna. Uma rede ponta a ponta devolveria só um número.
+
+Os encoders congelados funcionam porque já aprenderam muito antes de você chegar. O CLIP foi treinado com 400 milhões de pares imagem–legenda; ele já "sabe" o que é um rosto, um carro ou um texto grande. O seu trabalho é **perguntar do jeito certo** e entregar as respostas como colunas.
+
+A literatura recente de popularidade aponta na mesma direção:
+
+- O **MVP**, vencedor da trilha de vídeo do SMP Challenge 2025, usou embeddings de vídeo de um X-CLIP congelado e um CatBoost com perda Huber, com alvo `log2(views/dias)+1`, e chegou a MAPE de 0,1754.
+- O *Understanding Virality* extraiu atributos com o Gemini, agrupou-os com all-mpnet-base-v2 e K-Means e previu com XGBoost.
+
+<PaperCard
+  titulo="Understanding Virality: A Rubric based Vision-Language Model Framework for Short-Form Edutainment Evaluation"
+  referencia="Gupta et al., arXiv:2512.21402, 2025"
+  link="https://arxiv.org/abs/2512.21402"
+  resumo="Cerca de 11 mil Shorts educativos. Um VLM (Gemini) responde uma rubrica de atributos; os atributos viram texto, depois embeddings (all-mpnet-base-v2) e 20 clusters (K-Means); um XGBoost prevê o engajamento."
+  numeros={['Spearman 0,71', '76,3% par-a-par', 'SHAP: energia de áudio 12,4%, movimento 10,7%, contraste texto/fala 9,1%, cortes 7,6%']}
+  usar={['A ideia de rubrica fixa para o VLM (aula 4.7)', 'Sinais baratos (movimento, cortes, energia) como candidatos fortes a feature']}
+  criticar={['Split aleatório, não temporal: o número tende a ser otimista', 'Alvo likes/views, diferente do seu', 'Sem código nem dados liberados', 'Nicho educativo, não moda, beleza ou automotivo']}
+/>
+
+Guarde também a expectativa do briefing: as features do canal dominam, e o conteúdo visual soma algo como **+0,02 a +0,04** de <Termo id="spearman">Spearman</Termo>. Parece pouco, mas repare *onde* esse ganho aparece. Quando a Lumina compara A com B, as features do canal são idênticas nos dois e se cancelam. Na comparação dentro do mesmo canal, o conteúdo é **tudo o que sobra**. É por isso que a camada multimodal é obrigatória no case, mesmo que mexa pouco na métrica global.
+
+---
+
+## Cache por video_id: nunca reprocessar
+
+O pipeline tem oito etapas e a sua base terá milhares de vídeos. Sem disciplina, três coisas acontecem: o Colab desconecta no vídeo 1.800 e você recomeça do zero; você corrige um detalhe do detector de cortes e reprocessa também os embeddings, que não mudaram; e um vídeo corrompido derruba o lote inteiro.
+
+As regras que evitam isso são simples:
+
+1. **Uma pasta por etapa e por versão** (`cache/sinais_visuais_v1/`). Mudou a lógica da etapa? Suba a versão. O cache antigo é ignorado, não apagado.
+2. **Um arquivo por vídeo** (`<video_id>.json`). Se o arquivo existe, a etapa não roda.
+3. **Escrita atômica**: grave num `.tmp` e renomeie. Se o processo morrer no meio, não fica um JSON pela metade que parece válido.
+4. **Falhas não entram no cache**: elas vão para `_erros/`, o lote continua e a próxima rodada tenta só o que falhou.
+5. **Consolide para parquet** no fim: o treino lê um arquivo por etapa, não milhares de JSONs.
+
+```python
+import functools
+import json
+import os
+import traceback
+from pathlib import Path
+
+import pandas as pd
+
+RAIZ_CACHE = Path("cache")  # no Colab: Path("/content/drive/MyDrive/galaxies/cache")
+
+
+def cache_por_video(etapa: str, versao: int = 1):
+    """Guarda o resultado de uma etapa em cache/<etapa>_v<versao>/<video_id>.json.
+
+    Se o arquivo existe, devolve o que está nele e NÃO executa a função.
+    Mudou a lógica da etapa? Suba a `versao`: o cache antigo é ignorado, não apagado.
+    """
+    pasta = RAIZ_CACHE / f"{etapa}_v{versao}"
+
+    def decorador(func):
+        @functools.wraps(func)
+        def wrapper(video_id: str, *args, **kwargs) -> dict:
+            arquivo = pasta / f"{video_id}.json"
+            if arquivo.exists():
+                return json.loads(arquivo.read_text(encoding="utf-8"))
+            resultado = func(video_id, *args, **kwargs)
+            pasta.mkdir(parents=True, exist_ok=True)
+            tmp = arquivo.with_suffix(".tmp")
+            tmp.write_text(json.dumps(resultado, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, arquivo)  # atômico: nunca fica um JSON pela metade
+            return resultado
+
+        wrapper.pasta = pasta
+        return wrapper
+
+    return decorador
+
+
+def processar_lote(func, video_ids, **kwargs) -> pd.DataFrame:
+    """Roda uma etapa cacheada em vários vídeos; falhas vão para <pasta>/_erros."""
+    linhas = []
+    for vid in video_ids:
+        try:
+            linhas.append({"video_id": vid, **func(vid, **kwargs)})
+        except Exception as e:  # um vídeo quebrado não derruba o lote
+            erros = func.pasta / "_erros"
+            erros.mkdir(parents=True, exist_ok=True)
+            (erros / f"{vid}.txt").write_text(f"{e!r}\n{traceback.format_exc()}")
+    return pd.DataFrame(linhas)
+
+
+def consolidar(func) -> pd.DataFrame:
+    """Junta os JSON de uma etapa num único parquet (o que o treino vai ler)."""
+    linhas = [
+        {"video_id": p.stem, **json.loads(p.read_text(encoding="utf-8"))}
+        for p in sorted(func.pasta.glob("*.json"))
+    ]
+    df = pd.DataFrame(linhas)
+    df.to_parquet(func.pasta.with_suffix(".parquet"), index=False)
+    return df
+```
+
+Teste o comportamento com uma etapa falsa, que demora meio segundo e falha num dos vídeos:
+
+```python
+import shutil
+import time
+
+shutil.rmtree(RAIZ_CACHE, ignore_errors=True)  # só para o teste começar do zero
+chamadas = []
+
+
+@cache_por_video("sinais_visuais", versao=1)
+def sinais_visuais(video_id: str) -> dict:
+    chamadas.append(video_id)
+    time.sleep(0.5)  # finge ser uma etapa cara (decodificar vídeo, rodar modelo...)
+    if video_id == "quebrado":
+        raise ValueError("arquivo corrompido")
+    return {"brilho": 0.42, "cortes_por_s": 0.8}
+
+
+ids = ["aB3dE5fG7hI", "quebrado", "Zx9Yw8Vu7Ts"]
+for rodada in (1, 2):
+    chamadas.clear()
+    t0 = time.perf_counter()
+    df = processar_lote(sinais_visuais, ids)
+    print(f"rodada {rodada}: {len(df)} ok, executou {chamadas}, {time.perf_counter() - t0:.2f} s")
+
+print(consolidar(sinais_visuais))
+print(sorted(str(p) for p in RAIZ_CACHE.rglob("*")))
+```
+
+```text
+rodada 1: 2 ok, executou ['aB3dE5fG7hI', 'quebrado', 'Zx9Yw8Vu7Ts'], 1.56 s
+rodada 2: 2 ok, executou ['quebrado'], 0.52 s
+      video_id  brilho  cortes_por_s
+0  Zx9Yw8Vu7Ts    0.42           0.8
+1  aB3dE5fG7hI    0.42           0.8
+['cache/sinais_visuais_v1', 'cache/sinais_visuais_v1.parquet', 'cache/sinais_visuais_v1/Zx9Yw8Vu7Ts.json', 'cache/sinais_visuais_v1/_erros', 'cache/sinais_visuais_v1/_erros/quebrado.txt', 'cache/sinais_visuais_v1/aB3dE5fG7hI.json']
+```
+
+Na segunda rodada, só o vídeo que falhou foi tentado de novo; os outros dois vieram do disco. Se a falha for permanente (vídeo removido), mantenha uma lista de IDs a pular em vez de tentar para sempre.
+
+Dois ajustes práticos. Para vetores grandes, como um embedding de 768 números, o JSON funciona (cerca de 15 KB por vídeo), mas `np.save` por vídeo ou um parquet por lote ocupam menos. E, no Colab, aponte `RAIZ_CACHE` para o Google Drive: o disco da máquina some quando a sessão cai.
+
+---
+
+## As três camadas de ambição
+
+O briefing permite três níveis de ambição. **A camada multimodal leve é obrigatória**: thumbnail ou frames, transcrição e atributos extraídos por VLM. A camada mínima já cumpre isso sem gastar um centavo.
+
+| Camada | O que entra | Onde roda | Quando escolher |
+| :--- | :--- | :--- | :--- |
+| **Mínima** (100% offline) | metadados do arquivo, frames e sinais OpenCV, cortes, SigLIP 2 + sondas, faster-whisper + librosa, rosto e OCR, e um VLM aberto pequeno (SmolVLM2 ou Qwen3-VL 2B) com rubrica curta sobre a thumbnail e poucos frames | CPU ou T4 (Colab/Kaggle) | Sempre: é o piso do case |
+| **Recomendada** | a mínima + um VLM mais forte com a rubrica completa: Gemini lendo a URL do YouTube (free tier) ou Qwen3-VL 4B/8B local | + API gratuita ou T4 | Quando a mínima estiver rodando e cacheada |
+| **Ambiciosa** | a recomendada + embeddings de vídeo (X-CLIP), comparáveis com FAISS e ensemble de GBMs | T4 e mais tempo | Só depois da ablação da 4.8 mostrar que o visual ajuda |
+
+A ordem importa mais do que a camada. Um pipeline mínimo, cacheado e medido por ablação vale mais do que um ambicioso que nunca terminou de processar a base. Os comparáveis aparecem na [aula 6.4](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/comparaveis), e os embeddings de vídeo e áudio, na [extensão do módulo 7](/aulas/ml-preditivo-e-agentes/ir-alem/embeddings-de-video-e-audio).
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Com o pipeline no lugar, A e B deixam de ser linhas quase iguais. Um resumo qualitativo do que cada etapa deve registrar (ilustrativo; os números reais saem das próximas aulas):
+
+| Etapa | Short A: "Pele natural em 5 passos" | Short B: "1 produto, 20 segundos" |
+| :--- | :--- | :--- |
+| Arquivo | 55 s, vertical, com áudio | 22 s, vertical, com áudio |
+| Gancho (0–3 s) | logo parado: pouco movimento, nenhum rosto | metade do rosto sem maquiagem, corte por volta de 2 s |
+| Ritmo | poucos cortes, planos longos | cortes frequentes |
+| Texto na tela | nenhum | texto grande |
+| Áudio | voiceover calmo, muitas palavras por segundo | música animada, pouca fala |
+
+Repare que as features do canal são iguais para os dois. Tudo o que o modelo puder dizer de diferente sobre A e B virá **destas colunas**. Isso não garante que B vença: garante apenas que o modelo passa a ter como enxergar a diferença.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Querer treinar uma rede de vídeo.** Com milhares de exemplos, encoders congelados + GBM ganham em custo, em robustez e em explicação.
+2. **Processar sem cache.** Uma desconexão do Colab ou uma correção pequena não pode custar horas de reprocessamento. Cache por etapa, por versão e por `video_id` desde o primeiro dia.
+3. **Extrair de um jeito no treino e de outro na previsão.** Se a base foi processada em 360p com 8 frames, o MP4 da marca precisa passar pelo mesmo caminho (mesma resolução, mesmos instantes). Senão, as colunas mudam de significado entre treino e uso.
+4. **Ignorar a rotação e a proporção.** Um vídeo "deitado" com flag de rotação vira horizontal na sua tabela e contamina todas as features de enquadramento.
+5. **Começar pela camada ambiciosa.** Sem a mínima rodando e sem ablação, você não sabe se o X-CLIP ajudou ou só atrasou.
+:::
+
+<Quiz
+  id="m4-a1"
+  perguntas={[
+    {
+      pergunta: 'Um vídeo de 30 s a 30 fps em 1080 × 1920 tem quantos frames, e o que o **codec** faz com eles?',
+      opcoes: [
+        {texto: '900 frames; o codec guarda cada um como uma imagem JPEG independente.', explicacao: 'O número está certo, mas codecs de vídeo exploram a semelhança entre frames vizinhos: keyframes completos e, entre eles, só diferenças.'},
+        {texto: '900 frames; o codec guarda keyframes completos e, entre eles, apenas as diferenças.', correta: true, explicacao: 'Exato. É por isso que o arquivo é centenas de vezes menor que o vídeo cru e por isso que pular para um instante exige decodificar desde o keyframe anterior.'},
+        {texto: '30 frames; o fps diz quantos frames o vídeo tem no total.', explicacao: 'fps é a taxa por segundo. Total = fps × duração = 30 × 30 = 900.'},
+      ],
+    },
+    {
+      pergunta: 'A Lumina vai comparar A com B, do mesmo canal. Por que as features multimodais importam mais aqui do que na métrica global?',
+      opcoes: [
+        {texto: 'Porque o VLM é mais inteligente que o GBM.', explicacao: 'O VLM só extrai atributos; quem prevê continua sendo o GBM.'},
+        {texto: 'Porque, dentro do mesmo canal, as features do canal são idênticas e se cancelam; só o conteúdo diferencia A de B.', correta: true, explicacao: 'Isso. Na base inteira o canal domina, mas na comparação intra-canal o conteúdo é o que sobra.'},
+        {texto: 'Porque features visuais aumentam muito o Spearman global.', explicacao: 'A expectativa do briefing é modesta: algo como +0,02 a +0,04. O valor está na comparação intra-canal.'},
+      ],
+    },
+    {
+      pergunta: 'Você corrigiu o limiar do detector de cortes. O que o seu cache deve fazer?',
+      opcoes: [
+        {texto: 'Apagar a pasta `cache/` inteira e reprocessar tudo.', explicacao: 'Isso refaz também embeddings, transcrições e VLM, que não mudaram. Horas perdidas.'},
+        {texto: 'Nada: o cache já tem os valores, então basta seguir.', explicacao: 'Aí os cortes antigos continuam valendo e a correção não tem efeito.'},
+        {texto: 'Subir a versão só da etapa de cortes (`_v1` → `_v2`), para que só ela rode de novo.', correta: true, explicacao: 'Exato. Cada etapa tem a sua pasta e a sua versão; as demais continuam vindo do disco.'},
+      ],
+    },
+    {
+      pergunta: 'Quais itens fazem parte da camada multimodal **leve e obrigatória** do case? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Thumbnail ou frames do vídeo.', correta: true, explicacao: 'Sim, é a parte visual mínima.'},
+        {texto: 'Transcrição da fala.', correta: true, explicacao: 'Sim: faster-whisper roda offline, na CPU ou na T4.'},
+        {texto: 'Atributos extraídos por um VLM com rubrica.', correta: true, explicacao: 'Sim. Na camada mínima, um VLM aberto pequeno já cumpre esse papel.'},
+        {texto: 'Embeddings de vídeo com X-CLIP e um índice FAISS.', explicacao: 'Isso é da camada ambiciosa, opcional e só depois da ablação.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: o esqueleto do seu pipeline]
+1. Escolha 20 vídeos da sua base e rode `metadados_arquivo` em cada um, **dentro de uma etapa cacheada** (`@cache_por_video("metadados_arquivo")`). Por enquanto, gere os MP4 com o comando sintético do ffmpeg ou use vídeos seus; a aula 4.2 mostra como obter os reais.
+2. Consolide para parquet e responda: quantos são verticais? Algum tem rotação? Algum não tem áudio?
+3. Escreva, no README do projeto, a lista de etapas que você pretende rodar e em qual camada de ambição vai começar.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```python
+@cache_por_video("metadados_arquivo", versao=1)
+def etapa_metadados(video_id: str, caminho: str) -> dict:
+    return metadados_arquivo(caminho)
+
+
+caminhos = {"aB3dE5fG7hI": "videos/aB3dE5fG7hI.mp4"}  # video_id -> arquivo
+for vid, arq in caminhos.items():
+    etapa_metadados(vid, arq)
+
+meta = consolidar(etapa_metadados)
+print(meta["vertical"].mean(), meta["tem_audio"].mean(), meta["duracao_s"].describe())
+```
+
+Dois achados comuns nesse exercício:
+
+- Alguns "Shorts" coletados pela API têm proporção quadrada, porque vídeos 1:1 de até 3 min também contam como Shorts. Decida no seu data card se eles ficam na base.
+- Vídeos sem trilha de áudio aparecem com `tem_audio = False`. Guarde a coluna: ela evita que a aula 4.5 trate "sem áudio" como "silêncio".
+
+No README, algo como: *"Camada mínima: metadados, sinais OpenCV, SigLIP 2 + 8 sondas, faster-whisper small, MediaPipe, SmolVLM2 com rubrica de 6 itens. Recomendada, se sobrar tempo: Gemini 3.5 Flash-Lite com a rubrica completa."*
+
+</details>
+
+---
+
+## Resumo
+
+- Um vídeo é uma sequência de **frames** a uma taxa de **fps**, com **resolução** e **proporção** (9:16 = 0,5625). O **codec** comprime aproveitando frames vizinhos; o **container** junta vídeo, áudio e metadados. O `ffprobe` lê tudo isso sem decodificar.
+- Shorts são decididos no **gancho**, tocam em **loop** e usam o **som** como conteúdo. Cada uma dessas três características sugere colunas próprias.
+- O **pipeline de referência** vai de mídia → frames → sinais, embeddings, áudio, detectores e VLM → **fusão** → GBM, com **encoders congelados** e nenhuma rede treinada por você.
+- **Cache por video_id**, com uma pasta por etapa e por versão, escrita atômica e falhas fora do cache, é o que torna o pipeline viável no Colab.
+- Comece pela **camada mínima** (100% offline, já cumpre o obrigatório) e só suba de camada com ablação na mão.
+
+## Referências
+
+- Ye et al. [*MVP: Winning Solution to SMP Challenge 2025 Video Track*](https://arxiv.org/abs/2507.00950). arXiv:2507.00950, 2025.
+- Gupta et al. [*Understanding Virality: A Rubric based Vision-Language Model Framework for Short-Form Edutainment Evaluation*](https://arxiv.org/abs/2512.21402). arXiv:2512.21402, 2025.
+- Radford et al. [*Learning Transferable Visual Models From Natural Language Supervision*](https://arxiv.org/abs/2103.00020) (CLIP). ICML, 2021.
+- [Documentação do ffprobe](https://ffmpeg.org/ffprobe.html).
+- [Leituras do projeto Galaxies](/projetos/galaxies/leituras) e [Stack 2026](/projetos/galaxies/stack-2026).
+
+**Próxima aula:** [Obtendo a mídia](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia): thumbnails pela API, yt-dlp em 2026 e quando é melhor não baixar nada.

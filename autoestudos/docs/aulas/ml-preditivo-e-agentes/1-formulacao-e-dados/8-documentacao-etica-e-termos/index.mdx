@@ -1,0 +1,441 @@
+---
+sidebar_position: 8
+sidebar_label: 'Documentação, ética e termos de uso'
+title: 'Documentação, ética e termos de uso'
+description: 'O data card da sua base, o esquema mínimo do briefing validado com Pydantic e pandera, as YouTube Developer Policies que afetam o projeto, o Gemini no free tier, dados pessoais e um checklist de conformidade.'
+tags: [ml-preditivo, dados, etica, documentacao]
+---
+
+# Documentação, Ética e Termos de Uso: a Base Que Você Consegue Defender
+
+<LessonMeta
+  tempo="45 min"
+  semana={1}
+  etapa="dados"
+  objetivos={[
+    'Escrever o data card da sua base, com destaque para o que ela não representa',
+    'Implementar o esquema mínimo do briefing com Pydantic e validar a tabela com pandera',
+    'Interpretar as seções das YouTube Developer Policies que afetam o projeto e as tensões com ele',
+    'Avaliar os riscos do Gemini no free tier e de dados pessoais em vídeos e comentários',
+    'Aplicar um checklist de conformidade antes de treinar e antes de publicar qualquer coisa',
+  ]}
+  prerequisitos={[
+    {label: 'Construindo o coletor', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor'},
+    {label: 'O tempo mente', to: '/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente'},
+  ]}
+/>
+
+É o dia da apresentação. Você mostra o agente, a Lumina recebe a previsão para os Shorts A e B, e a pessoa da Galaxies pergunta: *"de onde vieram esses dados? Por quanto tempo vocês podem guardá-los? Eu posso usar esse modelo com os meus clientes?"*. Responder "peguei da API" encerra a conversa do jeito errado.
+
+Essas perguntas não são burocracia. Elas decidem se um modelo pode sair do protótipo. E mesmo que ninguém as faça, você vai precisar das respostas: daqui a duas semanas, quando uma métrica mudar sem motivo aparente, a única forma de descobrir o que aconteceu é ter registrado **como** a base foi feita.
+
+Esta aula fecha o módulo com três ferramentas: um **data card** que descreve a base, um **esquema validado em código** que impede dados quebrados de chegar ao modelo, e uma leitura honesta dos **termos** que regem o que você coletou.
+
+:::info[A ideia central]
+Uma base defensável tem: um <Termo id="data-card">data card</Termo> (origem, período, volume, termos, coleta, setores, vieses e o que ela **não** representa); um esquema **validado em código** (Pydantic por registro, pandera para a tabela); e uma rotina que respeita as **YouTube Developer Policies**, como o refresh ou a exclusão de dados em até 30 dias. Algumas políticas entram em **tensão** com um projeto de ML; a trilha as expõe como discussão ética e legal, **não** como aconselhamento jurídico.
+:::
+
+---
+
+## O data card da sua base
+
+Um data card é um documento curto que acompanha a base e responde às perguntas que um usuário cuidadoso faria antes de confiar nela. A ideia vem de *Datasheets for Datasets* (Gebru et al.) e de *Data Cards* (Pushkarna et al., Google). O modelo abaixo é adaptado ao case; copie para `DATA_CARD.md` no seu repositório:
+
+```text
+# Data card: <nome da base>   (versão, data)
+
+## Origem
+Fonte principal, endpoints usados, fontes de apoio (e o papel de cada uma).
+
+## Período
+Publicação: de <data> a <data>.  Coletas: de <data> a <data>, <n> execuções.
+
+## Volume
+<n> Shorts rotulados, <n> canais, por setor e por faixa de inscritos (tabela cruzada).
+
+## Licença e termos
+YouTube API Services Terms e Developer Policies (versão de <data>); uso educacional;
+sem redistribuição; política de retenção (refresh ou exclusão em até 30 dias).
+
+## Coleta
+Critérios de curadoria (link para a planilha), método (playlist de uploads),
+regra de Short, teto de Shorts por canal, versão do coletor, cota média por dia.
+
+## Setores e estratificação
+Mix marca/criador, faixas de inscritos, idioma e país.
+
+## Alvo e rótulo
+Alvo (curtidas, log1p e relativo), idade mínima, distribuição da idade do rótulo,
+tratamento de curtidas ocultas.
+
+## O que esta base NÃO representa
+Canais fora do recorte, canais inativos, canais que ocultam curtidas,
+métricas privadas (retenção, CTR), o período anterior a <data>...
+
+## Vieses e limitações conhecidos
+Viés de descoberta (fonte de cada canal), sobrevivência, inscritos como foto da coleta,
+quebras de regime de views, taxa de acerto da regra de Short (amostra manual).
+
+## Esquema
+Campos, tipos e validações (link para o código).
+
+## Contato e versão
+Responsável, repositório, changelog.
+```
+
+A seção mais importante é **"O que esta base NÃO representa"**. É ela que impede alguém, inclusive o seu agente, de usar o modelo fora da população em que ele foi treinado. Tudo o que as aulas anteriores levantaram (curadoria, maturação, quebras de regime, inscritos da coleta) tem um lugar neste documento.
+
+---
+
+## O esquema mínimo, em código
+
+O briefing da Galaxies define um esquema mínimo por post: `post_id`, `channel_id`, `published_at`, `caption`, `media_ref`, `metric_target`, `channel_stats_at_collection` e `sector`. Escrever esse esquema em código tem duas funções: documentar sem ambiguidade e **barrar** dados que não cumprem o contrato.
+
+A trilha usa duas ferramentas, com papéis complementares:
+
+- **Pydantic** valida **cada registro**: tipos, formatos, datas com fuso, relações entre campos. É o mesmo modelo que, no módulo 6, vai definir a entrada e a saída das tools do agente.
+- **pandera** valida **a tabela**: unicidade, proporção de nulos, checagens entre colunas em todas as linhas de uma vez, com um relatório de todas as falhas.
+
+```python
+from typing import Literal
+
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
+
+
+class ChannelStats(BaseModel):
+    """Estatísticas do canal NO MOMENTO DA COLETA (não da publicação)."""
+    subscribers: int | None = Field(default=None, ge=0)  # None = canal oculta inscritos
+    video_count: int = Field(ge=0)
+    collected_at: AwareDatetime
+
+
+class Post(BaseModel):
+    """Esquema mínimo do briefing, um registro por Short."""
+    post_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")           # formato observado dos IDs
+    channel_id: str = Field(pattern=r"^UC[A-Za-z0-9_-]{22}$")
+    published_at: AwareDatetime
+    caption: str                                                    # título + descrição
+    media_ref: str = Field(pattern=r"^https://www\.youtube\.com/shorts/")  # link, não arquivo
+    metric_target: int | None = Field(ge=0)                         # likeCount; None = oculto
+    target_age_days: float = Field(ge=30)                           # idade no snapshot do rótulo
+    channel_stats_at_collection: ChannelStats
+    sector: Literal["moda", "beleza", "automotivo"]
+
+    @model_validator(mode="after")
+    def coleta_depois_da_publicacao(self):
+        if self.channel_stats_at_collection.collected_at <= self.published_at:
+            raise ValueError("coleta anterior à publicação: confira fusos e datas")
+        return self
+
+
+bruto = {
+    "post_id": "Lm9Qk2VbT0s", "channel_id": "UCabc123LuminaBeauty0000",
+    "published_at": "2026-08-01T22:00:05Z", "caption": "1 produto, 20 segundos\nBase nova #shorts",
+    "media_ref": "https://www.youtube.com/shorts/Lm9Qk2VbT0s", "metric_target": 2410,
+    "target_age_days": 31.2, "sector": "beleza",
+    "channel_stats_at_collection": {"subscribers": 180000, "video_count": 912,
+                                    "collected_at": "2026-09-01T03:10:00Z"},
+}
+print(Post.model_validate(bruto).channel_stats_at_collection)
+try:
+    Post.model_validate({**bruto, "sector": "games", "target_age_days": 12})
+except Exception as e:
+    print(e)
+```
+
+```text
+subscribers=180000 video_count=912 collected_at=datetime.datetime(2026, 9, 1, 3, 10, tzinfo=TzInfo(0))
+2 validation errors for Post
+target_age_days
+  Input should be greater than or equal to 30 [type=greater_than_equal, input_value=12, input_type=int]
+sector
+  Input should be 'moda', 'beleza' or 'automotivo' [type=literal_error, input_value='games', input_type=str]
+```
+
+Os padrões de `post_id` e `channel_id` refletem o formato **observado** dos IDs do YouTube (11 caracteres para vídeos; `UC` mais 22 para canais), não um contrato publicado. Se um dia a validação começar a rejeitar IDs reais, afrouxe o padrão. E repare que `media_ref` é um **link** para o Short, não um caminho de arquivo: a base não guarda vídeos.
+
+Para a tabela achatada que vai para o treino:
+
+```python
+import pandas as pd
+import pandera.pandas as pa
+from pandera.typing import Series
+
+
+class BaseShorts(pa.DataFrameModel):
+    """A tabela achatada que vai para o treino (um Short por linha)."""
+    post_id: Series[str] = pa.Field(unique=True, str_matches=r"^[A-Za-z0-9_-]{11}$")
+    channel_id: Series[str] = pa.Field(str_startswith="UC")
+    published_at: Series[pd.DatetimeTZDtype] = pa.Field(dtype_kwargs={"unit": "us", "tz": "UTC"})
+    caption: Series[str]
+    media_ref: Series[str] = pa.Field(str_startswith="https://www.youtube.com/shorts/")
+    metric_target: Series[pd.Int64Dtype] = pa.Field(ge=0, nullable=True)
+    target_age_days: Series[float] = pa.Field(ge=30)
+    subscribers_at_collection: Series[pd.Int64Dtype] = pa.Field(ge=0, nullable=True)
+    collected_at: Series[pd.DatetimeTZDtype] = pa.Field(dtype_kwargs={"unit": "us", "tz": "UTC"})
+    sector: Series[str] = pa.Field(isin=["moda", "beleza", "automotivo"])
+
+    @pa.dataframe_check
+    def coleta_depois_da_publicacao(cls, df: pd.DataFrame) -> Series[bool]:
+        return df["collected_at"] > df["published_at"]
+
+    @pa.dataframe_check
+    def no_maximo_10pct_sem_curtidas(cls, df: pd.DataFrame) -> bool:
+        # checagem no DataFrame: checks de coluna ignoram os nulos quando nullable=True
+        return df["metric_target"].isna().mean() <= 0.10
+
+    class Config:
+        strict = True   # coluna extra ou faltando = erro
+        coerce = True   # converte tipos quando possível (ex.: "2410" -> 2410)
+
+
+df = pd.DataFrame({
+    "post_id": ["Lm9Qk2VbT0s", "aB3_x-Z9k0Q", "aB3_x-Z9k0Q"],
+    "channel_id": ["UCabc123LuminaBeauty0000"] * 3,
+    "published_at": pd.to_datetime(["2026-08-01T22:00:05Z", "2026-08-03T19:00:00Z", "2026-08-03T19:00:00Z"]),
+    "caption": ["1 produto, 20 segundos", "Pele natural em 5 passos", "Pele natural em 5 passos"],
+    "media_ref": ["https://www.youtube.com/shorts/Lm9Qk2VbT0s"] + ["https://www.youtube.com/shorts/aB3_x-Z9k0Q"] * 2,
+    "metric_target": ["2410", None, None],
+    "target_age_days": [31.2, 30.5, 30.5],
+    "subscribers_at_collection": [180000, 180000, 180000],
+    "collected_at": pd.to_datetime(["2026-09-01T03:10:00Z"] * 3),
+    "sector": ["beleza", "beleza", "beleza"],
+})
+try:
+    BaseShorts.validate(df, lazy=True)       # lazy=True: junta TODOS os erros num relatório
+except pa.errors.SchemaErrors as e:
+    print(e.failure_cases[["column", "check", "failure_case"]])
+```
+
+```text
+       column                         check failure_case
+2  BaseShorts  no_maximo_10pct_sem_curtidas        False
+0     post_id              field_uniqueness  aB3_x-Z9k0Q
+1     post_id              field_uniqueness  aB3_x-Z9k0Q
+```
+
+O relatório pegou as duas falhas de uma vez: um `post_id` duplicado e mais de 10% de Shorts sem curtidas. Note o detalhe no comentário: quando uma coluna é `nullable=True`, os checks de coluna do pandera **ignoram os nulos**, então a proporção de nulos precisa ser checada no nível do DataFrame. Rode essa validação toda vez que exportar o Parquet de treino.
+
+---
+
+## YouTube Developer Policies: o que importa aqui
+
+:::danger[Isto não é aconselhamento jurídico]
+O que segue é uma leitura das políticas para fins educacionais, feita a partir da versão publicada em 14/09/2026. Políticas mudam, e a interpretação de termos contratuais é trabalho de profissionais do direito. Se o projeto virar produto, consulte quem é da área.
+:::
+
+Quando você usa uma chave de API para ler dados públicos, sem autorização do dono do canal, o que você guarda é o que as políticas chamam de **Non-Authorized Data**. Cinco trechos afetam diretamente o projeto:
+
+| Seção | O que diz (resumo) | Onde o projeto encosta |
+| :--- | :--- | :--- |
+| **III.E.4.d** (e o exemplo de III.E.4.b) | Dados não autorizados podem ser guardados temporariamente, em quantidade limitada, por **no máximo 30 dias**; depois, apagar ou atualizar. O exemplo explícito: não guardar a contagem de inscritos de um canal por mais de 30 dias sem autorização | Snapshots antigos, que são justamente os rótulos |
+| **III.E.4.h** | Não usar dados da API para **criar métricas novas ou derivadas**; o exemplo proíbe um "score" que combine curtidas, views ou outros dados | Alvo relativo, faixas e a própria previsão |
+| **III.E.2** | Não **agregar** dados da API, exceto de canais do mesmo dono, e não usá-los para obter insights sobre o negócio do YouTube | Uma base que reúne 60+ canais de donos diferentes |
+| **III.E.1** | Não baixar nem guardar cópias do conteúdo audiovisual sem aprovação prévia do YouTube | Extração de frames e áudio (módulo 4) |
+| **III.E.6** | Não raspar (*scrape*) as aplicações do YouTube nem obter dados raspados | Ferramentas como o yt-dlp e truques como o redirect de `/shorts/` |
+
+Duas observações. Primeiro, desde 01/06/2026 existe uma seção nova, **III.L**, que permite métricas derivadas e armazenamento adicional **apenas para desenvolvedores auditados**, com casos de uso de analytics, que pediram permissão pelo formulário de extensão de cota. Um produto comercial da Galaxies construído sobre dados da API teria de passar por esse caminho. Segundo, quando um cliente da API exibe métricas que **não** vêm da API ao lado de dados da API, precisa deixar claro que elas não são do YouTube.
+
+Existe, portanto, uma **tensão real** entre as políticas e um projeto de ML sobre dados públicos do YouTube. A leitura prudente para um projeto educacional de quatro semanas é:
+
+1. **Escopo:** uso educacional, interno, sem produto e sem clientes reais consumindo as previsões.
+2. **Retenção:** rotina de refresh ou exclusão; ao fim do projeto, apague os dados brutos coletados.
+3. **Sem redistribuição:** nada de base, vídeos, frames ou áudios em repositório público ou Drive aberto. O repositório tem o **código** e o **data card**, não os dados.
+4. **Sem mídia baixada guardada:** a aula [Obtendo a mídia](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia) discute as alternativas, como o processamento por URL pública.
+5. **Transparência:** o agente apresenta a previsão como estimativa do modelo, não como métrica do YouTube.
+
+<Sketch name="m1/mapa-de-conformidade" alt="Quadro em três colunas. Faça (com registro): metadados e estatísticas via API com collected_at em cada linha; refresh ou exclusão em até 30 dias (III.E.4.d) com auditoria semanal; data card com origem, período, volume, termos, vieses e o que a base não representa. Com ressalvas: alvo relativo, faixas e outras métricas derivadas (tensão com III.E.4.h), uso interno e educacional; Gemini no free tier, em que o Google pode usar o que você envia e revisores humanos podem ler; comentários, rostos e vozes como dados pessoais (LGPD). Não faça: baixar e guardar vídeos (III.E.1) ou raspar páginas (III.E.6), por exemplo com yt-dlp; redistribuir a base ou as mídias; tratar a aula como aconselhamento jurídico. Rodapé: as políticas mudam; última revisão em 14/09/2026." caption="Um mapa rápido. Os detalhes estão na tabela acima e nas políticas originais." />
+
+A regra dos 30 dias vira código. A rotina abaixo lista os vídeos cujo dado mais recente passou do prazo; para eles, você renova (com `buscar_videos` e `salvar`, do coletor) ou apaga. Vídeos que sumiram da API, removidos ou privados, também devem sair da base:
+
+```python
+import duckdb
+
+PRAZO_DIAS = 30  # Developer Policies III.E.4.d: dados não autorizados, no máximo 30 dias
+
+
+def auditoria_de_retencao(con, hoje: str) -> dict:
+    """Quais vídeos têm dados coletados há mais de 30 dias sem nenhum refresh?"""
+    vencidos = con.execute("""
+        SELECT video_id, max(collected_at) AS ultimo_refresh
+        FROM snapshots GROUP BY video_id
+        HAVING max(collected_at) < CAST(? AS TIMESTAMPTZ) - to_days(?)
+        ORDER BY ultimo_refresh""", [hoje, PRAZO_DIAS]).df()  # .df(): fetchall() de TIMESTAMPTZ exige pytz
+    return {"vencidos": vencidos["video_id"].tolist(), "n": len(vencidos)}
+
+
+def apagar(con, video_ids: list[str]) -> None:
+    """Para vídeos que sumiram da API (removidos/privados) ou que você não vai renovar."""
+    if video_ids:
+        con.execute("DELETE FROM snapshots WHERE list_contains(?, video_id)", [video_ids])
+        con.execute("DELETE FROM videos WHERE list_contains(?, video_id)", [video_ids])
+
+
+# demonstração com uma base mínima em memória
+con = duckdb.connect()
+con.execute("SET TimeZone = 'UTC'")
+con.execute("CREATE TABLE videos (video_id VARCHAR PRIMARY KEY)")
+con.execute("CREATE TABLE snapshots (video_id VARCHAR, collected_at TIMESTAMPTZ, likes BIGINT)")
+con.execute("INSERT INTO videos VALUES ('aaaaaaaaaaa'), ('bbbbbbbbbbb')")
+con.execute("""INSERT INTO snapshots VALUES
+    ('aaaaaaaaaaa', '2026-09-01 10:00:00+00', 2100),
+    ('bbbbbbbbbbb', '2026-09-01 10:00:00+00', 900),
+    ('bbbbbbbbbbb', '2026-10-01 10:00:00+00', 950)""")
+rel = auditoria_de_retencao(con, hoje="2026-10-20")
+print(rel)            # {'vencidos': ['aaaaaaaaaaa'], 'n': 1}
+# decisão: renovar (videos.list + salvar, como no coletor) OU apagar
+apagar(con, rel["vencidos"])
+print(con.execute("SELECT count(*) FROM videos").fetchone())   # (1,)
+```
+
+---
+
+## Gemini no free tier: o que você envia deixa de ser só seu
+
+No módulo 4, você vai usar um VLM para extrair atributos dos vídeos, e o Gemini é uma opção natural. Os termos adicionais da Gemini API são explícitos sobre os **serviços não pagos** (o AI Studio e a cota gratuita da API):
+
+- o Google **usa o conteúdo enviado e as respostas** para fornecer, melhorar e desenvolver produtos e tecnologias de ML;
+- **revisores humanos podem ler**, anotar e processar entradas e saídas;
+- a recomendação textual é: **não envie informação sensível, confidencial ou pessoal** para os serviços não pagos.
+
+Para Shorts públicos processados por URL, o conteúdo já é público, mas ainda contém rostos e vozes de pessoas. Para **criativos não publicados de clientes**, como os Shorts A e B da Lumina, a situação é outra: são material confidencial e **não devem ir para o free tier**. Em produção, isso exige a camada paga, com os termos correspondentes, ou um modelo aberto rodando na sua infraestrutura.
+
+---
+
+## Dados pessoais: rostos, vozes e comentários
+
+Pela LGPD (Lei 13.709/2018), dado pessoal é qualquer informação relacionada a pessoa natural identificada ou identificável, e dado **biométrico** vinculado a uma pessoa é **dado sensível**. Numa base de Shorts, isso aparece em três lugares:
+
+- **Rostos e vozes** de criadores e figurantes nos vídeos. Detectar **se há** um rosto (uma feature sim/não) é bem diferente de **reconhecer quem** é. Fique no primeiro caso; reconhecimento facial não tem lugar neste projeto.
+- **Comentários**, com nomes de usuário e texto livre. Se não forem necessários para o modelo, **não colete**. Se forem, descarte autores e identificadores e agregue.
+- **Nomes e handles** de criadores em descrições. São públicos, mas continuam sendo dados pessoais; não os exponha fora do necessário.
+
+Os princípios que guiam a decisão são os da própria lei: **finalidade** (coletar para um propósito declarado) e **necessidade** (o mínimo para esse propósito).
+
+<Checklist
+  id="m1-conformidade"
+  titulo="Checklist de conformidade da base"
+  itens={[
+    {texto: 'Toda linha tem collected_at e age_days', detalhe: 'Sem isso, não há idade de rótulo, regime nem prazo de refresh.'},
+    {texto: 'Rotina de refresh ou exclusão em até 30 dias agendada', detalhe: 'Auditoria semanal com a função de retenção; vídeos removidos saem da base.'},
+    {texto: 'Base, vídeos, frames e áudios fora de qualquer repositório ou pasta pública', detalhe: 'O .gitignore cobre *.duckdb, *.parquet e pastas de mídia.'},
+    {texto: 'Nenhum vídeo baixado guardado; mídia processada por URL ou descartada após extrair features', detalhe: 'Ver a aula Obtendo a mídia.'},
+    {texto: 'Chave da API só em variável de ambiente, fora do código e do repositório'},
+    {texto: 'Nada confidencial ou pessoal enviado ao Gemini no free tier', detalhe: 'Criativos não publicados de clientes nunca vão para a camada gratuita.'},
+    {texto: 'Comentários não coletados, ou coletados sem autores e agregados'},
+    {texto: 'Sem reconhecimento facial: só presença de rosto como feature'},
+    {texto: 'Data card escrito, com a seção "o que NÃO representa" preenchida'},
+    {texto: 'Esquema validado com pandera a cada exportação do Parquet de treino'},
+    {texto: 'Previsões apresentadas como estimativa do modelo, não como métrica do YouTube'},
+    {texto: 'Plano de exclusão dos dados brutos ao fim do projeto, com data'},
+  ]}
+/>
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+A Lumina vai receber, do agente, uma previsão de curtidas para A e B. Três pontos desta aula mudam como essa resposta é construída e apresentada:
+
+- **Confidencialidade dos criativos.** A e B não foram publicados. Se o agente usar um VLM para extrair atributos deles, esse VLM não pode ser um serviço gratuito que use o conteúdo para treino. No protótipo, use os seus próprios Shorts de teste; no produto, a camada paga ou um modelo aberto.
+- **Transparência.** A resposta diz "estimativa do modelo, treinado em uma base de N Shorts públicos de M canais, coletados entre X e Y", não "o YouTube prevê". O data card é a fonte dessas informações.
+- **Limites.** Se a seção "o que NÃO representa" do data card disser que a base não tem marcas de beleza de 100 mil a 1 milhão de inscritos, o agente precisa avisar que a previsão para a Lumina é extrapolação. Documentação não é só para humanos: ela alimenta o sinal de baixa confiança do módulo 5.
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas desta etapa]
+1. **Publicar a base "para reprodutibilidade".** Reprodutibilidade vem do código, do data card e das datas de coleta. Os dados não vão para repositórios públicos.
+2. **Guardar snapshots indefinidamente.** A regra dos 30 dias vale para dados não autorizados. Tenha uma rotina de refresh ou exclusão e um plano de apagar tudo ao fim do projeto.
+3. **Tratar métricas derivadas como inofensivas.** O alvo relativo e as previsões são exatamente o tipo de coisa que a III.E.4.h restringe. Uso interno e educacional, com transparência.
+4. **Mandar criativos de clientes para o free tier do Gemini.** O conteúdo pode ser usado pelo Google e lido por revisores humanos.
+5. **Validar só no primeiro dia.** O esquema precisa rodar a cada exportação; é assim que ele pega a coleta que veio com curtidas nulas ou IDs duplicados.
+:::
+
+<Quiz
+  id="m1-a8"
+  perguntas={[
+    {
+      pergunta: 'Qual seção do data card impede que o modelo seja usado fora da população em que foi treinado?',
+      opcoes: [
+        {texto: 'Volume.', explicacao: 'O volume diz quanto há, não para quem o modelo vale.'},
+        {texto: 'O que esta base NÃO representa.', correta: true, explicacao: 'É ela que delimita onde a previsão deixa de ser confiável.'},
+        {texto: 'Contato e versão.', explicacao: 'Importante para manutenção, mas não delimita a população.'},
+      ],
+    },
+    {
+      pergunta: 'Por que validar com Pydantic **e** com pandera, em vez de só um deles?',
+      opcoes: [
+        {texto: 'Porque o Pydantic não valida datas com fuso.', explicacao: 'Valida: AwareDatetime exige fuso.'},
+        {texto: 'Porque o Pydantic garante o contrato de cada registro e o pandera checa propriedades da tabela, como unicidade e proporção de nulos.', correta: true, explicacao: 'Unicidade de post_id e fração de nulos só fazem sentido olhando todas as linhas.'},
+        {texto: 'Porque o pandera é mais rápido para um único registro.', explicacao: 'Velocidade não é o critério; os dois validam coisas diferentes.'},
+      ],
+    },
+    {
+      pergunta: 'Pelas Developer Policies, o que fazer com estatísticas coletadas via chave de API (sem autorização do dono do canal) depois de 30 dias?',
+      opcoes: [
+        {texto: 'Nada: dados públicos podem ser guardados para sempre.', explicacao: 'A seção III.E.4.d limita dados não autorizados a no máximo 30 dias.'},
+        {texto: 'Apagar ou atualizar (refresh).', correta: true, explicacao: 'É a regra; a rotina de retenção da aula lista o que venceu.'},
+        {texto: 'Mover para um repositório público, para não ocupar espaço.', explicacao: 'Redistribuir agrava o problema.'},
+      ],
+    },
+    {
+      pergunta: 'Quais práticas estão alinhadas com esta aula? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'Detectar se há rosto no vídeo como feature sim/não.', correta: true, explicacao: 'Presença não identifica a pessoa; reconhecimento facial seria dado biométrico sensível.'},
+        {texto: 'Enviar os Shorts A e B da Lumina ao Gemini no free tier para extrair atributos.', explicacao: 'São criativos não publicados e confidenciais; no free tier, o conteúdo pode ser usado pelo Google e lido por revisores.'},
+        {texto: 'Guardar no repositório o código do coletor e o data card, mas não os dados.', correta: true, explicacao: 'Reprodutibilidade sem redistribuição.'},
+        {texto: 'Coletar todos os comentários com nome do autor, "caso sejam úteis depois".', explicacao: 'Fere os princípios de finalidade e necessidade; colete só se precisar e sem autores.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: feche o módulo com uma base defensável]
+1. Escreva o `DATA_CARD.md` da sua base com o modelo desta aula, preenchendo pelo menos: origem, período, volume por setor e faixa, alvo e rótulo, **o que não representa** e três vieses conhecidos.
+2. Adapte o `BaseShorts` às colunas do seu Parquet e rode a validação. Corrija o que falhar **na coleta**, não na validação.
+3. Agende a auditoria de retenção (semanal) e escreva no data card a data em que os dados brutos serão apagados.
+4. Percorra o checklist de conformidade e anote, para cada item não cumprido, o que falta e até quando.
+:::
+
+<details>
+<summary>Ver um trecho de data card preenchido</summary>
+
+> **O que esta base NÃO representa.** Canais de fora do Brasil ou que não publicam em português; canais inativos há mais de 90 dias em 28/09/2026; canais que ocultam curtidas (4 excluídos); canais de beleza com menos de 10 mil inscritos (só 2 na base); Shorts publicados depois de 19/09/2026; métricas privadas (retenção, impressões, CTR).
+>
+> **Vieses conhecidos.** (1) 38% dos canais vieram de listas de "top canais", o que favorece canais grandes; (2) inscritos são do dia da coleta e só entram como faixa, fora do treino; (3) 12% dos rótulos têm mais de 300 dias de idade, por causa da primeira coleta; a idade do rótulo entra como variável de controle; (4) a regra de Short acertou 47 de 50 casos numa conferência manual.
+>
+> **Retenção.** Auditoria semanal às segundas; dados brutos apagados em 30/10/2026.
+
+</details>
+
+---
+
+## Resumo
+
+- O **data card** descreve origem, período, volume, termos, coleta, setores, vieses e, principalmente, **o que a base não representa**.
+- O esquema mínimo do briefing vira **Pydantic** (contrato por registro) e **pandera** (contrato da tabela), validados a cada exportação.
+- As **Developer Policies** limitam dados não autorizados a **30 dias** (III.E.4.d), restringem **métricas derivadas** (III.E.4.h) e **agregação** (III.E.2), e proíbem guardar **vídeos** (III.E.1) e **scraping** (III.E.6). Há tensão real com projetos de ML; trate como discussão, não como aconselhamento jurídico.
+- No **free tier do Gemini**, o conteúdo pode ser usado pelo Google e lido por revisores: nada confidencial ou pessoal.
+- **Dados pessoais** (rostos, vozes, comentários): finalidade e necessidade; presença de rosto sim, reconhecimento não.
+
+## Referências
+
+- Google. [YouTube API Services: Developer Policies](https://developers.google.com/youtube/terms/developer-policies) (seções III.E e III.L; atualizadas em 14/09/2026) e [YouTube API Services Terms of Service](https://developers.google.com/youtube/terms/api-services-terms-of-service).
+- Google. [Gemini API Additional Terms of Service](https://ai.google.dev/gemini-api/terms), seção sobre serviços não pagos.
+- Brasil. [Lei nº 13.709/2018, Lei Geral de Proteção de Dados Pessoais](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709.htm), arts. 5º e 6º.
+- Gebru et al. [*Datasheets for Datasets*](https://arxiv.org/abs/1803.09010). arXiv:1803.09010.
+- Pushkarna, Zaldivar e Kjartansson. [*Data Cards: Purposeful and Transparent Dataset Documentation for Responsible AI*](https://arxiv.org/abs/2204.01075). FAccT, 2022.
+- [Pydantic](https://docs.pydantic.dev/latest/) e [pandera](https://pandera.readthedocs.io/en/stable/).
+
+**Próxima aula:** [Baselines: o modelo burro que você precisa vencer](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/baselines): com a base pronta, o primeiro passo do módulo 2 é saber quanto acerta um modelo que não sabe nada sobre o conteúdo.

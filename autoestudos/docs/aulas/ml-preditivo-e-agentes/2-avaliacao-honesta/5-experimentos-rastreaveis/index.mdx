@@ -1,0 +1,531 @@
+---
+sidebar_position: 5
+sidebar_label: 'Experimentos rastreáveis com MLflow'
+title: 'Experimentos rastreáveis com MLflow'
+description: 'Registro de hipóteses, configuração em YAML e dataclass, seeds, MLflow 3 (params, metrics, tags, log_model com name=), comparação de runs, estrutura de pastas e pytest para métricas, splits e features.'
+tags: [ml-preditivo, avaliacao, mlflow, reprodutibilidade]
+---
+
+# Experimentos Rastreáveis com MLflow: Todo Número com Endereço
+
+<LessonMeta
+  tempo="50 min"
+  semana={2}
+  etapa="avaliacao"
+  objetivos={[
+    'Escrever uma hipótese com métrica e limiar de decisão definidos antes de rodar',
+    'Separar configuração de código com YAML e dataclass, e fixar seeds',
+    'Registrar params, metrics, tags e o modelo no MLflow 3 e comparar runs',
+    'Organizar o projeto em pastas e proteger métricas, splits e features com pytest',
+  ]}
+  prerequisitos={[
+    {label: 'Validação temporal e por canal', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/validacao-temporal-e-por-canal'},
+    {label: 'Métricas de erro e de ordenação', to: '/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao'},
+  ]}
+/>
+
+Semana 3 do projeto. No meio de um notebook de 200 células, você encontra uma anotação: *"par-a-par intra 0,58, melhor até agora!!"*. Com quais features? Qual data de corte? Era antes ou depois de você recoletar a base na terça (as curtidas dos posts recentes cresceram desde então)? Com o gap de 30 dias ou sem? Você roda de novo e sai 0,55.
+
+Nenhum desses números está errado. O problema é que nenhum deles tem **endereço**: não dá para dizer de onde veio nem reproduzir. E a entrega da Galaxies é julgada justamente pela honestidade da avaliação: quem ler o seu README vai perguntar como você chegou em cada número.
+
+Esta aula monta a infraestrutura mínima para isso não acontecer: hipótese escrita, configuração versionada, MLflow registrando cada rodada e testes automáticos protegendo as funções que produzem os números.
+
+:::info[Ideia central]
+Um experimento é **hipótese + configuração + versão do código + versão dos dados + resultado**. Se faltar qualquer um dos cinco, o resultado é uma anedota. O MLflow guarda os três últimos automaticamente se você pedir; a hipótese e a configuração são disciplina sua.
+:::
+
+---
+
+## Comece pela hipótese
+
+Antes de rodar, escreva o que você espera e **como vai decidir**. Isso evita o que Gelman e Loken chamaram de "jardim dos caminhos que se bifurcam": com liberdade para escolher métrica, corte, subconjunto e comparação depois de ver os resultados, quase sempre aparece *algum* recorte em que a sua ideia "funcionou".
+
+Um template para o `HIPOTESES.md` do projeto:
+
+```text
+## H1: conteúdo ajuda a ordenar dentro do canal
+Data: 2026-09-29
+Hipótese: adicionar gancho (VLM), rosto, texto na tela, cortes e duração
+  ao modelo só-canal sobe a acurácia par-a-par intra-canal.
+Mecanismo: nos Shorts, os primeiros segundos decidem se a pessoa fica;
+  o canal explica o nível, o conteúdo explica a variação dentro dele.
+Métrica e limiar (definidos ANTES de rodar): par-a-par intra-canal no
+  teste temporal (corte 2026-03-01, gap 30 dias); aceito se o ganho for
+  >= +0,03 e o IC 95% do bootstrap pareado por canal não incluir zero.
+Controle: configs/so_canal.yaml (mesma base, mesmo corte, mesmo modelo)
+Tratamento: configs/conteudo.yaml
+Resultado: (run_id do MLflow, valor, IC)
+Decisão: aceita / rejeita / refina, e por quê
+```
+
+Os campos que mais fazem diferença são **métrica e limiar** e **controle**. Sem eles, qualquer número vira confirmação. O limiar não precisa ser perfeito; precisa ser escrito antes.
+
+<Sketch name="m2/ciclo-do-experimento" alt="Ciclo em seis passos: 1, hipótese em HIPOTESES.md ('o gancho sobe o par-a-par intra-canal em pelo menos 0,03'); 2, config em configs/*.yaml com features, data de corte, gap, seed e hiperparâmetros; 3, treino com python -m experimentos.treinar, split temporal e métricas; 4, run no MLflow com params, metrics, modelo e tags de commit, corte e base; 5, comparar na UI do MLflow ou com search_runs, com IC por bootstrap; 6, decisão: aceita, rejeita ou refina e anota o resultado na hipótese, voltando ao passo 1. Uma nota tracejada indica que o pytest roda antes do treino, testando métricas e splits. Regra em vermelho: nenhum número entra no README sem um run_id que permita reproduzi-lo." caption="O ciclo de um experimento. O MLflow cuida dos passos 4 e 5; os outros são disciplina." />
+
+---
+
+## Configuração como dado: YAML + dataclass
+
+Tudo o que muda entre experimentos sai do código e vai para um arquivo de configuração: features, data de corte, gap, seed, hiperparâmetros. Três ganhos imediatos:
+
+- **dá para ver a diferença** entre dois experimentos com um `diff` de dois YAML;
+- **o arquivo vai para o MLflow** junto com o resultado (`mlflow.log_dict`);
+- **o código não muda** para testar uma ideia nova, só a config.
+
+Carregar o YAML numa `dataclass` dá uma validação de graça: uma chave com erro de digitação (`gap_dia` em vez de `gap_dias`) levanta `TypeError` na hora, em vez de ser ignorada em silêncio. Se quiser validar tipos e faixas também, o Pydantic faz isso; para o projeto, a dataclass basta.
+
+---
+
+## Seeds e determinismo
+
+Fixe as seeds que existirem no caminho: `random.seed`, `np.random.seed` e o `random_state` do modelo. Três observações honestas:
+
+- Com os parâmetros padrão (sem *bagging* nem amostragem de colunas), o LightGBM já é determinístico: a seed só muda algo quando há aleatoriedade ligada. Nas [aulas de boosting](/aulas/ml-preditivo-e-agentes/gradient-boosting/lightgbm-catboost-xgboost), quando você ligar `subsample` e `colsample_bytree`, a seed passa a importar, e vale rodar mais de uma.
+- Para resultados idênticos com números diferentes de threads, a [documentação do LightGBM](https://lightgbm.readthedocs.io/en/latest/Parameters.html) recomenda `deterministic=True` junto com `force_row_wise=True` ou `force_col_wise=True`. A mesma página avisa que sistemas e versões diferentes podem dar resultados diferentes mesmo assim.
+- A "seed" mais esquecida é a **base**. Se você recoletar os dados, as curtidas dos posts recentes mudam. Por isso o script registra um *hash* do conteúdo da base em cada run.
+
+---
+
+## MLflow 3 em dez minutos
+
+O MLflow organiza o trabalho em **experimentos** (um por pergunta do projeto, por exemplo `galaxies-curtidas`) e **runs** (uma rodada de treino). Cada run guarda:
+
+| O quê | Para quê | Exemplo no case |
+| :--- | :--- | :--- |
+| **params** | o que configura a rodada | features, gap, seed, hiperparâmetros |
+| **metrics** | o resultado | `mae_log`, `spearman_intra`, `par_a_par_intra` |
+| **tags** | contexto para filtrar e auditar | commit do git, hash da base, data de corte |
+| **artefatos** | arquivos | a config em JSON, gráficos |
+| **modelo** | o modelo treinado, carregável depois | o LightGBM, via `mlflow.lightgbm.log_model` |
+
+Quatro pontos da versão 3 que importam aqui (conferidos no MLflow 3.16.1):
+
+- **`log_model(..., name="modelo")`**. O parâmetro `name` substitui o antigo `artifact_path`. O retorno traz `model_uri` no formato `models:/<id>`: no MLflow 3, o modelo registrado é uma entidade própria (*LoggedModel*), ligada ao run.
+- **Onde os dados ficam.** Sem configurar nada, o MLflow 3.16 grava num SQLite local, `mlflow.db`, na pasta de onde você roda, e os artefatos em `./mlruns`. Os dois vão para o `.gitignore`.
+- **A interface.** `uv run mlflow ui` sobe a UI em `http://127.0.0.1:5000`, lendo o `mlflow.db` da pasta atual. No macOS, a porta 5000 costuma estar ocupada pelo Receptor AirPlay: use `uv run mlflow ui --port 5001`. Na UI, você filtra runs, seleciona vários e compara params e métricas lado a lado.
+- **Params são imutáveis.** Registrar de novo o mesmo param com outro valor, no mesmo run, dá erro. É proposital: um run descreve uma configuração só.
+
+Existe também o `mlflow.lightgbm.autolog()`, que registra parâmetros e métricas de treino automaticamente. Aqui preferimos o registro explícito, porque as métricas que importam (intra-canal, par-a-par) são nossas, e não do LightGBM.
+
+---
+
+## Estrutura de pastas
+
+```text
+galaxies-previsor/
+├── pyproject.toml           # dependências (aula 2.1) + config do pytest
+├── HIPOTESES.md             # registro de hipóteses
+├── configs/                 # um YAML por experimento
+│   ├── so_canal.yaml
+│   └── conteudo.yaml
+├── galaxies/                # código importável
+│   ├── __init__.py
+│   ├── sintetico.py         # gerar_base() da aula 2.1 (troque pelo loader da sua base)
+│   ├── features.py
+│   ├── splits.py            # funções da aula 2.3
+│   └── metricas.py          # módulo da aula 2.4
+├── experimentos/
+│   ├── __init__.py
+│   ├── treinar.py
+│   └── comparar.py
+├── tests/
+│   ├── test_metricas.py     # aula 2.4, importando de galaxies.metricas
+│   └── test_splits.py
+├── data/                    # sua base (fora do git; o hash vai para o MLflow)
+├── mlflow.db                # criado pelo MLflow (fora do git)
+└── mlruns/                  # artefatos e modelos (fora do git)
+```
+
+Dois detalhes: o `splits.py` precisa de `import numpy as np` e `import pandas as pd` no topo; e o `test_metricas.py` da aula 2.4 passa a importar `from galaxies.metricas import ...`. A separação entre `galaxies/` (funções) e `experimentos/` (scripts) é o que permite testar as funções sem rodar treino nenhum.
+
+---
+
+## O que merece teste automático
+
+Você não precisa testar tudo. Precisa testar **o que produz os números do README**:
+
+- **Métricas**, contra uma referência (o `scipy`) e contra casos com resposta conhecida. Já feito na aula [2.4](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/metricas-de-erro-e-ordenacao).
+- **Splits**: o treino termina antes do corte menos o gap, nenhum canal aparece dos dois lados no split por canal, cada fold do walk-forward respeita o gap.
+- **Features de histórico**, com um **teste de perturbação**: mude o alvo de um post para um valor absurdo e confira que as features dele e dos posts anteriores não mudam. É a auditoria de vazamento da aula [2.2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados) transformada em código, e ela roda sozinha a cada mudança.
+
+Rode `uv run pytest -q` antes de cada experimento que vai para o relatório.
+
+---
+
+## Na prática (código)
+
+**Passo 1: a configuração do pytest.** No `pyproject.toml` que o `uv init` criou, acrescente:
+
+```toml title="pyproject.toml"
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+```
+
+E no `.gitignore`:
+
+```text
+mlflow.db
+mlruns/
+data/
+```
+
+**Passo 2: as features de canal num módulo próprio.** O mesmo cálculo das aulas anteriores, agora reutilizável pelo treino e pelos testes.
+
+```python title="galaxies/features.py"
+import numpy as np
+
+
+def adicionar_features_canal(df):
+    """Features do histórico do canal: só posts ANTERIORES entram na conta."""
+    df = df.sort_values(["canal", "data_pub"]).reset_index(drop=True)
+    g = df.groupby("canal")["y"]
+    df["log_inscritos"] = np.log(df["inscritos"])
+    df["n_anteriores"] = df.groupby("canal").cumcount()
+    df["mediana_canal"] = g.transform(lambda s: s.shift(1).expanding().median())
+    df["media_ult5"] = g.transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+    return df
+```
+
+**Passo 3: duas configurações, controle e tratamento da hipótese H1.**
+
+```yaml title="configs/so_canal.yaml"
+nome: so-canal
+hipotese: "H0: só o histórico do canal já ordena os posts dentro do canal (esperado: par-a-par ~0,5)"
+versao_base: sintetica-v1
+data_corte: "2026-03-01"
+gap_dias: 30
+seed: 42
+features: [log_inscritos, mediana_canal, media_ult5, n_anteriores]
+lgbm: {n_estimators: 300, learning_rate: 0.03, num_leaves: 15}
+```
+
+```yaml title="configs/conteudo.yaml"
+nome: canal-mais-conteudo
+hipotese: "H1: gancho, rosto e texto na tela sobem o par-a-par intra-canal em >= 0,03"
+versao_base: sintetica-v1
+data_corte: "2026-03-01"
+gap_dias: 30
+seed: 42
+features: [log_inscritos, mediana_canal, media_ult5, n_anteriores, hora, duracao_s,
+           rosto, texto_tela, cortes_10s, titulo_pergunta, gancho_vlm]
+lgbm: {n_estimators: 300, learning_rate: 0.03, num_leaves: 15}
+```
+
+**Passo 4: o script de treino.** Primeira parte: imports, a dataclass da configuração e duas funções de rastreabilidade.
+
+```python title="experimentos/treinar.py"
+"""Uso: uv run python -m experimentos.treinar configs/so_canal.yaml"""
+import hashlib
+import random
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+
+import lightgbm as lgb  # importe antes do mlflow (veja "Erros comuns")
+import mlflow
+import numpy as np
+import pandas as pd
+import yaml
+
+from galaxies.features import adicionar_features_canal
+from galaxies.metricas import mae_log, pairwise_accuracy, spearman_global, spearman_intra_canal
+from galaxies.sintetico import gerar_base
+from galaxies.splits import split_temporal
+
+
+@dataclass
+class Config:
+    nome: str
+    hipotese: str
+    versao_base: str
+    data_corte: str
+    gap_dias: int
+    features: list[str]
+    seed: int = 42
+    lgbm: dict = field(default_factory=dict)
+
+
+def commit_atual() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True,
+                                       stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "sem-git"
+
+
+def hash_base(df: pd.DataFrame) -> str:
+    """Impressão digital do conteúdo da base: muda se qualquer valor mudar."""
+    conteudo = pd.util.hash_pandas_object(df, index=True).to_numpy().tobytes()
+    return hashlib.sha256(conteudo).hexdigest()[:12]
+```
+
+Segunda parte, no mesmo arquivo: o treino e o registro no MLflow.
+
+```python title="experimentos/treinar.py"
+def main(caminho: str) -> None:
+    with open(caminho, encoding="utf-8") as f:
+        cfg = Config(**yaml.safe_load(f))  # chave desconhecida no YAML -> TypeError
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    df = adicionar_features_canal(gerar_base())  # troque pelo loader da SUA base
+    tr, te = split_temporal(df, cfg.data_corte, cfg.gap_dias)
+    X_tr, X_te = df.loc[tr, cfg.features].astype(float), df.loc[te, cfg.features].astype(float)
+    y_te, canal_te = df.loc[te, "y"], df.loc[te, "canal"]
+
+    mlflow.set_experiment("galaxies-curtidas")
+    with mlflow.start_run(run_name=cfg.nome, description=cfg.hipotese):
+        mlflow.set_tags({"git_commit": commit_atual(), "versao_base": cfg.versao_base,
+                         "hash_base": hash_base(df), "data_corte": cfg.data_corte,
+                         "config": caminho})
+        mlflow.log_params({"n_features": len(cfg.features), "features": ",".join(cfg.features),
+                           "gap_dias": cfg.gap_dias, "seed": cfg.seed,
+                           "n_treino": len(tr), "n_teste": len(te), **cfg.lgbm})
+        mlflow.log_dict(asdict(cfg), "config.json")
+
+        modelo = lgb.LGBMRegressor(**cfg.lgbm, random_state=cfg.seed, verbose=-1)
+        modelo.fit(X_tr, df.loc[tr, "y"])
+        p = modelo.predict(X_te)
+        metricas = {"mae_log": mae_log(y_te, p), "spearman": spearman_global(y_te, p),
+                    "spearman_intra": spearman_intra_canal(y_te, p, canal_te),
+                    "par_a_par_intra": pairwise_accuracy(y_te, p, canal_te)}
+        mlflow.log_metrics(metricas)
+        info = mlflow.lightgbm.log_model(modelo, name="modelo", input_example=X_te.head(3))
+        print(cfg.nome, {k: round(v, 3) for k, v in metricas.items()}, info.model_uri)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+```
+
+**Passo 5: rodar os dois experimentos.**
+
+```bash
+uv run pytest -q
+uv run python -m experimentos.treinar configs/so_canal.yaml
+uv run python -m experimentos.treinar configs/conteudo.yaml
+```
+
+Na primeira execução, o MLflow cria o banco e o experimento e avisa nos logs (`Creating initial MLflow database tables...`, `Experiment with name 'galaxies-curtidas' does not exist. Creating a new experiment.`). Em ambientes criados pelo `uv`, que não têm `pip`, aparecem também dois `WARNING mlflow.utils.environment` sobre a inferência dos requisitos do modelo; o MLflow cai num fallback (`lightgbm` e `skops`) e o modelo é salvo normalmente. As linhas finais de cada execução:
+
+```text
+so-canal {'mae_log': 0.777, 'spearman': 0.845, 'spearman_intra': -0.104, 'par_a_par_intra': 0.456} models:/m-727ef11b47384b6db0abfadfb0932c61
+canal-mais-conteudo {'mae_log': 0.733, 'spearman': 0.859, 'spearman_intra': 0.163, 'par_a_par_intra': 0.555} models:/m-9037031389294295bc0a585926af3aca
+```
+
+Os identificadores `m-...` serão outros na sua máquina: cada `log_model` gera um novo.
+
+**Passo 6: comparar os runs por código.** A UI é ótima para explorar; para o relatório, prefira uma consulta que qualquer pessoa possa rodar de novo. O filtro garante que só runs com a mesma data de corte são comparados.
+
+```python title="experimentos/comparar.py"
+"""Uso: uv run python -m experimentos.comparar"""
+import mlflow
+
+runs = mlflow.search_runs(
+    experiment_names=["galaxies-curtidas"],
+    filter_string="tags.data_corte = '2026-03-01'",  # só compare runs com o mesmo corte
+    order_by=["metrics.par_a_par_intra DESC"],
+)
+colunas = {"tags.mlflow.runName": "run", "params.n_features": "n_feat",
+           "metrics.mae_log": "mae_log", "metrics.spearman_intra": "sp_intra",
+           "metrics.par_a_par_intra": "par_a_par", "tags.hash_base": "base",
+           "tags.git_commit": "commit"}
+print(runs[list(colunas)].rename(columns=colunas).round(3).to_string(index=False))
+```
+
+```text
+                run n_feat  mae_log  sp_intra  par_a_par         base  commit
+canal-mais-conteudo     11    0.733     0.163      0.555 9d8d1d86d195 sem-git
+           so-canal      4    0.777    -0.104      0.456 9d8d1d86d195 sem-git
+```
+
+A coluna `base` confirma que os dois runs usaram exatamente os mesmos dados. A `commit` mostra `sem-git` porque rodamos fora de um repositório; no seu projeto, ela traz o commit, e a disciplina é **commitar antes de rodar** experimentos que vão para o relatório. O ganho de +0,099 no par-a-par passa folgado do limiar da H1; o IC pareado que completa a decisão é calculado na [próxima aula](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao).
+
+Para carregar o modelo de um run depois, por exemplo dentro da tool de predição do agente, use a URI que o `log_model` devolveu: `mlflow.lightgbm.load_model("models:/m-...")`, ou `mlflow.lightgbm.load_model(f"runs:/{run_id}/modelo")`.
+
+**Passo 7: os testes de split e de vazamento.**
+
+```python title="tests/test_splits.py"
+import pandas as pd
+import pytest
+
+from galaxies.features import adicionar_features_canal
+from galaxies.sintetico import gerar_base
+from galaxies.splits import split_por_canal, split_temporal, walk_forward
+
+
+@pytest.fixture(scope="module")
+def df():
+    return adicionar_features_canal(gerar_base(n_canais=20, seed=1))
+
+
+def test_split_temporal_respeita_corte_e_gap(df):
+    tr, te = split_temporal(df, "2026-03-01", gap_dias=30)
+    assert df.loc[tr, "data_pub"].max() < pd.Timestamp("2026-01-30")
+    assert df.loc[te, "data_pub"].min() >= pd.Timestamp("2026-03-01")
+
+
+def test_walk_forward_treino_sempre_antes_do_teste(df):
+    folds = list(walk_forward(df, n_folds=3, gap_dias=30))
+    assert len(folds) == 3
+    for tr, te in folds:
+        gap = df.loc[te, "data_pub"].min() - df.loc[tr, "data_pub"].max()
+        assert gap >= pd.Timedelta(days=30)
+
+
+def test_split_por_canal_nao_compartilha_canais(df):
+    tr, te = split_por_canal(df, frac=0.25, seed=0)
+    assert set(df.loc[tr, "canal"]).isdisjoint(df.loc[te, "canal"])
+
+
+def test_feature_do_canal_nao_enxerga_o_proprio_post_nem_o_futuro(df):
+    """Mudar o alvo de um post não pode mudar as features dele nem as dos anteriores."""
+    canal = df["canal"].iloc[0]
+    alvo = df.index[(df["canal"] == canal) & (df["n_anteriores"] == 10)][0]
+    bruto = df[["canal", "data_pub", "inscritos", "y"]].copy()
+    bruto.loc[alvo, "y"] = 99.0  # um post "viral" absurdo
+    recalc = adicionar_features_canal(bruto)
+    ate_o_alvo = (df["canal"] == canal) & (df["n_anteriores"] <= 10)
+    cols = ["mediana_canal", "media_ult5"]
+    pd.testing.assert_frame_equal(df.loc[ate_o_alvo, cols], recalc.loc[ate_o_alvo, cols])
+    seguinte = df.index[(df["canal"] == canal) & (df["n_anteriores"] == 11)][0]
+    assert recalc.loc[seguinte, "media_ult5"] != df.loc[seguinte, "media_ult5"]
+```
+
+```text
+..........                                                               [100%]
+10 passed in 3.01s
+```
+
+As duas últimas linhas do teste de perturbação importam: além de conferir que o passado não mudou, ele confere que o post **seguinte** mudou. Sem isso, um bug que zerasse a feature inteira passaria no teste.
+
+---
+
+## No projeto Galaxies
+
+<NoProjeto>
+
+Quando o agente responder à Lumina, o número de cada Short sai da tool de predição, que carrega **um modelo específico** do MLflow. Faça a resposta carregar esse endereço junto:
+
+> Previsão para B: 3.900 curtidas (A: 1.800). Modelo `models:/m-9037...` (run `canal-mais-conteudo`, commit `a1b2c3d`, corte 2026-03-01, base `9d8d1d86d195`). Par-a-par intra-canal no teste: 0,555.
+
+Isso tem dois efeitos práticos. Para a Galaxies, qualquer resposta do agente pode ser auditada até o treino que a produziu. Para você, quando alguém perguntar "por que o agente disse B?", a resposta começa por um run que existe, e não por um notebook perdido. No [módulo 6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/as-cinco-tools), a tool de predição recebe a URI do modelo por configuração, nunca "o último arquivo `.pkl` da pasta".
+
+</NoProjeto>
+
+---
+
+## Erros comuns
+
+:::warning[Armadilhas de rastreabilidade]
+1. **Registrar métricas sem a configuração.** Um run com `par_a_par_intra = 0,58` e sem features, corte e gap não serve para nada. Use `log_params` e `log_dict` da config inteira.
+2. **Recoletar a base sem versionar.** As curtidas crescem; a mesma config dá outro número uma semana depois. Registre o hash da base em cada run.
+3. **Comparar runs com cortes diferentes.** Filtre por `tags.data_corte` antes de comparar.
+4. **Escolher o melhor de 40 configs pelo teste.** Isso ajusta o modelo ao teste. Selecione em folds de validação (walk-forward dentro do treino) e use o teste uma vez, no fim.
+5. **`artifact_path=` em código novo.** No MLflow 3, o parâmetro do `log_model` é `name=`.
+6. **Porta 5000 ocupada no macOS.** Use `mlflow ui --port 5001`.
+7. **Segmentation fault ao carregar o modelo.** Observamos no macOS, num ambiente com várias cópias da biblioteca OpenMP (de pacotes como scikit-learn, torch e faiss): `mlflow.lightgbm.load_model` derrubava o processo quando o `lightgbm` ainda não tinha sido importado. Um `import lightgbm` explícito no topo do script resolveu.
+8. **Commitar `mlflow.db` e `mlruns/`.** São grandes e mudam a cada run. Vão para o `.gitignore`; o que vai para o git são o código, as configs e o `HIPOTESES.md`.
+:::
+
+<Quiz
+  id="m2-a5"
+  perguntas={[
+    {
+      pergunta: 'Para que um número do README seja reproduzível, o que precisa estar registrado? (marque todas)',
+      multipla: true,
+      opcoes: [
+        {texto: 'O commit do código.', correta: true, explicacao: 'Sem ele, você não sabe qual versão das features e das métricas produziu o número.'},
+        {texto: 'A configuração completa (features, corte, gap, seed, hiperparâmetros).', correta: true, explicacao: 'É o que define a rodada.'},
+        {texto: 'A versão (ou o hash) da base de dados.', correta: true, explicacao: 'A mesma config com outra coleta dá outro número.'},
+        {texto: 'Um print da tela da UI do MLflow.', explicacao: 'Um print mostra o resultado, mas não permite reproduzi-lo.'},
+      ],
+    },
+    {
+      pergunta: 'Como registrar o modelo LightGBM no MLflow 3.16?',
+      opcoes: [
+        {texto: '`mlflow.lightgbm.log_model(modelo, artifact_path="modelo")`', explicacao: 'É a forma antiga. No MLflow 3, o parâmetro que nomeia o modelo é `name`.'},
+        {texto: '`mlflow.lightgbm.log_model(modelo, name="modelo")`', correta: true, explicacao: 'Exato. O retorno traz o `model_uri` (models:/...) para carregar o modelo depois.'},
+        {texto: '`mlflow.log_artifact("modelo.pkl")`', explicacao: 'Funciona como arquivo solto, mas perde a assinatura, o exemplo de entrada e o carregamento pelo flavor.'},
+      ],
+    },
+    {
+      pergunta: 'Você rodou 40 configurações e escolheu a de maior par-a-par no **teste**. Qual é o problema?',
+      opcoes: [
+        {texto: 'Nenhum, se todas usaram o mesmo teste.', explicacao: 'Justamente por usar o mesmo teste 40 vezes, a melhor tende a ser a que teve mais sorte nele.'},
+        {texto: 'A seleção ajusta o modelo ao teste: o número do vencedor fica otimista. Selecione em validação e use o teste uma vez.', correta: true, explicacao: 'Exato. É o mesmo vazamento, agora na seleção de modelos.'},
+        {texto: 'O MLflow não aceita mais de 20 runs por experimento.', explicacao: 'Não existe esse limite.'},
+      ],
+    },
+    {
+      pergunta: 'Qual teste automático pega uma feature de canal calculada com o próprio post ou com o futuro?',
+      opcoes: [
+        {texto: 'Um teste que compara a métrica com a de um run anterior.', explicacao: 'Métrica maior não prova vazamento, e vazamentos sutis mudam pouco a métrica.'},
+        {texto: 'Um teste de perturbação: mudar o alvo de um post e conferir que as features dele e dos anteriores não mudam.', correta: true, explicacao: 'Exato. É a auditoria da linha do tempo transformada em teste.'},
+        {texto: 'Um teste que confere se não há valores nulos nas features.', explicacao: 'Útil, mas não detecta uso do futuro.'},
+      ],
+    },
+  ]}
+/>
+
+---
+
+## Exercício
+
+:::tip[Exercício: hipótese H2 do começo ao fim]
+1. Escreva no `HIPOTESES.md` uma H2: *"o horário de publicação, sozinho, melhora o modelo só-canal"*, com métrica, limiar e controle definidos antes.
+2. Crie `configs/so_canal_hora.yaml` e rode o treino.
+3. Rode o `comparar.py` e anote a decisão na H2.
+:::
+
+<details>
+<summary>Ver uma solução</summary>
+
+```yaml title="configs/so_canal_hora.yaml"
+nome: so-canal-mais-hora
+hipotese: "H2: a hora de publicação sobe o par-a-par intra-canal do modelo só-canal em >= 0,03"
+versao_base: sintetica-v1
+data_corte: "2026-03-01"
+gap_dias: 30
+seed: 42
+features: [log_inscritos, mediana_canal, media_ult5, n_anteriores, hora]
+lgbm: {n_estimators: 300, learning_rate: 0.03, num_leaves: 15}
+```
+
+```bash
+uv run python -m experimentos.treinar configs/so_canal_hora.yaml
+uv run python -m experimentos.comparar
+```
+
+```text
+                run n_feat  mae_log  sp_intra  par_a_par         base  commit
+canal-mais-conteudo     11    0.733     0.163      0.555 9d8d1d86d195 sem-git
+ so-canal-mais-hora      5    0.774    -0.075      0.472 9d8d1d86d195 sem-git
+           so-canal      4    0.777    -0.104      0.456 9d8d1d86d195 sem-git
+```
+
+A hora soma +0,016 no par-a-par (de 0,456 para 0,472), abaixo do limiar de +0,03: pela regra escrita antes, a H2 é **rejeitada**, mesmo com a métrica tendo subido. Na base sintética, o horário nobre tem um efeito real (+0,12 em log), mas pequeno perto do ruído de post a post. Uma decisão possível: "rejeitada como bloco isolado; manter a feature no modelo completo e reavaliar na ablação". Anote exatamente isso na H2.
+
+</details>
+
+---
+
+## Resumo
+
+- Um experimento é **hipótese + config + commit + versão da base + resultado**; sem um deles, é anedota.
+- Escreva a **hipótese com métrica, limiar e controle antes de rodar**, para não escolher o recorte depois.
+- **Config em YAML** carregada numa **dataclass**; **seeds** fixadas; **hash da base** registrado.
+- No **MLflow 3**: `set_experiment`, `start_run`, `log_params`, `log_metrics`, `set_tags` e `log_model(..., name="modelo")`; compare com `search_runs` filtrando pelo corte.
+- **pytest** protege o que gera os números: métricas, splits e o **teste de perturbação** das features.
+
+## Referências
+
+- MLflow. [ML Experiment Tracking](https://mlflow.org/docs/latest/ml/tracking/) e [Search Runs](https://mlflow.org/docs/latest/ml/search/search-runs/): conceitos de runs, params, metrics, tags e a sintaxe de `filter_string`.
+- MLflow. [MLflow 3 Migration Guide](https://mlflow.org/docs/latest/ml/mlflow-3/): `name` no lugar de `artifact_path` e o modelo como entidade própria.
+- MLflow. [`mlflow.lightgbm`](https://mlflow.org/docs/latest/api_reference/python_api/mlflow.lightgbm.html): `log_model`, `load_model` e `autolog`.
+- Gelman e Loken. [*The garden of forking paths*](http://www.stat.columbia.edu/~gelman/research/unpublished/forking.pdf), 2013. Por que decidir a análise depois de ver os dados produz falsos positivos.
+- Sculley et al. [*Hidden Technical Debt in Machine Learning Systems*](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html). NeurIPS, 2015.
+- [pytest](https://docs.pytest.org/en/stable/): fixtures e configuração via `pyproject.toml`.
+
+**Próxima aula:** [Análise de erros e ablação](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/analise-de-erros-e-ablacao): onde o modelo erra, quanto cada bloco de features vale e como saber se uma diferença pequena é real.

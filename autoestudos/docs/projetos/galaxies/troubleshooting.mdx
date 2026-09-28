@@ -1,0 +1,384 @@
+---
+sidebar_position: 8
+sidebar_label: 'Troubleshooting'
+title: 'Troubleshooting: erros comuns e como sair deles'
+description: 'Soluções para os erros mais comuns do case Galaxies: cota da YouTube API, 429 do Gemini, yt-dlp, Colab e T4, conflitos de versão do MCP, SHAP, MediaPipe, pandas 3 e métricas boas demais.'
+---
+
+# Troubleshooting: Erros Comuns e Como Sair Deles
+
+Procure a mensagem de erro com a busca do site (canto superior direito) ou navegue pelas seções. Cada item diz **a causa provável** e **o que fazer**.
+
+---
+
+## Coleta (YouTube Data API)
+
+<details>
+<summary><strong>HTTP 403 <code>quotaExceeded</code></strong></summary>
+
+**Causa:** a cota diária do projeto (10.000 unidades) acabou.
+
+**O que fazer**
+- Espere o reset: meia-noite no horário do Pacífico, ou seja, 4h ou 5h da manhã em Brasília.
+- Confira se você não está listando vídeos com `search.list`. Use a playlist de uploads, como mostra a [aula do coletor](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor).
+- Faça o coletor **idempotente e incremental**, para que ele continue de onde parou no dia seguinte.
+- **Não** crie vários projetos para somar cotas: isso viola as políticas da API.
+
+</details>
+
+<details>
+<summary><strong>HTTP 403 <code>rateLimitExceeded</code> ou erros 5xx intermitentes</strong></summary>
+
+**Causa:** requisições rápidas demais ou instabilidade temporária.
+
+**O que fazer:** retry com backoff exponencial e jitter (`tenacity`), sem paralelizar agressivamente. Faça retry só em erros transitórios; `quotaExceeded` não se resolve com retry.
+
+</details>
+
+<details>
+<summary><strong>Vídeo sem <code>likeCount</code></strong></summary>
+
+**Causa:** o dono do canal pode ocultar a contagem de curtidas.
+
+**O que fazer:** trate como **ausente** (NaN), nunca como zero. Registre quantos foram excluídos no data card.
+
+</details>
+
+<details>
+<summary><strong>"Quantos dos meus vídeos são Shorts?"</strong></summary>
+
+**Causa:** a API não tem um campo `isShort`.
+
+**O que fazer:** use duração ≤ 180 s (desde out/2024) como regra principal e documente a heurística. Os truques não oficiais (playlist `UUSH…`, redirect de `/shorts/ID`) podem quebrar sem aviso.
+
+</details>
+
+---
+
+## Mídia e multimodal
+
+<details>
+<summary><strong>yt-dlp: "Sign in to confirm you're not a bot"</strong></summary>
+
+**Causa:** o YouTube bloqueia IPs de datacenter, como os do Colab e do Kaggle.
+
+**O que fazer**
+- Rode o download numa máquina com IP residencial.
+- Use concorrência 1 ou 2 e pausas de 5 a 10 s entre downloads.
+- Baixe em 360p.
+- Mantenha o yt-dlp atualizado.
+- Evite usar cookies da sua conta principal: há risco de bloqueio da conta.
+- Para a etapa do VLM, o Gemini aceita **URL pública do YouTube direto**, sem download.
+
+Antes de tudo, leia a discussão sobre termos de uso na [aula 1.8](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos).
+
+</details>
+
+<details>
+<summary><strong>yt-dlp reclama de runtime JavaScript ou de PO token</strong></summary>
+
+**Causa:** desde 2025/2026, o yt-dlp precisa de um runtime JS para resolver os desafios do YouTube.
+
+**O que fazer**
+- Instale o **Deno** e atualize com `pip install -U "yt-dlp[default]"`.
+- Alguns clientes (web, mweb) exigem PO tokens para certos formatos. Consulte o [guia de PO token do yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
+
+</details>
+
+<details>
+<summary><strong>yt-dlp baixa Shorts em 144×256 quando pedi 360p</strong></summary>
+
+**Causa:** para vídeos verticais, o filtro `height<=360` compara a altura real (o lado longo), então `-f "bv*[height<=360]+ba"` acaba escolhendo 144×256.
+
+**O que fazer:** ordene por resolução com `-S "res:360"`, que escolhe 360×640. Veja a [aula Obtendo a mídia](/aulas/ml-preditivo-e-agentes/do-video-as-features/obtendo-a-midia).
+
+</details>
+
+<details>
+<summary><strong>transformers 5: <code>get_image_features</code> não devolve mais um tensor</strong></summary>
+
+**Causa:** no transformers 5.x, `get_image_features` e `get_text_features` devolvem um objeto. Exemplos de model cards escritos para a versão 4 quebram.
+
+**O que fazer:** pegue o vetor em `.pooler_output`. Veja a [aula de embeddings visuais](/aulas/ml-preditivo-e-agentes/do-video-as-features/embeddings-visuais).
+
+</details>
+
+<details>
+<summary><strong>Gemini: 429 / <code>RESOURCE_EXHAUSTED</code></strong></summary>
+
+**Causa:** limite de requisições por minuto ou por dia do free tier.
+
+**O que fazer**
+- Capture `google.genai.errors.ClientError` com `code == 429`.
+- Faça backoff exponencial e diminua a concorrência.
+- **Cacheie** cada resposta por `video_id`.
+- Confira seus limites no AI Studio: eles não são mais publicados em número e mudam sem aviso.
+- Tenha um **fallback local** (Qwen3-VL, Gemma 4, SmolVLM2) para terminar a base.
+
+</details>
+
+<details>
+<summary><strong>O VLM devolve JSON inválido ou campos fora da escala</strong></summary>
+
+**O que fazer**
+- Use **structured output** com schema Pydantic (`Field(ge=0, le=10)`, `Literal[...]`) e temperatura 0.
+- Valide toda resposta. Se falhar, repita uma vez e depois marque a extração como falha, com uma flag que vira feature.
+- Veja a [aula do VLM](/aulas/ml-preditivo-e-agentes/do-video-as-features/vlm-como-extrator-estruturado).
+
+</details>
+
+<details>
+<summary><strong><code>AttributeError: module 'mediapipe' has no attribute 'solutions'</code></strong></summary>
+
+**Causa:** o MediaPipe removeu a API legada `mp.solutions`.
+
+**O que fazer:** use a **Tasks API** (`mediapipe.tasks.python.vision.FaceDetector`) com o modelo `.tflite` baixado. Veja a [aula de detectores](/aulas/ml-preditivo-e-agentes/do-video-as-features/detectores-leves).
+
+</details>
+
+<details>
+<summary><strong>MediaPipe aborta no Mac (<code>Check failed: service_ Service is unavailable</code>)</strong></summary>
+
+**Causa:** o `FaceDetector` do MediaPipe 1.0.1 aborta no macOS com Apple Silicon, mesmo com delegate de CPU.
+
+**O que fazer:** rode a etapa de detecção de rosto no **Colab** ou em Linux. Num contêiner `python:3.12-slim`, instale `libegl1 libgles2 libgl1` e use o `opencv-python-headless`.
+
+</details>
+
+<details>
+<summary><strong>librosa não consegue abrir o <code>.mp4</code></strong></summary>
+
+**Causa:** a librosa 1.0 não lê o áudio de dentro de contêineres de vídeo.
+
+**O que fazer:** extraia o áudio antes com ffmpeg (`ffmpeg -i video.mp4 -ac 1 -ar 16000 audio.wav`) e leia o WAV. Veja a [aula de áudio e fala](/aulas/ml-preditivo-e-agentes/do-video-as-features/audio-e-fala).
+
+</details>
+
+<details>
+<summary><strong>Gemini: <code>resp.parsed</code> vem <code>None</code> sem erro nenhum</strong></summary>
+
+**Causa:** no `google-genai` 2.25, quando o JSON devolvido viola o schema Pydantic, `resp.parsed` vira `None` silenciosamente.
+
+**O que fazer:** sempre confira `resp.parsed is None`. Nesse caso, valide `resp.text` com `Rubrica.model_validate_json(...)` para ver o erro, tente de novo uma vez e marque a extração como falha.
+
+</details>
+
+<details>
+<summary><strong>Código do PySceneDetect de um tutorial não funciona</strong></summary>
+
+**Causa:** a versão 0.7 mudou a API de timestamps.
+
+**O que fazer:** fixe `scenedetect==0.7.1` e siga a [aula de frames e cortes](/aulas/ml-preditivo-e-agentes/do-video-as-features/frames-cortes-e-sinais).
+
+</details>
+
+<details>
+<summary><strong>Colab desconectou no meio da extração</strong></summary>
+
+**Causa:** sessões do Colab gratuito caem, em torno de 12 h ou antes, por inatividade.
+
+**O que fazer**
+- Salve **cada etapa por vídeo** no Google Drive, em Parquet ou JSON por `video_id`.
+- Faça o pipeline pular o que já existe.
+- Processe em lotes.
+
+Assim, uma queda custa minutos, não horas.
+
+</details>
+
+<details>
+<summary><strong>Erro de Flash Attention ou falta de memória na T4</strong></summary>
+
+**Causa:** a T4 (Colab/Kaggle) não suporta Flash Attention 2.
+
+**O que fazer**
+- Carregue o modelo com `attn_implementation="eager"` (ou `"sdpa"`) e quantização em 4 bits.
+- Reduza o número de frames e a resolução.
+- Use o menor modelo que responde bem a rubrica.
+
+</details>
+
+---
+
+## Ambiente e versões
+
+<details>
+<summary><strong><code>ImportError: cannot import name 'FastMCP' from 'mcp.server.fastmcp'</code></strong></summary>
+
+**Causa:** você instalou o SDK oficial `mcp` 2.x, que renomeou `FastMCP` para `MCPServer`, sem alias.
+
+**O que fazer:** fixe `mcp==1.30.0` e `fastmcp==3.4.7`, compatíveis com `langchain-mcp-adapters==0.3.2`, que exige `mcp<2`. Veja a [stack 2026](/projetos/galaxies/stack-2026).
+
+</details>
+
+<details>
+<summary><strong>Cada chamada MCP pelo <code>langchain-mcp-adapters</code> demora ~10 s</strong></summary>
+
+**Causa:** sem sessão explícita, o `MultiServerMCPClient` abre uma sessão nova (um processo novo, no caso de stdio) a cada chamada de tool.
+
+**O que fazer:** abra a sessão uma vez com `async with client.session("galaxies") as sessao:` e carregue as tools dela. Nos testes da trilha, o tempo caiu de ~10 s para ~0,6 s por chamada.
+
+</details>
+
+<details>
+<summary><strong>MCP Inspector não acha o meu pacote</strong></summary>
+
+**Causa:** o Inspector v2 não repassa o `-m` do Python e não herda o `PYTHONPATH`.
+
+**O que fazer:** aponte o comando para um script (ou `uv run python caminho/servidor.py`) e passe variáveis com `-e PYTHONPATH=...`. Veja a [aula MCP do zero](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/mcp-do-zero).
+
+</details>
+
+<details>
+<summary><strong>O resolvedor de dependências não encontra versão compatível de <code>mcp</code></strong></summary>
+
+**Causa:** você pediu FastMCP 4.x junto com `langchain-mcp-adapters`.
+
+**O que fazer:** fique com FastMCP 3.4.7 ou rode o servidor MCP num ambiente separado do agente.
+
+</details>
+
+<details>
+<summary><strong><code>pip install shap</code> falha</strong></summary>
+
+**Causa:** o SHAP 0.52 exige **Python ≥ 3.12**.
+
+**O que fazer:** crie o ambiente com `uv init --python 3.12` (ou `uv venv --python 3.12`).
+
+</details>
+
+<details>
+<summary><strong>LightGBM no macOS: <code>Library not loaded: ... libomp.dylib</code></strong></summary>
+
+**O que fazer:** `brew install libomp` e reinstale o LightGBM.
+
+</details>
+
+<details>
+<summary><strong><code>ImportError: cannot import name 'MapieRegressor'</code></strong></summary>
+
+**Causa:** o MAPIE 1.x reescreveu a API.
+
+**O que fazer**
+- Use `SplitConformalRegressor` ou `ConformalizedQuantileRegressor`, com o fluxo `fit` → `conformalize` → `predict_interval`.
+- O helper `train_conformalize_test_split` é **aleatório**: separe treino, calibração e teste **por data**.
+- Veja a [aula de conformal](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade/predicao-conformal).
+
+</details>
+
+<details>
+<summary><strong>Aviso de descontinuação de <code>create_react_agent</code></strong></summary>
+
+**O que fazer:** use `from langchain.agents import create_agent`, ou um `StateGraph` para o fluxo determinístico. Veja a [aula de LangGraph](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/langgraph-em-2026).
+
+</details>
+
+<details>
+<summary><strong><code>mlflow ui</code> não abre no macOS (porta 5000 ocupada)</strong></summary>
+
+**Causa:** o Receptor AirPlay do macOS usa a porta 5000.
+
+**O que fazer:** rode `mlflow ui --port 5001`, ou desative o Receptor AirPlay nas configurações do sistema.
+
+</details>
+
+<details>
+<summary><strong>MLflow avisa que <code>artifact_path</code> está descontinuado</strong></summary>
+
+**O que fazer:** no MLflow 3, use `mlflow.<flavor>.log_model(model, name="modelo")`.
+
+</details>
+
+<details>
+<summary><strong>Segfault no macOS ao usar LightGBM junto com torch (ou ao carregar modelo do MLflow)</strong></summary>
+
+**Causa provável:** conflito entre as bibliotecas OpenMP que o LightGBM e o PyTorch carregam no mesmo processo.
+
+**O que fazer**
+- Importe o `lightgbm` **antes** do `torch`.
+- Se o processo cair ao carregar o modelo pelo MLflow, importe `lightgbm` antes de `mlflow.lightgbm.load_model`.
+- Em último caso, extraia os embeddings (torch) num processo e treine o GBM em outro. O cache em disco por `video_id` já deixa isso natural.
+
+</details>
+
+<details>
+<summary><strong>Segfault ao usar FAISS e LightGBM no mesmo processo (macOS)</strong></summary>
+
+**Causa:** as duas bibliotecas trazem runtimes OpenMP que conflitam.
+
+**O que fazer:** defina `OMP_NUM_THREADS=1` antes de importá-las (por exemplo, no topo do `__init__.py` do seu pacote: `os.environ.setdefault("OMP_NUM_THREADS", "1")`). Veja a [aula de comparáveis](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp/comparaveis).
+
+</details>
+
+<details>
+<summary><strong>pandas 3: coluna booleana virou <code>object</code> depois do join</strong></summary>
+
+**Causa:** num `left join`, uma coluna `bool` que recebe `NaN` (vídeos sem aquela etapa) vira `object`.
+
+**O que fazer:** converta para o tipo anulável `boolean` antes do join, ou para `float` (0/1/NaN), que o GBM entende.
+
+</details>
+
+<details>
+<summary><strong>pandas 3: atribuição não tem efeito ou <code>ChainedAssignmentError</code></strong></summary>
+
+**Causa:** o Copy-on-Write é padrão no pandas 3, então `df[df.x > 0]["y"] = 1` não altera `df`.
+
+**O que fazer:** use `df.loc[df.x > 0, "y"] = 1`.
+
+</details>
+
+---
+
+## Resultados estranhos
+
+<details>
+<summary><strong>Minhas métricas estão boas demais (ex.: Spearman 0,95 intra-canal)</strong></summary>
+
+A literatura espera um Spearman de cerca de 0,55 a 0,85 antes da publicação, e o intra-canal costuma ser menor que o global. Números muito acima disso quase sempre são **vazamento**. Confira:
+
+1. Views, comentários ou qualquer métrica pós-publicação entraram como feature?
+2. As estatísticas do canal usam só posts **anteriores**?
+3. O split é temporal? Não há CV aleatório?
+4. PCA, scaler ou encoder foram ajustados só no treino?
+5. Há reuploads ou duplicatas do mesmo vídeo?
+
+Veja [Vazamento de dados](/aulas/ml-preditivo-e-agentes/avaliacao-honesta/vazamento-de-dados).
+
+</details>
+
+<details>
+<summary><strong>Meu modelo não bate o baseline</strong></summary>
+
+A mediana do canal é um baseline **forte**: ela sozinha explica boa parte do nível de curtidas. Tente:
+
+1. Prever o **alvo relativo ao canal**, e não o absoluto.
+2. Features de histórico mais ricas: tendência recente e cadência de postagem.
+3. **Early stopping** com validação temporal, para evitar overfitting.
+4. Medir ordenação **intra-canal**: o ganho do conteúdo aparece mais aí.
+5. Conferir se a base tem vídeos suficientes por canal.
+
+Se ainda assim não bater, reporte com honestidade e analise onde o baseline ganha. Isso também é um resultado.
+
+</details>
+
+<details>
+<summary><strong>A cobertura do meu intervalo de 80% deu 65% no teste</strong></summary>
+
+**Causa:** intervalos quantílicos sem calibração tendem a subcobrir. Com drift temporal, até o conformal perde cobertura.
+
+**O que fazer**
+- Calibre com **conformal**, usando a fatia temporal mais recente antes do teste.
+- Meça a cobertura **por setor**.
+- Considere recalibrar com frequência (veja [conformal adaptativo](/aulas/ml-preditivo-e-agentes/ir-alem/conformal-adaptativo)).
+
+</details>
+
+<details>
+<summary><strong>Minhas views dão um salto em 2025</strong></summary>
+
+**Causa:** em 31/03/2025, o YouTube mudou a forma de contar views de Shorts, e replays passaram a contar. Houve nova mudança em 24/08/2026 (a view passou a contar desde o primeiro frame).
+
+**O que fazer:** prefira **curtidas** como alvo ou trate as datas como quebras de regime. Veja [O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente).
+
+</details>

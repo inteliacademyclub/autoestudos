@@ -1,0 +1,143 @@
+---
+sidebar_position: 3
+sidebar_label: 'Monte sua base'
+title: 'Monte sua base de Shorts'
+description: 'Guia prático, do zero à base documentada: chave da YouTube Data API, curadoria de canais, coleta, filtros, armazenamento, atualização e data card.'
+---
+
+import QuotaCalculator from '@site/src/components/interativos/QuotaCalculator';
+
+# Monte sua Base de Shorts: o Passo a Passo
+
+Neste case **você monta a própria base**. Este guia é o roteiro prático. A teoria e o código completo de cada etapa estão nas aulas do [módulo 1](/aulas/ml-preditivo-e-agentes/formulacao-e-dados), sempre linkadas.
+
+<Sketch name="galaxies/base-passo-a-passo" alt="Sete passos: chave da API, curadoria de 60+ canais, coletor pela playlist de uploads, filtros de Shorts e idade, armazenamento em Parquet com data de coleta, atualização das estatísticas e data card. A coleta se repete todo dia até a cota." caption="A coleta é um processo diário, não um script que roda uma vez." />
+
+:::info[Metas do briefing]
+- **5.000 a 15.000 Shorts**, de **60+ canais**, em pelo menos **2 setores** (moda, beleza, automotivo).
+- Vídeos com **idade ≥ 30 dias** na data da coleta, para que as métricas estejam estabilizadas.
+- **Data de coleta registrada** em toda linha.
+
+Se ficar abaixo da meta, **documente** e explique no data card. Uma base menor e honesta vale mais que uma grande e mal documentada.
+:::
+
+---
+
+## Passo 1 · Crie a chave da API
+
+1. No [Google Cloud Console](https://console.cloud.google.com/), crie um projeto, por exemplo `galaxies-<seu-nome>`.
+2. Em **APIs e serviços → Biblioteca**, procure **YouTube Data API v3** e clique em **Ativar**.
+3. Em **APIs e serviços → Credenciais → Criar credenciais → Chave de API**.
+4. **Restrinja a chave** à YouTube Data API v3.
+5. Guarde a chave em `.env` (`YOUTUBE_API_KEY=...`) e coloque `.env` no `.gitignore`. **Nunca** faça commit da chave.
+
+Teste com uma chamada que custa 1 unidade:
+
+```python
+import os
+from googleapiclient.discovery import build  # google-api-python-client==2.200.0
+
+youtube = build("youtube", "v3", developerKey=os.environ["YOUTUBE_API_KEY"])
+resp = youtube.channels().list(part="snippet,statistics,contentDetails", forHandle="@YouTube").execute()
+canal = resp["items"][0]
+print(canal["id"], canal["snippet"]["title"], canal["statistics"].get("subscriberCount"))
+print("uploads:", canal["contentDetails"]["relatedPlaylists"]["uploads"])  # UU… = UC… sem o "C"
+```
+
+:::warning[Cota por projeto, não por pessoa]
+A cota padrão é de **10.000 unidades por dia por projeto do Google Cloud**, zerada à meia-noite no horário do Pacífico (4h ou 5h da manhã no horário de Brasília). Cada aluno deve usar o **próprio** projeto.
+:::
+
+---
+
+## Passo 2 · Faça a curadoria dos canais
+
+Aula: [Curadoria de canais](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/curadoria-de-canais).
+
+Monte uma planilha **antes** de coletar. Sugestão de colunas:
+
+| handle | channel_id | setor | tipo | inscritos | país/idioma | nº de vídeos | posta Shorts? | incluir? | motivo |
+| :--- | :--- | :--- | :--- | ---: | :--- | ---: | :---: | :---: | :--- |
+| @exemplo | UC… | beleza | marca | 180000 | BR/pt | 950 | sim | sim | ativo, Shorts semanais |
+
+- **Misture tamanhos.** Se só entrarem canais enormes, o modelo nunca aprende o que acontece num canal de 20 mil inscritos.
+- **Misture marcas oficiais e criadores.** Eles se comportam de forma diferente, e a Galaxies atende marcas.
+- **Descubra canais sem gastar `search.list`.** Desde 01/06/2026 ele tem um balde próprio de apenas 100 chamadas por dia. Prefira handles conhecidos, colaborações citadas em descrições e listas curadas por você.
+
+---
+
+## Passo 3 · Rode o coletor
+
+Aula: [Construindo o coletor](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor).
+
+O fluxo barato é: `channels.list` → playlist de uploads (`UU…`) → `playlistItems.list` (50 por página) → `videos.list` (50 IDs por chamada, com `snippet,contentDetails,statistics`). **Não use `search.list` para listar vídeos**: além do balde de 100 chamadas por dia, uma busca por canal devolve no máximo 500 vídeos.
+
+<QuotaCalculator />
+
+---
+
+## Passo 4 · Filtre o que não é Short (e o que é recente demais)
+
+- **Shorts:** a API não tem um campo `isShort`. Desde 15/10/2024, vídeos verticais de até 3 minutos são Shorts; antes, o limite era 60 s. Use `contentDetails.duration` (ISO 8601) com o limite da época e a orientação do vídeo (a aula 1.5 mostra como), e documente a heurística.
+- **Idade:** descarte vídeos com menos de 30 dias na data da coleta. Guarde-os para coletar de novo depois.
+- **Likes nulos:** alguns canais escondem a contagem. Trate como ausente, **nunca como zero**.
+- **Duplicatas:** a chave é `video_id`. A mesma coleta rodando duas vezes não pode duplicar linhas.
+
+---
+
+## Passo 5 · Salve com a data de coleta
+
+Sugestão de organização:
+
+```text
+data/
+├─ canais.csv                     # sua curadoria (versionada no git)
+├─ raw/
+│  └─ coleta=2026-09-28/
+│     ├─ canais.parquet           # snapshot de inscritos nesse dia
+│     └─ videos.parquet           # uma linha por vídeo, com collected_at
+├─ processed/
+│  └─ base_v1.parquet             # filtrada, deduplicada, pronta para modelar
+└─ media/<video_id>/              # thumbnail, frames, áudio (NÃO versionar)
+```
+
+Registre **em toda linha** `collected_at` e as estatísticas do canal **naquele dia**. A [aula O tempo mente](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/o-tempo-mente) explica por que inscritos "de hoje" não são inscritos "do dia do post".
+
+---
+
+## Passo 6 · Atualize as estatísticas
+
+As métricas mudam, e as políticas da API pedem que dados armazenados sejam mantidos atualizados (e não guardados por mais de 30 dias sem refresh). Veja a [aula de documentação, ética e termos](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/documentacao-etica-e-termos).
+
+Na prática:
+
+- Antes do treino final, **recolete as estatísticas** dos vídeos da base com `videos.list` (50 IDs por chamada, 1 unidade).
+- Desde 03/06/2026 existe também `videos.batchGetStats`, que devolve só estatísticas e detalhes de conteúdo e tem **balde de cota próprio** (10.000 unidades/dia), separado da cota geral. É o jeito mais barato de manter as métricas atualizadas. Confira os detalhes na [página de custos da API](https://developers.google.com/youtube/v3/determine_quota_cost).
+- Guarde **cada** coleta com sua data. Nunca sobrescreva: isso é o que permite reproduzir o experimento.
+
+---
+
+## Passo 7 · Documente (data card)
+
+Use o [template de data card](/projetos/galaxies/templates#data-card). Ele precisa responder:
+
+- **Origem e método:** API, endpoints, filtros, heurística de Shorts.
+- **Período** dos vídeos e **datas** das coletas.
+- **Volume:** vídeos, canais, por setor e por faixa de tamanho.
+- **Termos de uso** e como você os respeita.
+- **O que a base NÃO representa.** Por exemplo: canais pequenos, outras plataformas, anúncios pagos, conteúdo em outros idiomas, o período antes das mudanças de contagem de views.
+
+<Checklist
+  id="galaxies-base"
+  titulo="Sua base está pronta quando…"
+  itens={[
+    'Chave criada, restrita e fora do git',
+    'Planilha de curadoria com 60+ canais e o motivo de cada inclusão/exclusão',
+    'Coletor idempotente (rodar duas vezes não duplica) e com controle de cota',
+    'Heurística de Shorts documentada e aplicada',
+    'Só vídeos com ≥ 30 dias na data da coleta',
+    'Toda linha com `collected_at` e snapshot do canal',
+    'Recoleta de estatísticas feita antes do treino final',
+    'Data card preenchido, incluindo o que a base não representa',
+  ]}
+/>

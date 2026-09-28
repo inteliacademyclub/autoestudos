@@ -1,0 +1,140 @@
+---
+sidebar_position: 2
+sidebar_label: 'Roadmap de 4 semanas'
+title: 'Roadmap de 4 semanas'
+description: 'O que fazer em cada semana do case Galaxies, com checkpoints, a aula certa para cada etapa e o que priorizar se o tempo apertar.'
+---
+
+import PipelineMap from '@site/src/components/interativos/PipelineMap';
+
+# Roadmap: do Kickoff (23/09) à Entrega (23/10)
+
+O projeto tem quatro semanas e uma dependência forte: **sem base não há modelo, e sem modelo o agente só embrulha um chute**. O roteiro abaixo segue essa ordem. Cada semana tem uma **definição de pronto**. Marque os itens: o progresso fica salvo no seu navegador.
+
+<PipelineMap />
+
+---
+
+## Semana 1 · 23/09 a 29/09 · Problema e base
+
+**Objetivo:** ter uma base de Shorts coletando todos os dias e um alvo bem definido.
+
+Leia: [módulo 1](/aulas/ml-preditivo-e-agentes/formulacao-e-dados), com prioridade para as aulas [1.3](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/fontes-de-dados-e-plano-da-base), [1.4](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/curadoria-de-canais) e [1.5](/aulas/ml-preditivo-e-agentes/formulacao-e-dados/construindo-o-coletor). Depois o [guia Monte sua base](/projetos/galaxies/monte-sua-base).
+
+<Checklist
+  id="galaxies-semana-1"
+  titulo="Pronto quando…"
+  itens={[
+    {texto: 'Problema escrito no README (decisão, unidade, momento da previsão, alvo, métrica de sucesso)', detalhe: 'Exercício da aula 1.1.'},
+    'Chave da YouTube Data API criada e testada',
+    {texto: 'Lista curada com **60+ canais** de pelo menos 2 setores', detalhe: 'Mix de marcas e criadores, tamanhos variados.'},
+    {texto: 'Coletor rodando com paginação, retry e controle de cota', detalhe: 'Salvando Parquet com `collected_at`.'},
+    'Primeira coleta completa salva (mesmo que parcial em canais)',
+    'Filtro de Shorts e de idade ≥ 30 dias aplicado',
+    {texto: 'Alvo definido: `log1p(curtidas)` ou relativo ao canal', detalhe: 'E por que não views (aula 1.7).'},
+    'Rascunho do data card (origem, período, volume, termos, limites)',
+  ]}
+/>
+
+:::tip[Enquanto a coleta roda]
+Use o SMTPD (aula 1.3) para praticar pandas, alvo em log e baselines. Só não confunda: ele é majoritariamente **long-form**. Os resultados finais precisam vir da **sua** base de Shorts.
+:::
+
+---
+
+## Semana 2 · 30/09 a 06/10 · Avaliação honesta e modelo tabular
+
+**Objetivo:** um GBM com metadados + texto (Opção A) que **bate o baseline em validação temporal**, com tudo registrado.
+
+Leia: [módulo 2](/aulas/ml-preditivo-e-agentes/avaliacao-honesta) e [módulo 3](/aulas/ml-preditivo-e-agentes/gradient-boosting). No fim da semana, comece a [aula 4.1](/aulas/ml-preditivo-e-agentes/do-video-as-features/anatomia-de-um-short).
+
+<Checklist
+  id="galaxies-semana-2"
+  titulo="Pronto quando…"
+  itens={[
+    {texto: 'Split temporal implementado (e split por canal para "cliente novo")', detalhe: 'Nada de CV aleatório como métrica final.'},
+    'Baseline "mediana histórica do canal" com MAE (log), Spearman e par-a-par',
+    {texto: 'Features de canal e tempo **sem vazamento** (shift + expanding)', detalhe: 'Com um teste que prova isso.'},
+    'Features de texto (comprimento, hashtags, CTA + embeddings com PCA ajustado só no treino)',
+    'LightGBM ou CatBoost (Opção A) batendo o baseline no teste temporal',
+    'Runs no MLflow com parâmetros, métricas, data de corte e versão da base',
+    'Download de thumbnails e cache por `video_id` começando',
+  ]}
+/>
+
+---
+
+## Semana 3 · 07/10 a 13/10 · Multimodal, incerteza e explicação
+
+**Objetivo:** medir quanto a camada multimodal ajuda e dar a cada previsão um intervalo e um "porquê".
+
+Leia: [módulo 4](/aulas/ml-preditivo-e-agentes/do-video-as-features) e [módulo 5](/aulas/ml-preditivo-e-agentes/incerteza-e-explicabilidade).
+
+<Checklist
+  id="galaxies-semana-3"
+  titulo="Pronto quando…"
+  itens={[
+    {texto: 'Camada 1 (100% offline): frames, SigLIP/CLIP, Whisper, detectores, OpenCV', detalhe: 'Na base toda ou numa amostra justificada.'},
+    {texto: 'Camada 2: VLM respondendo a rubrica em JSON (Pydantic)', detalhe: 'Gemini free tier ou modelo local, com backoff e cache.'},
+    'Ablação por blocos (meta → +texto → +visual → +VLM) com bootstrap pareado',
+    'Intervalo de 80% (quantis + conformal) com cobertura medida no teste',
+    '`confidence_flag` com regras e motivos',
+    '`top_drivers` via SHAP no formato do contrato',
+    'Análise de erros: onde e por que o modelo erra',
+  ]}
+/>
+
+---
+
+## Semana 4 · 14/10 a 20/10 · Agente, MCP e demo
+
+**Objetivo:** tudo embrulhado como tool, testado e demonstrável.
+
+Leia: [módulo 6](/aulas/ml-preditivo-e-agentes/agente-preditivo-e-mcp).
+
+<Checklist
+  id="galaxies-semana-4"
+  titulo="Pronto quando…"
+  itens={[
+    {texto: 'Função `prever_criativo(req) -> PredictionResponse` com contrato Pydantic', detalhe: 'É a API principal: o MCP e o LangGraph só a embrulham.'},
+    'Grafo LangGraph com as 5 tools e o subagente explicador',
+    'Validador determinístico da explicação (só cita números e fatores do JSON)',
+    'Servidor MCP funcionando e testado no MCP Inspector',
+    {texto: 'Testes pytest: contrato, low ≤ pred ≤ high, "número do agente == número do modelo"'},
+    'Demo em criativos de canais **fora do treino**, com métrica real conhecida',
+  ]}
+/>
+
+---
+
+## Reta final · 21/10 a 23/10 · Documentar e ensaiar
+
+<Checklist
+  id="galaxies-reta-final"
+  titulo="Antes de entregar"
+  itens={[
+    'README completo (use o [template](/projetos/galaxies/templates))',
+    'Data card e model card finais',
+    'Relatório de experimento: hipótese, setup, resultados, ablação, erros, limitações',
+    'Demo ensaiada e gravação de backup',
+    'Passou pela [autoavaliação](/projetos/galaxies/autoavaliacao)',
+  ]}
+/>
+
+---
+
+## Se o tempo apertar: o que priorizar
+
+A ordem abaixo maximiza o que a Galaxies consegue avaliar. **Não pule etapas para chegar ao agente mais rápido**: um agente sem modelo validado não prova nada.
+
+1. **Base + alvo + split temporal + baseline.** Sem isso, nada do resto se sustenta.
+2. **GBM Opção A batendo o baseline**, com métricas de ordenação.
+3. **Função + servidor MCP mínimo** devolvendo o contrato (mesmo com explicação simples).
+4. **Multimodal camada 1** e a ablação mostrando o ganho (ou a ausência dele: é um resultado válido!).
+5. **Intervalo** com cobertura medida.
+6. **SHAP + subagente explicador** com validação.
+7. **VLM (camada 2)**, agente LangGraph completo e extensões.
+
+:::info[Um resultado negativo bem medido é um resultado]
+Se a camada multimodal não melhorar o Spearman de forma significativa na sua base, **isso é um achado**. A literatura espera ganhos pequenos, de +0,02 a +0,04. Reporte com intervalo de confiança (bootstrap) e discuta por quê. Isso vale mais do que um número inflado por vazamento.
+:::

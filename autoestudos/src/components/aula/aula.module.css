@@ -1,0 +1,629 @@
+/* Componentes pedagógicos da trilha (LessonMeta, Quiz, Checklist, Cards, Sketch, Termo).
+ *
+ * Superfícies: raio externo = raio interno + padding (16px de padding, filhos
+ * com 6–8px de raio → 22–24px por fora). Profundidade com sombra
+ * (--shadow-border, em custom.css); bordas só para estado e separação. */
+
+/* ---------- Sketch ---------- */
+
+.sketch {
+  margin: 24px auto 32px;
+  text-align: center;
+}
+
+.sketchImg {
+  width: 100%;
+  height: auto;
+}
+
+.sketchCaption {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 0.85rem;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.sketchSource {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.72rem;
+  color: var(--ifm-color-emphasis-600);
+  transition-property: color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.sketchSource:hover {
+  color: var(--ifm-link-color);
+}
+
+/* ---------- LessonMeta ---------- */
+
+.meta {
+  container-type: inline-size;
+  border-radius: 22px; /* 6 (etapa) + 16 */
+  padding: 16px;
+  margin: 0 0 32px;
+  background: var(--ifm-background-surface-color);
+  box-shadow: var(--shadow-border);
+}
+
+.metaTop {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(63, 1, 255, 0.08);
+  color: var(--ifm-color-primary);
+  font-weight: 600;
+}
+
+[data-theme='dark'] .pill {
+  background: rgba(122, 77, 255, 0.16);
+  color: #b69cff;
+}
+
+.pillOpt {
+  background: rgba(240, 140, 0, 0.12);
+  color: #b35c00;
+}
+
+[data-theme='dark'] .pillOpt {
+  color: #ffc078;
+}
+
+/* Etapas: indicador estático (não pode parecer botão). Só a etapa ativa ganha
+ * forma; as demais são texto com separadores. */
+.pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 2px;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 16px;
+  font-size: 0.76rem;
+  font-family: Excalifont, var(--ifm-font-family-base);
+}
+
+.stage {
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.stage:not(:last-child)::after {
+  content: '›';
+  margin-inline-start: 8px;
+  color: var(--ifm-color-emphasis-400);
+}
+
+.stageOn {
+  color: var(--ifm-color-primary);
+  background: rgba(63, 1, 255, 0.09);
+  font-weight: 700;
+}
+
+.stageOn:not(:last-child)::after {
+  font-weight: 400;
+}
+
+[data-theme='dark'] .stageOn {
+  color: #d0bfff;
+  background: rgba(122, 77, 255, 0.2);
+}
+
+.metaCols {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 16px 32px;
+  font-size: 0.92rem;
+}
+
+.metaCols ul {
+  margin: 4px 0 0;
+  padding-inline-start: 1.1rem;
+}
+
+@container (max-width: 560px) {
+  .metaCols {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---------- Quiz ---------- */
+
+.quiz {
+  border-radius: 24px; /* 8 (alternativa) + 16 */
+  padding: 16px 16px 8px;
+  margin: 32px 0;
+  background: var(--ifm-background-surface-color);
+  box-shadow: var(--shadow-border);
+}
+
+.quizHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 1.05rem;
+}
+
+.quizTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quizScore {
+  font-size: 0.85rem;
+  color: var(--ifm-color-emphasis-700);
+  display: flex;
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.linkButton {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--ifm-link-color);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+}
+
+/* Perguntas agrupadas por espaço (24px entre perguntas, 8px dentro). */
+.question {
+  border: none;
+  padding: 0;
+  margin: 24px 0 0;
+  min-width: 0;
+}
+
+.questionTitle {
+  font-weight: 600;
+  padding: 0;
+  margin-bottom: 8px;
+  line-height: 1.45;
+}
+
+.questionNum {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  background: rgba(63, 1, 255, 0.1);
+  color: var(--ifm-color-primary);
+  font-size: 0.8rem;
+  margin-inline-end: 6px;
+}
+
+[data-theme='dark'] .questionNum {
+  background: rgba(151, 117, 250, 0.2);
+  color: #d0bfff;
+}
+
+.questionHint {
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Alternativas são controles: borda de formulário que muda com o estado. */
+.option {
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 8px;
+  padding: 8px 12px;
+  transition-property: border-color, background-color;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.option label {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.option input {
+  margin-top: 0.3rem;
+  accent-color: var(--ifm-color-primary);
+}
+
+.option:hover {
+  border-color: var(--ifm-color-primary-lightest);
+}
+
+.optionOk {
+  border-color: #2f9e44 !important;
+  background: rgba(47, 158, 68, 0.08);
+}
+
+.optionBad {
+  border-color: #e03131 !important;
+  background: rgba(224, 49, 49, 0.07);
+}
+
+.explain {
+  margin-block: 6px 2px;
+  margin-inline-start: 26px;
+  font-size: 0.88rem;
+  color: var(--ifm-color-emphasis-800);
+}
+
+.questionActions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.questionActions :global(.button) {
+  transition-property: scale, color, background-color, border-color, box-shadow;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.questionActions :global(.button):active:not(:disabled) {
+  scale: 0.96;
+}
+
+.verdictOk,
+.verdictBad {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 700;
+}
+
+.verdictOk {
+  color: #2f9e44;
+}
+
+.verdictBad {
+  color: #e03131;
+}
+
+[data-theme='dark'] .verdictOk {
+  color: #69db7c;
+}
+
+[data-theme='dark'] .verdictBad {
+  color: #ff8787;
+}
+
+/* ---------- Checklist ---------- */
+
+.checklist {
+  border-radius: 22px;
+  padding: 16px;
+  margin: 24px 0;
+  background: var(--ifm-background-surface-color);
+  box-shadow: var(--shadow-border);
+}
+
+.checklistHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.progressLabel {
+  font-variant-numeric: tabular-nums;
+  color: var(--ifm-color-emphasis-700);
+}
+
+.progress {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--ifm-color-emphasis-200);
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.progressBar {
+  height: 100%;
+  width: 100%;
+  transform-origin: left center;
+  background: linear-gradient(90deg, #3f01ff, #9775fa);
+  transition-property: transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+[dir='rtl'] .progressBar {
+  transform-origin: right center;
+}
+
+.checkItems {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.checkItems label {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+
+.checkItems input {
+  margin-top: 0.35rem;
+  accent-color: var(--ifm-color-primary);
+}
+
+.checkDone > label > span {
+  color: var(--ifm-color-emphasis-600);
+  text-decoration: line-through;
+  text-decoration-color: var(--ifm-color-emphasis-400);
+}
+
+.checkDetail {
+  display: block;
+  color: var(--ifm-color-emphasis-600);
+  text-decoration: none;
+}
+
+/* ---------- Cards ---------- */
+
+.cardGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 16px;
+  margin: 20px 0 32px;
+}
+
+.card {
+  container-type: inline-size;
+  border-radius: 22px; /* 6 (tags) + 16 */
+  padding: 16px;
+  margin-bottom: 16px;
+  background: var(--ifm-background-surface-color);
+  box-shadow: var(--shadow-border);
+  transition-property: box-shadow;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+.card:hover {
+  box-shadow: var(--shadow-border-hover);
+}
+
+.cardGrid .card {
+  margin-bottom: 0;
+}
+
+.card p {
+  margin: 8px 0;
+  font-size: 0.93rem;
+}
+
+.cardTitle {
+  font-weight: 700;
+  font-size: 1.02rem;
+}
+
+.cardSub {
+  font-size: 0.8rem;
+  color: var(--ifm-color-emphasis-600);
+}
+
+.numbers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 10px;
+}
+
+.number {
+  font-size: 0.78rem;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(25, 113, 194, 0.09);
+  color: #1864ab;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-theme='dark'] .number {
+  background: rgba(116, 192, 252, 0.14);
+  color: #a5d8ff;
+}
+
+.cardCols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  font-size: 0.9rem;
+}
+
+.cardCols ul {
+  padding-inline-start: 1.1rem;
+  margin: 4px 0 0;
+}
+
+@container (max-width: 520px) {
+  .cardCols {
+    grid-template-columns: 1fr;
+  }
+}
+
+.good {
+  color: #2f9e44;
+}
+
+.warn {
+  color: #e8590c;
+}
+
+[data-theme='dark'] .good {
+  color: #69db7c;
+}
+
+[data-theme='dark'] .warn {
+  color: #ffa94d;
+}
+
+.toolHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.toolTags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tag {
+  font-size: 0.7rem;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: var(--ifm-color-emphasis-200);
+  color: var(--ifm-color-emphasis-800);
+}
+
+.toolAlert {
+  font-size: 0.86rem !important;
+  color: #b35c00;
+}
+
+.toolAlert > svg {
+  margin-inline-end: 4px;
+}
+
+[data-theme='dark'] .toolAlert {
+  color: #ffc078;
+}
+
+/* ---------- NoProjeto (fio condutor) ---------- */
+
+.projeto {
+  border-radius: 12px;
+  background: rgba(47, 158, 68, 0.07);
+  padding: 14px 16px;
+  margin: 24px 0;
+}
+
+[data-theme='dark'] .projeto {
+  background: rgba(47, 158, 68, 0.12);
+}
+
+.projetoTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #2b8a3e;
+  margin-bottom: 6px;
+  font-family: Excalifont, var(--ifm-font-family-base);
+  font-size: 1.08rem;
+}
+
+[data-theme='dark'] .projetoTitle {
+  color: #8ce99a;
+}
+
+.projeto > div > :last-child {
+  margin-bottom: 0;
+}
+
+/* ---------- Termo (tooltip do glossário) ---------- */
+
+.termo {
+  position: relative;
+  border-bottom: 1.5px dotted var(--ifm-color-primary-lightest);
+  cursor: help;
+}
+
+.termoTip {
+  visibility: hidden;
+  opacity: 0;
+  position: absolute;
+  z-index: 20;
+  left: 50%; /* centralização geométrica: física de propósito */
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  width: min(320px, 80vw);
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  font-weight: 400;
+  background: var(--ifm-background-surface-color);
+  color: var(--ifm-font-color-base);
+  box-shadow: var(--shadow-border), 0 8px 24px rgba(0, 0, 0, 0.16);
+  transition-property: opacity, visibility;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+  pointer-events: none;
+}
+
+.termo:hover .termoTip,
+.termo:focus .termoTip,
+.termo:focus-within .termoTip {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* ---------- Glossário (agrupado por espaço, sem linhas) ---------- */
+
+.glossario {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  margin: 24px 0;
+}
+
+.glossarioItem {
+  scroll-margin-top: 80px;
+}
+
+.glossarioItem dt {
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+
+.glossarioItem dd {
+  margin: 4px 0 0;
+}
+
+.glossarioEn {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--ifm-color-emphasis-600);
+  font-size: 0.9rem;
+}
